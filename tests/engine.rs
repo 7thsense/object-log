@@ -4,8 +4,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_log::{
-    BlobStore, CommitBatch, CommitOutcome, Durability, FlushConfig, InMemorySequencer, IndexEntry,
-    LogEngine, MemoryBlobStore, ObjectLogError, PartitionKey, Sequencer,
+    BlobStore, BudgetConfig, BudgetMode, CommitBatch, CommitOutcome, Durability, FlushConfig,
+    InMemorySequencer, IndexEntry, LogEngine, MemoryBlobStore, ObjectLogError, PartitionKey,
+    Sequencer,
 };
 use std::collections::HashMap;
 use std::ops::Range;
@@ -25,6 +26,10 @@ fn coalesce_after(n: usize) -> FlushConfig {
         linger: Duration::from_secs(3600),
         max_inflight_flushes: 1,
         max_buffered_bytes: usize::MAX,
+        budget: object_log::BudgetConfig {
+            enabled: false,
+            ..object_log::BudgetConfig::default()
+        },
     }
 }
 
@@ -624,4 +629,103 @@ async fn truncate_before_deletes_dead_objects() {
     engine.truncate_before(&p, 2).await.unwrap();
     assert_eq!(blob.object_count(), 1, "two covered objects reaped");
     assert_eq!(engine.fetch(&p, 2, 1 << 20).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pipeline_snapshot_exposes_budget_defaults() {
+    let engine = LogEngine::new(
+        Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig::default(),
+        "log/",
+    );
+    let snap = engine.pipeline_snapshot();
+    assert!(snap.budget_enabled);
+    assert_eq!(snap.budget_mode, BudgetMode::LatencyPriority);
+    assert!(snap.budget_per_sec.effective > 0.0);
+    assert_eq!(snap.max_linger_ms, 50);
+}
+
+#[tokio::test]
+async fn fail_closed_rejects_when_budget_starved() {
+    let mut budget = BudgetConfig::default();
+    budget.mode = BudgetMode::FailClosed;
+    budget.default_capacity_per_sec = 0.0;
+    budget.budget_fraction = 0.0;
+    budget.budget_per_sec_cap = Some(0.0);
+    let engine = LogEngine::new(
+        Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig {
+            budget,
+            ..FlushConfig::default()
+        },
+        "log/",
+    );
+    // Force empty tokens: predicted cost > 0 and capacity 0.
+    {
+        // Produce once may still work if tokens bootstrapped; drain tokens by
+        // setting predicted high via a produce then starve — simpler: capacity 0
+        // still starts with tokens = max(1.0) in BudgetRuntime::new. So burn them.
+        for _ in 0..5 {
+            let _ = engine
+                .produce(
+                    pk("burn"),
+                    Bytes::from_static(b"x"),
+                    1,
+                    (),
+                    Durability::Sequenced,
+                )
+                .await;
+        }
+    }
+    // With zero refill rate, further fail_closed admissions should eventually fail.
+    let mut saw_budget = false;
+    for _ in 0..20 {
+        match engine
+            .produce(
+                pk("starve"),
+                Bytes::from_static(b"y"),
+                1,
+                (),
+                Durability::Sequenced,
+            )
+            .await
+        {
+            Err(ObjectLogError::BudgetExceeded(_)) => {
+                saw_budget = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+    assert!(saw_budget, "expected BudgetExceeded under fail_closed starvation");
+}
+
+#[tokio::test]
+async fn headroom_allows_fast_single_produce() {
+    let engine = LogEngine::new(
+        Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig::default(),
+        "log/",
+    );
+    let start = std::time::Instant::now();
+    engine
+        .produce(
+            pk("fast"),
+            Bytes::from_static(b"hi"),
+            1,
+            (),
+            Durability::Sequenced,
+        )
+        .await
+        .unwrap();
+    // Should not wait the full 50ms linger when headroom early-flush applies.
+    assert!(
+        start.elapsed() < Duration::from_millis(40),
+        "idle produce should early-flush, elapsed={:?}",
+        start.elapsed()
+    );
 }

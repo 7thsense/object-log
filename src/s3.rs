@@ -5,7 +5,7 @@
 //! object is durably stored) and dispatches multipart upload above a size
 //! threshold so large coalesced objects are not a single whole-buffer PUT.
 
-use crate::{BlobStore, ObjectLogError};
+use crate::{BlobStore, MediaOpStats, ObjectLogError};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{
@@ -16,6 +16,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::{Bytes, BytesMut};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 fn unavailable<E: std::fmt::Display>(e: E) -> ObjectLogError {
@@ -32,6 +33,8 @@ pub struct S3BlobStore {
     part_size: usize,
     /// Use SigV4's UNSIGNED-PAYLOAD mode for PUT/UploadPart requests.
     disable_payload_signing: bool,
+    media_ops: AtomicU64,
+    bytes_written: AtomicU64,
 }
 
 impl S3BlobStore {
@@ -76,7 +79,14 @@ impl S3BlobStore {
             multipart_threshold: 16 * 1024 * 1024,
             part_size: 8 * 1024 * 1024,
             disable_payload_signing: env_flag("OBJECT_LOG_S3_DISABLE_PAYLOAD_SIGNING"),
+            media_ops: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
         }
+    }
+
+    fn record_media(&self, ops: u64, bytes: u64) {
+        self.media_ops.fetch_add(ops, Ordering::Relaxed);
+        self.bytes_written.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Override the multipart threshold and part size (both in bytes).
@@ -110,8 +120,13 @@ impl S3BlobStore {
             .ok_or_else(|| ObjectLogError::StorageUnavailable("missing upload id".into()))?
             .to_string();
 
+        let byte_len = value.len() as u64;
         match self.upload_parts(key, &upload_id, &value).await {
-            Ok(()) => Ok(()),
+            Ok(part_count) => {
+                // create + N parts + complete
+                self.record_media(2 + part_count, byte_len);
+                Ok(())
+            }
             Err(e) => {
                 let _ = self
                     .client
@@ -121,6 +136,8 @@ impl S3BlobStore {
                     .upload_id(&upload_id)
                     .send()
                     .await;
+                // create (+ abort best-effort); still billable attempt noise
+                self.record_media(2, 0);
                 Err(e)
             }
         }
@@ -131,7 +148,7 @@ impl S3BlobStore {
         key: &str,
         upload_id: &str,
         value: &Bytes,
-    ) -> Result<(), ObjectLogError> {
+    ) -> Result<u64, ObjectLogError> {
         let mut parts = Vec::new();
         let mut offset = 0usize;
         let mut part_number = 1i32;
@@ -161,6 +178,7 @@ impl S3BlobStore {
             part_number += 1;
             offset = end;
         }
+        let part_count = parts.len() as u64;
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
@@ -173,7 +191,7 @@ impl S3BlobStore {
             .send()
             .await
             .map_err(unavailable)?;
-        Ok(())
+        Ok(part_count)
     }
 
     async fn upload_one_part(
@@ -221,8 +239,12 @@ impl S3BlobStore {
             .ok_or_else(|| ObjectLogError::StorageUnavailable("missing upload id".into()))?
             .to_string();
 
+        let byte_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
         match self.upload_chunk_parts(key, &upload_id, chunks).await {
-            Ok(()) => Ok(()),
+            Ok(part_count) => {
+                self.record_media(2 + part_count, byte_len);
+                Ok(())
+            }
             Err(e) => {
                 let _ = self
                     .client
@@ -232,6 +254,7 @@ impl S3BlobStore {
                     .upload_id(&upload_id)
                     .send()
                     .await;
+                self.record_media(2, 0);
                 Err(e)
             }
         }
@@ -242,7 +265,7 @@ impl S3BlobStore {
         key: &str,
         upload_id: &str,
         chunks: Vec<Bytes>,
-    ) -> Result<(), ObjectLogError> {
+    ) -> Result<u64, ObjectLogError> {
         let mut parts = Vec::new();
         let mut part_number = 1i32;
         let mut pending = BytesMut::with_capacity(self.part_size);
@@ -283,6 +306,7 @@ impl S3BlobStore {
             );
         }
 
+        let part_count = parts.len() as u64;
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
@@ -295,7 +319,7 @@ impl S3BlobStore {
             .send()
             .await
             .map_err(unavailable)?;
-        Ok(())
+        Ok(part_count)
     }
 }
 
@@ -319,6 +343,7 @@ impl BlobStore for S3BlobStore {
         if value.len() > self.multipart_threshold {
             return self.put_multipart(key, value).await;
         }
+        let byte_len = value.len() as u64;
         let request = self
             .client
             .put_object()
@@ -331,7 +356,15 @@ impl BlobStore for S3BlobStore {
             request.send().await
         }
         .map_err(unavailable)?;
+        self.record_media(1, byte_len);
         Ok(())
+    }
+
+    fn take_media_op_stats(&self) -> Option<MediaOpStats> {
+        Some(MediaOpStats {
+            media_ops: self.media_ops.swap(0, Ordering::Relaxed),
+            bytes: self.bytes_written.swap(0, Ordering::Relaxed),
+        })
     }
 
     async fn put_chunks(&self, key: &str, chunks: Vec<Bytes>) -> Result<(), ObjectLogError> {

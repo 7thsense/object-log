@@ -3,6 +3,33 @@
 use bytes::Bytes;
 use object_log::{BlobStore, LocalBlobStore, MemoryBlobStore, ObjectLogError};
 
+#[tokio::test]
+async fn local_put_reports_two_media_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::new(dir.path());
+    let _ = store.take_media_op_stats();
+    store
+        .put("k", Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    let stats = store.take_media_op_stats().expect("local stats");
+    assert_eq!(stats.media_ops, 2, "file sync + dir sync");
+    assert_eq!(stats.bytes, 3);
+}
+
+#[tokio::test]
+async fn memory_put_reports_zero_media_ops() {
+    let store = MemoryBlobStore::new();
+    let _ = store.take_media_op_stats();
+    store
+        .put("k", Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    let stats = store.take_media_op_stats().expect("memory stats");
+    assert_eq!(stats.media_ops, 0);
+    assert_eq!(stats.bytes, 3);
+}
+
 async fn port_suite(store: &dyn BlobStore) {
     // Absent key.
     assert!(store.get("topics/a/0").await.unwrap().is_none());

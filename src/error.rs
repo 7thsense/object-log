@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors returned by the object-log engine, storage adapters, and sequencer.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ObjectLogError {
     /// An object key was empty or contained a `..` path component or `\0`.
     #[error("invalid object key: {0}")]
@@ -21,6 +22,12 @@ pub enum ObjectLogError {
     /// The sequencer rejected or failed to process a commit/lookup.
     #[error("sequencer error: {0}")]
     Sequencer(String),
+    /// Durable-ops budget admission failed (`BudgetMode::FailClosed` or timed out).
+    #[error("durable-ops budget exceeded: {0}")]
+    BudgetExceeded(String),
+    /// Invalid engine or budget configuration.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
 }
 
 impl From<std::io::Error> for ObjectLogError {

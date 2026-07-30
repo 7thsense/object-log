@@ -287,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             linger: Duration::from_millis(cfg.linger_ms),
             max_inflight_flushes: cfg.flush_inflight,
             max_buffered_bytes: cfg.memory_bytes,
+            budget: object_log::BudgetConfig::default(),
         },
         format!("{}/data/", cfg.prefix),
     ));

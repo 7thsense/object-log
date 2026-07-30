@@ -45,6 +45,7 @@
 #![deny(missing_docs)]
 
 mod blob;
+mod budget;
 mod engine;
 mod error;
 mod manifest_sequencer;
@@ -52,7 +53,8 @@ mod manifest_sequencer;
 mod s3;
 mod sequencer;
 
-pub use blob::{BlobStore, LocalBlobStore, MemoryBlobStore};
+pub use blob::{BlobStore, LocalBlobStore, MediaOpStats, MemoryBlobStore};
+pub use budget::{BudgetConfig, BudgetMode, EffectiveKnob, EffectiveReason, PipelineSnapshot};
 pub use engine::{AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine};
 pub use error::ObjectLogError;
 pub use manifest_sequencer::ManifestSequencer;

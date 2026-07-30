@@ -7,7 +7,17 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Durable-media accounting for the flush budget controller (TD-004).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MediaOpStats {
+    /// File/dir fsyncs or billable durable requests performed since last take.
+    pub media_ops: u64,
+    /// Bytes written through durable (or memory) put paths since last take.
+    pub bytes: u64,
+}
 
 /// Suffix for in-flight temp files written by [`LocalBlobStore`]; keys ending in
 /// it are skipped by [`list`](BlobStore::list).
@@ -68,6 +78,16 @@ pub trait BlobStore: Send + Sync {
 
     /// Delete an object; deleting a missing key is a no-op success.
     async fn delete(&self, key: &str) -> Result<(), ObjectLogError>;
+
+    /// Snapshot and reset media-op counters since the previous take.
+    ///
+    /// Adapters that can count exact durable units (fsyncs, S3 PUTs) should
+    /// implement this. The default returns [`None`]; the engine then treats each
+    /// successful [`put`](BlobStore::put) / [`put_chunks`](BlobStore::put_chunks)
+    /// as **one** media op (documented fallback).
+    fn take_media_op_stats(&self) -> Option<MediaOpStats> {
+        None
+    }
 }
 
 /// Slice `bytes` by `range`, applying the [`BlobStore::get_range`] bounds rules.
@@ -93,6 +113,7 @@ fn slice_range(bytes: &Bytes, range: Range<u64>) -> Result<Bytes, ObjectLogError
 #[derive(Clone, Default)]
 pub struct MemoryBlobStore {
     objects: Arc<Mutex<BTreeMap<String, Bytes>>>,
+    bytes_written: Arc<AtomicU64>,
 }
 
 impl MemoryBlobStore {
@@ -120,6 +141,8 @@ impl MemoryBlobStore {
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
+        self.bytes_written
+            .fetch_add(value.len() as u64, Ordering::Relaxed);
         self.objects
             .lock()
             .expect("poisoned")
@@ -158,6 +181,14 @@ impl BlobStore for MemoryBlobStore {
         self.objects.lock().expect("poisoned").remove(key);
         Ok(())
     }
+
+    fn take_media_op_stats(&self) -> Option<MediaOpStats> {
+        // Memory has no crash-durable media cost.
+        Some(MediaOpStats {
+            media_ops: 0,
+            bytes: self.bytes_written.swap(0, Ordering::Relaxed),
+        })
+    }
 }
 
 /// Filesystem-backed [`BlobStore`] rooted at a directory.
@@ -170,6 +201,8 @@ impl BlobStore for MemoryBlobStore {
 #[derive(Clone)]
 pub struct LocalBlobStore {
     root: Arc<PathBuf>,
+    media_ops: Arc<AtomicU64>,
+    bytes_written: Arc<AtomicU64>,
 }
 
 impl LocalBlobStore {
@@ -177,6 +210,8 @@ impl LocalBlobStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Arc::new(root.into()),
+            media_ops: Arc::new(AtomicU64::new(0)),
+            bytes_written: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -192,6 +227,7 @@ impl LocalBlobStore {
 impl BlobStore for LocalBlobStore {
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
         let path = self.path_for(key)?;
+        let byte_len = value.len() as u64;
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             let parent = path.parent().expect("object path has a parent");
             std::fs::create_dir_all(parent)?;
@@ -210,6 +246,9 @@ impl BlobStore for LocalBlobStore {
         })
         .await
         .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))??;
+        // Two media ops: file data sync + parent directory sync (TD-004 §4.1).
+        self.media_ops.fetch_add(2, Ordering::Relaxed);
+        self.bytes_written.fetch_add(byte_len, Ordering::Relaxed);
         Ok(())
     }
 
@@ -280,6 +319,13 @@ impl BlobStore for LocalBlobStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn take_media_op_stats(&self) -> Option<MediaOpStats> {
+        Some(MediaOpStats {
+            media_ops: self.media_ops.swap(0, Ordering::Relaxed),
+            bytes: self.bytes_written.swap(0, Ordering::Relaxed),
+        })
     }
 }
 

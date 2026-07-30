@@ -1,5 +1,8 @@
 //! The buffered, multiplexing log engine.
 
+use crate::budget::{
+    BudgetConfig, BudgetMode, BudgetRuntime, EffectiveKnob, EffectiveReason, PipelineSnapshot,
+};
 use crate::sequencer::BatchLocation;
 use crate::{BlobStore, CommitBatch, CommitOutcome, ObjectLogError, PartitionKey, Sequencer};
 use bytes::Bytes;
@@ -35,8 +38,11 @@ pub struct FlushConfig {
     pub max_bytes: usize,
     /// Flush once this many batches are buffered.
     pub max_batches: usize,
-    /// Maximum time a batch waits in the buffer before a flush is forced. `ZERO`
-    /// flushes as soon as a batch arrives (lowest latency).
+    /// **Maximum** time a batch may wait before a deadline flush (hard ceiling).
+    /// The budget controller may use a shorter *effective* linger when media
+    /// headroom allows early flush (TD-004). `ZERO` forces ASAP flushes (legacy).
+    /// Default is `50ms` so co-buffering under load is possible while headroom
+    /// early-flush keeps idle latency low.
     pub linger: Duration,
     /// Maximum number of sealed objects that may be PUT concurrently.
     pub max_inflight_flushes: usize,
@@ -44,6 +50,8 @@ pub struct FlushConfig {
     /// once this budget is exhausted, which makes memory use an explicit tradeoff
     /// against latency.
     pub max_buffered_bytes: usize,
+    /// Durable-ops budget controller (default on for Fjord).
+    pub budget: BudgetConfig,
 }
 
 impl Default for FlushConfig {
@@ -51,9 +59,10 @@ impl Default for FlushConfig {
         Self {
             max_bytes: 128 * 1024 * 1024,
             max_batches: 10_000,
-            linger: Duration::ZERO,
+            linger: Duration::from_millis(50),
             max_inflight_flushes: 4,
             max_buffered_bytes: 512 * 1024 * 1024,
+            budget: BudgetConfig::default(),
         }
     }
 }
@@ -178,6 +187,10 @@ struct Shared<M> {
     queue: Mutex<Queue<M>>,
     cv: Condvar,
     max_buffered_bytes: usize,
+    /// Budget controller + inspectable counters (TD-004).
+    budget: Mutex<BudgetRuntime>,
+    /// Max linger (operator ceiling) and budget config copy for the flush loop.
+    flush_config: FlushConfig,
 }
 
 /// A buffered, multiplexing append-log engine over a [`BlobStore`], with
@@ -209,9 +222,13 @@ where
         config: FlushConfig,
         key_prefix: impl Into<String>,
     ) -> Self {
+        if let Err(msg) = config.budget.validate() {
+            panic!("invalid FlushConfig.budget: {msg}");
+        }
         if std::env::var("OLOG_DEBUG_FLUSH_CONFIG").is_ok() {
             eprintln!("object-log flush config: {config:?}");
         }
+        let budget_rt = BudgetRuntime::new(config.budget);
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 items: VecDeque::new(),
@@ -221,12 +238,15 @@ where
             }),
             cv: Condvar::new(),
             max_buffered_bytes: config.max_buffered_bytes.max(config.max_bytes),
+            budget: Mutex::new(budget_rt),
+            flush_config: config,
         });
         let flush_thread = {
             let shared = Arc::clone(&shared);
             let blob = Arc::clone(&blob);
             let sequencer = Arc::clone(&sequencer);
             let prefix = key_prefix.into();
+            let config = config;
             std::thread::Builder::new()
                 .name("object-log-flush".into())
                 .spawn(move || flush_loop(shared, blob, sequencer, config, prefix))
@@ -262,13 +282,45 @@ where
                 meta,
                 durability,
                 responder: None,
-            });
+            })?;
             return Ok(AppendOutcome {
                 base_offset: None,
                 last_offset: None,
                 durable: false,
                 sequenced: false,
             });
+        }
+        // fail_closed: reserve predicted media ops before waiting on flush.
+        {
+            let mut budget = self.shared.budget.lock().expect("poisoned");
+            if budget.config.enabled
+                && budget.config.mode == BudgetMode::FailClosed
+                && !budget.reserve_for_fail_closed(Instant::now())
+            {
+                return Err(ObjectLogError::BudgetExceeded(
+                    "insufficient durable-ops budget to admit produce".into(),
+                ));
+            }
+        }
+        // budget_priority: wait briefly for tokens when empty.
+        if self.shared.flush_config.budget.enabled
+            && self.shared.flush_config.budget.mode == BudgetMode::BudgetPriority
+        {
+            let timeout = self.shared.flush_config.budget.admission_timeout;
+            let deadline = Instant::now() + timeout;
+            loop {
+                let mut budget = self.shared.budget.lock().expect("poisoned");
+                if budget.can_admit_now(Instant::now()) {
+                    break;
+                }
+                drop(budget);
+                if Instant::now() >= deadline {
+                    return Err(ObjectLogError::BudgetExceeded(
+                        "timed out waiting for durable-ops budget".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         let (tx, rx) = oneshot::channel();
         self.enqueue(Pending {
@@ -278,32 +330,30 @@ where
             meta,
             durability,
             responder: Some(tx),
-        });
+        })?;
         rx.await
             .map_err(|_| ObjectLogError::Sequencer("flush worker stopped".into()))?
     }
 
-    fn enqueue(&self, item: Pending<S::Meta>) {
+    fn enqueue(&self, item: Pending<S::Meta>) -> Result<(), ObjectLogError> {
         let item_len = item.payload.len();
         let max_buffered_bytes = self.shared.max_buffered_bytes;
         let shared = Arc::clone(&self.shared);
-        let enqueue = move || {
-            let mut q = shared.queue.lock().expect("poisoned");
-            while !q.shutdown
-                && q.bytes_in_use > 0
-                && q.bytes_in_use.saturating_add(item_len) > max_buffered_bytes
-            {
-                q = shared.cv.wait(q).expect("poisoned");
-            }
-            if q.shutdown {
-                return;
-            }
-            q.bytes += item_len;
-            q.bytes_in_use += item_len;
-            q.items.push_back(item);
-            shared.cv.notify_all();
-        };
-        enqueue();
+        let mut q = shared.queue.lock().expect("poisoned");
+        while !q.shutdown
+            && q.bytes_in_use > 0
+            && q.bytes_in_use.saturating_add(item_len) > max_buffered_bytes
+        {
+            q = shared.cv.wait(q).expect("poisoned");
+        }
+        if q.shutdown {
+            return Err(ObjectLogError::Sequencer("engine shutting down".into()));
+        }
+        q.bytes += item_len;
+        q.bytes_in_use += item_len;
+        q.items.push_back(item);
+        shared.cv.notify_all();
+        Ok(())
     }
 
     /// Read batches covering offsets at/after `offset`, up to ~`max_bytes`.
@@ -357,6 +407,68 @@ where
             bytes_in_use: q.bytes_in_use,
             queued_batches: q.items.len(),
             max_buffered_bytes: self.shared.max_buffered_bytes,
+        }
+    }
+
+    /// Inspect budget controller layers and counters (TD-004).
+    pub fn pipeline_snapshot(&self) -> PipelineSnapshot {
+        let now = Instant::now();
+        let mut budget = self.shared.budget.lock().expect("poisoned");
+        budget.refill(now);
+        let effective = budget.effective_budget_per_sec;
+        let reason = if !budget.config.enabled {
+            EffectiveReason::Disabled
+        } else if budget.config.budget_per_sec_cap.is_some()
+            && budget
+                .config
+                .budget_per_sec_cap
+                .is_some_and(|c| (effective - c).abs() < 1e-9)
+        {
+            EffectiveReason::ConfigCap
+        } else if budget.ongoing_capacity.is_some() {
+            EffectiveReason::Ongoing
+        } else if budget.startup_capacity.is_some() {
+            EffectiveReason::StartupProbe
+        } else {
+            EffectiveReason::DefaultCapacity
+        };
+        let early = budget.allow_early_flush(now);
+        let max_linger = self.shared.flush_config.linger;
+        let eff_linger = if !budget.config.enabled {
+            max_linger
+        } else if early || max_linger.is_zero() {
+            Duration::ZERO
+        } else {
+            max_linger
+        };
+        PipelineSnapshot {
+            budget_per_sec: EffectiveKnob {
+                configured: budget.config.budget_per_sec_cap,
+                startup_measured: budget.startup_capacity,
+                ongoing_measured: budget.ongoing_capacity,
+                effective,
+                reason,
+            },
+            effective_linger_ms: EffectiveKnob {
+                configured: Some(max_linger.as_millis() as u64),
+                startup_measured: None,
+                ongoing_measured: None,
+                effective: eff_linger.as_millis() as u64,
+                reason: if early {
+                    EffectiveReason::Ongoing
+                } else {
+                    EffectiveReason::Configured
+                },
+            },
+            max_linger_ms: max_linger.as_millis() as u64,
+            token_fill_ratio: budget.fill_ratio(),
+            media_ops_total: budget.media_ops_total,
+            overdraft_total: budget.overdraft_total,
+            flushes_total: budget.flushes_total,
+            undersized_deadline_flushes: budget.undersized_deadline_flushes,
+            predicted_media_ops: budget.predicted_media_ops,
+            budget_enabled: budget.config.enabled,
+            budget_mode: budget.config.mode,
         }
     }
 }
@@ -440,7 +552,7 @@ fn flush_loop<S>(
             .is_some_and(|work| work.put_result.is_some())
         {
             let work = pending.pop_front().expect("front exists");
-            let released = finish_flush_work(&sequencer, work);
+            let released = finish_flush_work(&shared, &blob, &sequencer, work);
             let mut q = shared.queue.lock().expect("poisoned");
             q.bytes_in_use = q.bytes_in_use.saturating_sub(released);
             shared.cv.notify_all();
@@ -460,6 +572,21 @@ fn flush_loop<S>(
     }
 }
 
+fn effective_linger<M>(shared: &Shared<M>, config: FlushConfig) -> Duration {
+    if config.linger.is_zero() || !config.budget.enabled {
+        return config.linger;
+    }
+    let now = Instant::now();
+    let mut budget = shared.budget.lock().expect("poisoned");
+    budget.refill(now);
+    if budget.allow_early_flush(now) {
+        budget.note_early_flush(now);
+        Duration::ZERO
+    } else {
+        config.linger
+    }
+}
+
 fn take_batch<M>(
     shared: &Arc<Shared<M>>,
     config: FlushConfig,
@@ -474,10 +601,16 @@ fn take_batch<M>(
             if !wait_when_empty {
                 return TakeBatch::Empty;
             }
-            if config.linger.is_zero() {
+            let linger = {
+                drop(q);
+                let l = effective_linger(shared, config);
+                q = shared.queue.lock().expect("poisoned");
+                l
+            };
+            if linger.is_zero() {
                 q = shared.cv.wait(q).expect("poisoned");
             } else {
-                let (guard, timeout) = shared.cv.wait_timeout(q, config.linger).expect("poisoned");
+                let (guard, timeout) = shared.cv.wait_timeout(q, linger).expect("poisoned");
                 q = guard;
                 if timeout.timed_out() && q.items.is_empty() {
                     return TakeBatch::Empty;
@@ -486,17 +619,33 @@ fn take_batch<M>(
             continue;
         }
 
-        let triggered = q.shutdown
-            || q.bytes >= config.max_bytes
-            || q.items.len() >= config.max_batches
-            || config.linger.is_zero();
+        let linger = {
+            drop(q);
+            let l = effective_linger(shared, config);
+            q = shared.queue.lock().expect("poisoned");
+            l
+        };
+
+        let size_trigger = q.bytes >= config.max_bytes || q.items.len() >= config.max_batches;
+        let triggered = q.shutdown || size_trigger || linger.is_zero();
         if triggered {
+            if !size_trigger && !q.shutdown && !q.items.is_empty() {
+                // Deadline / early flush — may be undersized relative to max_bytes.
+                let mut budget = shared.budget.lock().expect("poisoned");
+                if q.bytes < config.max_bytes && q.items.len() < config.max_batches {
+                    budget.undersized_deadline_flushes += 1;
+                }
+            }
             break;
         }
 
-        let (guard, timeout) = shared.cv.wait_timeout(q, config.linger).expect("poisoned");
+        let (guard, timeout) = shared.cv.wait_timeout(q, linger).expect("poisoned");
         q = guard;
         if timeout.timed_out() {
+            let mut budget = shared.budget.lock().expect("poisoned");
+            if q.bytes < config.max_bytes && q.items.len() < config.max_batches {
+                budget.undersized_deadline_flushes += 1;
+            }
             break;
         }
     }
@@ -578,6 +727,9 @@ fn start_flush_work<M>(
         .collect();
 
     let blob = Arc::clone(blob);
+    // Reset stats so this put's media_ops can be isolated (shared store may have
+    // other traffic; best-effort for single-engine-per-store deployments).
+    let _ = blob.take_media_op_stats();
     let put_started = Instant::now();
     let put = rt.spawn(async move { put_chunks_with_retries(&blob, &key, chunks).await });
 
@@ -592,7 +744,12 @@ fn start_flush_work<M>(
     }
 }
 
-fn finish_flush_work<S>(sequencer: &Arc<S>, mut work: FlushWork<S::Meta>) -> usize
+fn finish_flush_work<S, M>(
+    shared: &Arc<Shared<M>>,
+    blob: &Arc<dyn BlobStore>,
+    sequencer: &Arc<S>,
+    mut work: FlushWork<S::Meta>,
+) -> usize
 where
     S: Sequencer + 'static,
     S::Meta: Send + 'static,
@@ -608,6 +765,12 @@ where
             return release_bytes;
         }
     };
+
+    // Media ops for the data object put.
+    let mut media_ops = blob
+        .take_media_op_stats()
+        .map(|s| s.media_ops)
+        .unwrap_or(1); // fallback: 1 per successful put
 
     // Signal Durable-level waiters now (after PUT, before commit).
     send_durable_acks(&mut work.responders);
@@ -626,6 +789,9 @@ where
         .collect();
 
     let commit_started = timing.then(Instant::now);
+    // Clear stats again so sequencer durable work (e.g. ManifestSequencer put)
+    // on the shared store is counted into the same budget.
+    let _ = blob.take_media_op_stats();
     match sequencer.commit(&commit_batches) {
         Ok(outcomes) => {
             if let Some(commit_started) = commit_started {
@@ -636,6 +802,9 @@ where
                     put_elapsed.as_millis(),
                     commit_started.elapsed().as_millis()
                 );
+            }
+            if let Some(s) = blob.take_media_op_stats() {
+                media_ops = media_ops.saturating_add(s.media_ops);
             }
             for (outcome, (_, tx)) in outcomes.into_iter().zip(work.responders.iter_mut()) {
                 if let Some(tx) = tx.take() {
@@ -659,8 +828,18 @@ where
             }
         }
         Err(e) => {
+            if let Some(s) = blob.take_media_op_stats() {
+                media_ops = media_ops.saturating_add(s.media_ops);
+            }
             send_storage_error(&mut work.responders, e);
         }
     }
+
+    {
+        let mut budget = shared.budget.lock().expect("poisoned");
+        budget.consume_after_flush(media_ops, Instant::now());
+    }
+    shared.cv.notify_all();
+
     release_bytes
 }
