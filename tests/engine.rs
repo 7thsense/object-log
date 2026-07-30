@@ -648,11 +648,13 @@ async fn pipeline_snapshot_exposes_budget_defaults() {
 
 #[tokio::test]
 async fn fail_closed_rejects_when_budget_starved() {
-    let mut budget = BudgetConfig::default();
-    budget.mode = BudgetMode::FailClosed;
-    budget.default_capacity_per_sec = 0.0;
-    budget.budget_fraction = 0.0;
-    budget.budget_per_sec_cap = Some(0.0);
+    let budget = BudgetConfig {
+        mode: BudgetMode::FailClosed,
+        default_capacity_per_sec: 0.0,
+        budget_fraction: 0.0,
+        budget_per_sec_cap: Some(0.0),
+        ..BudgetConfig::default()
+    };
     let engine = LogEngine::new(
         Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
@@ -700,7 +702,10 @@ async fn fail_closed_rejects_when_budget_starved() {
             Err(e) => panic!("unexpected error: {e:?}"),
         }
     }
-    assert!(saw_budget, "expected BudgetExceeded under fail_closed starvation");
+    assert!(
+        saw_budget,
+        "expected BudgetExceeded under fail_closed starvation"
+    );
 }
 
 #[tokio::test]

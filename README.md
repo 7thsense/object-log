@@ -16,10 +16,11 @@ is decoupled from produce count. It is the storage engine extracted from the
   `LocalBlobStore`, and `S3BlobStore` (feature `s3`; multipart + range reads).
 - **`LogEngine`** — buffers and group-commits many batches into one object, PUTs
   it durably, then sequences it; `produce` resolves at a chosen `Durability`
-  (`Buffered` / `Durable` / `Sequenced`), `fetch` reads by offset. A default-on
-  **durable-ops budget** adapts effective linger (early flush when media is idle;
-  co-buffer under load within `FlushConfig.linger`) so Fjord/S3 and Local share
-  one latency↔throughput controller (`pipeline_snapshot()`).
+  (`Buffered` / `Durable` / `Sequenced`), or clients can pipeline with
+  `Buffered` and wait on `flush()`. A default-on **durable-ops budget** adapts
+  effective linger (early flush when media is idle; co-buffer under load within
+  `FlushConfig.linger`) so Fjord/S3 and Local share one latency↔throughput
+  controller (`pipeline_snapshot()`).
 - **`Sequencer` seam** — a sync trait that assigns offsets and owns the index;
   ships `InMemorySequencer` and a crash-durable `ManifestSequencer`. Plug your own
   (e.g. a Kafka coordinator); the engine forwards its `Meta` uninterpreted.

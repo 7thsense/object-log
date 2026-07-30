@@ -158,6 +158,8 @@ struct Pending<M> {
     meta: M,
     durability: Durability,
     responder: Option<Responder>,
+    /// Monotonic enqueue id for [`LogEngine::flush`] barriers.
+    seq: u64,
 }
 
 struct FlushWork<M> {
@@ -165,6 +167,8 @@ struct FlushWork<M> {
     locations: Vec<BatchLocation>,
     responders: Vec<(Durability, Option<Responder>)>,
     bytes: usize,
+    /// Highest enqueue seq included in this flush object.
+    max_seq: u64,
     put: Option<TokioJoinHandle<Result<(), ObjectLogError>>>,
     put_started: Instant,
     put_result: Option<Result<Duration, ObjectLogError>>,
@@ -176,11 +180,21 @@ enum TakeBatch<M> {
     Shutdown,
 }
 
+type FlushWaiter = (u64, oneshot::Sender<Result<(), ObjectLogError>>);
+
 struct Queue<M> {
     items: VecDeque<Pending<M>>,
     bytes: usize,
     bytes_in_use: usize,
     shutdown: bool,
+    /// Next seq to assign on enqueue.
+    next_seq: u64,
+    /// Highest seq fully sealed (put + sequencer commit finished).
+    completed_through: u64,
+    /// When true, take_batch flushes even if under size/linger.
+    force_flush: bool,
+    /// Waiters: (barrier_seq inclusive, responder).
+    flush_waiters: Vec<FlushWaiter>,
 }
 
 struct Shared<M> {
@@ -235,6 +249,10 @@ where
                 bytes: 0,
                 bytes_in_use: 0,
                 shutdown: false,
+                next_seq: 1, // first enqueued batch gets seq 1
+                completed_through: 0,
+                force_flush: false,
+                flush_waiters: Vec::new(),
             }),
             cv: Condvar::new(),
             max_buffered_bytes: config.max_buffered_bytes.max(config.max_bytes),
@@ -246,7 +264,6 @@ where
             let blob = Arc::clone(&blob);
             let sequencer = Arc::clone(&sequencer);
             let prefix = key_prefix.into();
-            let config = config;
             std::thread::Builder::new()
                 .name("object-log-flush".into())
                 .spawn(move || flush_loop(shared, blob, sequencer, config, prefix))
@@ -282,6 +299,7 @@ where
                 meta,
                 durability,
                 responder: None,
+                seq: 0, // filled in enqueue
             })?;
             return Ok(AppendOutcome {
                 base_offset: None,
@@ -330,12 +348,42 @@ where
             meta,
             durability,
             responder: Some(tx),
+            seq: 0,
         })?;
         rx.await
             .map_err(|_| ObjectLogError::Sequencer("flush worker stopped".into()))?
     }
 
-    fn enqueue(&self, item: Pending<S::Meta>) -> Result<(), ObjectLogError> {
+    /// Seal every batch enqueued **at or before** this call (barrier).
+    ///
+    /// Use after [`Durability::Buffered`] produces to wait for durable PUT (and
+    /// sequencing) of that prior work. Concurrent produces enqueued after this
+    /// call are not required to finish. Empty buffer returns immediately.
+    pub async fn flush(&self) -> Result<(), ObjectLogError> {
+        let rx = {
+            let mut q = self.shared.queue.lock().expect("poisoned");
+            if q.shutdown {
+                return Err(ObjectLogError::Sequencer("engine shutting down".into()));
+            }
+            if q.next_seq == 1 {
+                // Nothing has ever been enqueued.
+                return Ok(());
+            }
+            let barrier = q.next_seq - 1;
+            if q.completed_through >= barrier && q.items.is_empty() && q.bytes_in_use == 0 {
+                return Ok(());
+            }
+            let (tx, rx) = oneshot::channel();
+            q.force_flush = true;
+            q.flush_waiters.push((barrier, tx));
+            self.shared.cv.notify_all();
+            rx
+        };
+        rx.await
+            .map_err(|_| ObjectLogError::Sequencer("flush worker stopped".into()))?
+    }
+
+    fn enqueue(&self, mut item: Pending<S::Meta>) -> Result<(), ObjectLogError> {
         let item_len = item.payload.len();
         let max_buffered_bytes = self.shared.max_buffered_bytes;
         let shared = Arc::clone(&self.shared);
@@ -349,6 +397,8 @@ where
         if q.shutdown {
             return Err(ObjectLogError::Sequencer("engine shutting down".into()));
         }
+        item.seq = q.next_seq;
+        q.next_seq = q.next_seq.saturating_add(1);
         q.bytes += item_len;
         q.bytes_in_use += item_len;
         q.items.push_back(item);
@@ -560,7 +610,23 @@ fn flush_loop<S>(
         }
 
         if pending.is_empty() {
+            {
+                let mut q = shared.queue.lock().expect("poisoned");
+                if q.items.is_empty() && q.bytes_in_use == 0 {
+                    // Nothing in flight: any remaining waiters with barrier already
+                    // covered (or no work after last seal) can complete.
+                    notify_flush_waiters(&mut q);
+                }
+            }
+            shared.cv.notify_all();
             if shutdown {
+                // Fail any remaining flush waiters.
+                let mut q = shared.queue.lock().expect("poisoned");
+                for (_, tx) in q.flush_waiters.drain(..) {
+                    let _ = tx.send(Err(ObjectLogError::Sequencer(
+                        "engine shutting down".into(),
+                    )));
+                }
                 return;
             }
             continue;
@@ -627,10 +693,11 @@ fn take_batch<M>(
         };
 
         let size_trigger = q.bytes >= config.max_bytes || q.items.len() >= config.max_batches;
-        let triggered = q.shutdown || size_trigger || linger.is_zero();
+        let force = q.force_flush;
+        let triggered = q.shutdown || size_trigger || linger.is_zero() || force;
         if triggered {
             if !size_trigger && !q.shutdown && !q.items.is_empty() {
-                // Deadline / early flush — may be undersized relative to max_bytes.
+                // Deadline / early flush / force — may be undersized relative to max_bytes.
                 let mut budget = shared.budget.lock().expect("poisoned");
                 if q.bytes < config.max_bytes && q.items.len() < config.max_batches {
                     budget.undersized_deadline_flushes += 1;
@@ -650,20 +717,51 @@ fn take_batch<M>(
         }
     }
 
+    let force_drain = q.force_flush;
     let mut items = Vec::new();
     let mut bytes = 0usize;
+    // On force_flush, still respect max_bytes so one object stays bounded, but
+    // ignore max_batches so a barrier can drain large queues across objects.
     while let Some(item) = q.items.pop_front() {
         q.bytes = q.bytes.saturating_sub(item.payload.len());
         bytes += item.payload.len();
         items.push(item);
-        if bytes >= config.max_bytes || items.len() >= config.max_batches {
+        if bytes >= config.max_bytes {
             break;
         }
+        if !force_drain && items.len() >= config.max_batches {
+            break;
+        }
+    }
+    // Keep forcing while a barrier still has queued work.
+    if force_drain {
+        q.force_flush = !q.items.is_empty() || !q.flush_waiters.is_empty();
     }
     if items.is_empty() {
         TakeBatch::Empty
     } else {
         TakeBatch::Batch(items)
+    }
+}
+
+fn notify_flush_waiters<M>(q: &mut Queue<M>) {
+    let done = q.completed_through;
+    let mut i = 0;
+    while i < q.flush_waiters.len() {
+        if q.flush_waiters[i].0 <= done {
+            let (_, tx) = q.flush_waiters.swap_remove(i);
+            let _ = tx.send(Ok(()));
+        } else {
+            i += 1;
+        }
+    }
+    if q.flush_waiters.is_empty() {
+        q.force_flush = false;
+    } else if q.items.is_empty() && q.bytes_in_use == 0 {
+        // Barriers still waiting but no work — should not happen; clear force.
+        q.force_flush = true;
+    } else {
+        q.force_flush = true;
     }
 }
 
@@ -725,6 +823,7 @@ fn start_flush_work<M>(
         .iter_mut()
         .map(|p| (p.durability, p.responder.take()))
         .collect();
+    let max_seq = batch.iter().map(|p| p.seq).max().unwrap_or(0);
 
     let blob = Arc::clone(blob);
     // Reset stats so this put's media_ops can be isolated (shared store may have
@@ -738,6 +837,7 @@ fn start_flush_work<M>(
         locations,
         responders,
         bytes: offset,
+        max_seq,
         put: Some(put),
         put_started,
         put_result: None,
@@ -761,16 +861,29 @@ where
     let put_elapsed = match work.put_result.take().expect("put result is ready") {
         Ok(elapsed) => elapsed,
         Err(e) => {
-            send_storage_error(&mut work.responders, e);
+            send_storage_error(&mut work.responders, e.clone());
+            let mut q = shared.queue.lock().expect("poisoned");
+            // Unblock flush waiters covering this seq with the storage error.
+            let done = work.max_seq;
+            if done >= q.completed_through {
+                q.completed_through = done;
+            }
+            let mut i = 0;
+            while i < q.flush_waiters.len() {
+                if q.flush_waiters[i].0 <= done {
+                    let (_, tx) = q.flush_waiters.swap_remove(i);
+                    let _ = tx.send(Err(e.clone()));
+                } else {
+                    i += 1;
+                }
+            }
+            shared.cv.notify_all();
             return release_bytes;
         }
     };
 
     // Media ops for the data object put.
-    let mut media_ops = blob
-        .take_media_op_stats()
-        .map(|s| s.media_ops)
-        .unwrap_or(1); // fallback: 1 per successful put
+    let mut media_ops = blob.take_media_op_stats().map(|s| s.media_ops).unwrap_or(1); // fallback: 1 per successful put
 
     // Signal Durable-level waiters now (after PUT, before commit).
     send_durable_acks(&mut work.responders);
@@ -838,6 +951,13 @@ where
     {
         let mut budget = shared.budget.lock().expect("poisoned");
         budget.consume_after_flush(media_ops, Instant::now());
+    }
+    {
+        let mut q = shared.queue.lock().expect("poisoned");
+        if work.max_seq >= q.completed_through {
+            q.completed_through = work.max_seq;
+        }
+        notify_flush_waiters(&mut q);
     }
     shared.cv.notify_all();
 
