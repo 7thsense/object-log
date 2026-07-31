@@ -180,6 +180,132 @@ async fn concurrent_producers_get_dense_contiguous_offsets() {
     }
 }
 
+/// Per-producer send-order contiguity (ADR-002 invariant residual).
+///
+/// Many producers share one partition; each keeps in-flight=1 and stamps
+/// `(producer_id, seq)` into Meta. The engine must present batches to `commit`
+/// in arrival order without splitting a partition across concurrent commits
+/// (default single flush worker). Recording the Meta stream proves each
+/// producer's sequences are observed contiguously 0..N-1 in send order.
+#[derive(Default)]
+struct RecordingSeq {
+    inner: InMemorySequencer,
+    /// Global commit presentation order: (producer_id, seq).
+    order: Mutex<Vec<(u32, u32)>>,
+}
+
+impl Sequencer for RecordingSeq {
+    type Meta = (u32, u32);
+
+    fn commit(
+        &self,
+        batches: &[CommitBatch<'_, Self::Meta>],
+    ) -> Result<Vec<CommitOutcome>, ObjectLogError> {
+        let mut order = self.order.lock().expect("poisoned");
+        let mut out = Vec::with_capacity(batches.len());
+        for b in batches {
+            order.push(*b.meta);
+            let clean = [CommitBatch {
+                partition: b.partition.clone(),
+                record_count: b.record_count,
+                location: b.location.clone(),
+                meta: &(),
+            }];
+            out.push(self.inner.commit(&clean)?.into_iter().next().unwrap());
+        }
+        Ok(out)
+    }
+
+    fn lookup(&self, p: &PartitionKey, o: i64) -> Result<Vec<IndexEntry>, ObjectLogError> {
+        self.inner.lookup(p, o)
+    }
+    fn high_watermark(&self, p: &PartitionKey) -> Result<i64, ObjectLogError> {
+        self.inner.high_watermark(p)
+    }
+    fn log_start_offset(&self, p: &PartitionKey) -> Result<i64, ObjectLogError> {
+        self.inner.log_start_offset(p)
+    }
+    fn truncate_before(&self, p: &PartitionKey, o: i64) -> Result<Vec<String>, ObjectLogError> {
+        self.inner.truncate_before(p, o)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_producer_send_order_is_contiguous_on_shared_partition() {
+    const PRODUCERS: u32 = 8;
+    const PER_PRODUCER: u32 = 25;
+
+    let blob = Arc::new(MemoryBlobStore::new());
+    let seq = Arc::new(RecordingSeq::default());
+    let engine = Arc::new(LogEngine::new(
+        Arc::clone(&blob) as Arc<dyn BlobStore>,
+        Arc::clone(&seq),
+        // Single-flight flush (default): partition never split across commits.
+        FlushConfig {
+            max_inflight_flushes: 1,
+            budget: object_log::BudgetConfig {
+                enabled: false,
+                ..object_log::BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        },
+        "log/",
+    ));
+    let p = pk("shared");
+
+    let mut handles = Vec::new();
+    for producer_id in 0..PRODUCERS {
+        let engine = Arc::clone(&engine);
+        let p = p.clone();
+        handles.push(tokio::spawn(async move {
+            for seq_no in 0..PER_PRODUCER {
+                // in-flight=1 for this producer: await before next produce.
+                let out = engine
+                    .produce(
+                        p.clone(),
+                        Bytes::from(format!("p{producer_id}-s{seq_no}").into_bytes()),
+                        1,
+                        (producer_id, seq_no),
+                        Durability::Sequenced,
+                    )
+                    .await
+                    .unwrap();
+                assert!(out.sequenced);
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let order = seq.order.lock().expect("poisoned").clone();
+    assert_eq!(
+        order.len() as u32,
+        PRODUCERS * PER_PRODUCER,
+        "every produce must reach commit"
+    );
+
+    // For each producer, filter the global commit stream → sequences 0..N-1 in order.
+    for producer_id in 0..PRODUCERS {
+        let seqs: Vec<u32> = order
+            .iter()
+            .filter(|(pid, _)| *pid == producer_id)
+            .map(|(_, s)| *s)
+            .collect();
+        assert_eq!(
+            seqs,
+            (0..PER_PRODUCER).collect::<Vec<_>>(),
+            "producer {producer_id} must see send-order contiguity in commit presentation"
+        );
+    }
+
+    // Global offsets remain dense.
+    assert_eq!(
+        seq.high_watermark(&p).unwrap(),
+        (PRODUCERS * PER_PRODUCER) as i64
+    );
+}
+
 // ---- A blob store whose put always fails. ----
 struct FailingPut;
 #[async_trait]

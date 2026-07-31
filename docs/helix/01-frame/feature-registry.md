@@ -16,7 +16,7 @@ ddx:
 | FEAT-003 | Sequencer Seam | Sequencer Seam | P0 | implemented | sync trait, Meta, atomic commit; InMemory + Manifest sequencers |
 | FEAT-004 | Durable-Ops Budget | Operations and Cost | P1 | implemented | TD-004 budget modes, early-flush, pipeline_snapshot |
 | FEAT-005 | S3 BlobStore Adapter | Operations and Cost | P1 | implemented | feature `s3`; multipart; no store CAS |
-| FEAT-006 | Consumer Integration Maps | Consumer Compatibility | P1 | defined | fjord Sequencer binding + Niflheim cold-tier docs (not product schemas) |
+| FEAT-006 | Consumer Integration Maps | Consumer Compatibility | P1 | implemented | README + TD-003 binding sketches; sequencer_conformance tests |
 | FEAT-007 | Streaming Fetch | Non-Goals / P2 | P2 | deferred | `fetch_stream` for wide replay |
 | FEAT-008 | Orphan Reaper | Non-Goals / P2 | P2 | deferred | crash-between-PUT-and-commit cleanup |
 | FEAT-009 | Kafka Types in Core | — | — | rejected | Superseded by ADR-002; was ADR-001 FEAT-001 Kafka-shaped core |

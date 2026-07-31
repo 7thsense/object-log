@@ -25,19 +25,17 @@ object-log 0.2.x re-foundation (ADR-002) is **implemented**. Remaining work hard
 - TD-004 budget controller
 - Gate: `cargo test` green for P0 suite
 
-### M1: Conformance Hardening
+### M1: Conformance Hardening (done)
 
-- Extract reusable Sequencer conformance helpers (optional module under `tests/` or `src` test utils).
-- Add multi-producer send-order / in-flight contiguity test (ADR-002 residual).
-- Ensure FR→test table in test-plan stays accurate after renames.
+- `tests/sequencer_conformance.rs` for InMemory + Manifest.
+- `per_producer_send_order_is_contiguous_on_shared_partition` engine ordering test.
+- Honest perf ratio assert gated to release / `OBJECT_LOG_PERF_ASSERT=1`.
 - Gate: `cargo test` + `cargo clippy --all-targets -- -D warnings`.
 
-### M2: Consumer Integration Docs (FEAT-006)
+### M2: Consumer Integration Docs (FEAT-006) (done)
 
-- Document fjord binding sketch (acks→Durability, Sequencer Meta) in TD-003 / README links.
-- Document Niflheim cold-tier BlobStore/`get_range` usage.
+- README consumer integration table; TD-003 binding sketches for fjord / Niflheim / pqueue-class.
 - No product schemas in object-log.
-- Gate: docs review; no new Kafka types in public API.
 
 ### M3: S3 Production Evidence
 

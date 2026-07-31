@@ -71,7 +71,7 @@ A custom `Sequencer` MUST:
 4. Ensure `lookup` only returns entries whose bytes are durable (engine guarantees put-before-commit).
 5. On `truncate_before`, return only object ids with zero remaining references **across partitions**.
 
-Recommended follow-up (ALIGN residual): extract a shared `sequencer_conformance` helper module for third-party sequencers; today tests use InMemory + ad-hoc fakes.
+Reference suite: `tests/sequencer_conformance.rs` (InMemory + Manifest). Engine presentation ordering: `per_producer_send_order_is_contiguous_on_shared_partition` in `tests/engine.rs`.
 
 ## Consumer Integration Maps
 
@@ -84,6 +84,18 @@ fjord binding: map Kafka acks → Durability; LogEngine::produce/fetch
 object-log: BlobStore + group-commit only
 ```
 
+**Binding sketch**
+
+| Kafka / broker concept | object-log mapping |
+|------------------------|--------------------|
+| `acks=0` | `Durability::Buffered` (+ optional later `flush`) |
+| `acks=1` (local) | often `Durability::Durable` (bytes on object store; no offset yet) or `Sequenced` if offset required |
+| `acks=all` / `-1` | `Durability::Sequenced` |
+| `(topic, partition)` | `PartitionKey` (encode however the coordinator prefers) |
+| record batch bytes | opaque `payload`; heimq stamps `base_offset` after assign |
+| producer id/epoch/seq | fields inside `Sequencer::Meta` only |
+| DeleteRecords / retention | coordinator policy → `engine.truncate_before` |
+
 object-log MUST NOT grow Kafka types to “help” fjord (PRD FR-30).
 
 ### Niflheim (cold tier)
@@ -95,6 +107,16 @@ Optional: use LogEngine or raw BlobStore depending on whether offset index is de
 Codecs/checksums: Niflheim-owned framing inside opaque bytes
 ```
 
+**Binding sketch**
+
+| Niflheim cold concern | object-log primitive |
+|-----------------------|----------------------|
+| Mark cold durable after upload | `BlobStore::put` Ok (durable-on-return) |
+| Load one chunk from coalesced object | `get_range(key, start..end)` |
+| Boot scan of cold keys | `list(prefix)` (paginates internally) |
+| Large coalesced segments | multipart inside `S3BlobStore` / streaming `put_chunks` on Local |
+| Offset index / publish gating | Niflheim control plane, or optional `Sequencer`/`LogEngine` |
+
 ### pqueue-class
 
 ```text
@@ -102,6 +124,8 @@ Opaque command bytes as produce payloads
 Projection reads via fetch by offset
 Ownership/fencing: consumer control plane or custom Sequencer Meta
 ```
+
+**Binding sketch**: `produce` command envelopes as opaque bytes; project with `fetch`; snapshot high-watermark then `truncate_before`. Fencing is not a core API—use `Meta` or refuse produce in the caller before enqueue.
 
 ## Shared Kafka Protocol Boundary (outside this crate)
 

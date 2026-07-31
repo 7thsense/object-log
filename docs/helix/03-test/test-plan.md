@@ -50,11 +50,11 @@ ddx:
 | FR-12 | `flush_drains_buffered_produces` | `tests/perf_throughput.rs` |
 | FR-13 | `put_failure_yields_no_ack_no_offset` | `tests/engine.rs` |
 | FR-14 | `commit_failure_orphans_object_and_retry_is_exactly_once` | `tests/engine.rs` |
-| FR-15, FR-19 | `multiplexed_commit_is_all_or_nothing`, single-flight default | `tests/engine.rs` |
+| FR-15, FR-19 | `multiplexed_commit_is_all_or_nothing`, `per_producer_send_order_is_contiguous_on_shared_partition` | `tests/engine.rs` |
 | FR-20 | `idempotent_retry_does_not_duplicate` | `tests/engine.rs` |
 | FR-17 | `truncate_before_deletes_dead_objects` | `tests/engine.rs` |
-| FR-18..FR-22 | sequencer fakes + `InMemorySequencer` usage across engine tests | `tests/engine.rs` |
-| FR-23 | `manifest_index_survives_restart` | `tests/manifest.rs` |
+| FR-18..FR-22 | `in_memory_sequencer_conforms` + engine fakes | `tests/sequencer_conformance.rs`, `tests/engine.rs` |
+| FR-23 | `manifest_index_survives_restart`, `manifest_sequencer_conforms` | `tests/manifest.rs`, `tests/sequencer_conformance.rs` |
 | FR-24..FR-25 | `pipeline_snapshot_exposes_budget_defaults`, `fail_closed_rejects_when_budget_starved`, `headroom_allows_fast_single_produce`, `default_config_idle_latency_budget` | `tests/engine.rs`, `tests/perf_budget.rs` |
 | FR-26 | `s3_blob_store_round_trip` (env-gated) | `tests/s3.rs` |
 | FR-27..FR-28 | opaque payload round-trip in `produce_fetch_round_trip` | `tests/engine.rs` |
@@ -64,8 +64,8 @@ ddx:
 
 | Gap | Priority | Notes |
 |-----|----------|-------|
-| Explicit multi-producer **send-order** contiguity under custom Meta sequencer | P1 | Density covered; ADR-002 asked for per-producer ordering harness |
-| Extracted `sequencer_conformance` module for third parties | P1 | Today: ad-hoc fakes in engine tests |
+| Multi-producer send-order contiguity | **Closed** | `per_producer_send_order_is_contiguous_on_shared_partition` |
+| Sequencer conformance extract | **Closed** | `tests/sequencer_conformance.rs` |
 | `fetch_stream` | P2 | Deferred feature |
 
 ## Critical Paths (P0)
@@ -91,7 +91,7 @@ ddx:
 | Requirement | Specification |
 |-------------|---------------|
 | Correctness gate | `cargo test` (default; excludes needing release perf floor) |
-| Perf evidence | `cargo test --release --test perf_throughput honest -- --nocapture` |
+| Perf evidence | `cargo test --release --test perf_throughput honest -- --nocapture` (ratio assert is release-only unless `OBJECT_LOG_PERF_ASSERT=1`) |
 | Clippy | `cargo clippy --all-targets -- -D warnings` |
 | Optional S3 | document env vars in `tests/s3.rs` |
 

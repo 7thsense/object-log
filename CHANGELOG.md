@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Sequencer conformance suite (`tests/sequencer_conformance.rs`) for InMemory and
+  Manifest sequencers.
+- Engine test: per-producer send-order contiguity on a shared partition
+  (`per_producer_send_order_is_contiguous_on_shared_partition`).
+- README + TD-003 consumer integration binding sketches (fjord / Niflheim / pqueue).
+
 ### Changed
 
 - HELIX frame and design stack evolved to match ADR-002 / 0.2.x: vision, PRD
@@ -14,6 +22,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   epoch-guard requirements removed from governing docs.
 - Library user-story AC floor waived in concerns; P0 FR→named-test mapping is
   the coverage gate.
+- Honest local throughput ratio assert runs in `--release` (or with
+  `OBJECT_LOG_PERF_ASSERT=1`); debug builds still print the table.
 
 ## [0.2.0] — 2026-06-17
 

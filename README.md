@@ -67,6 +67,18 @@ assert_eq!(read[0].payload, "hello");
 To target S3/Garage/MinIO, enable the `s3` feature and use `S3BlobStore`, or
 implement the `BlobStore` trait for your client.
 
+## Consumer integration
+
+object-log is a **storage engine**, not a Kafka broker or WAL codec.
+
+| Consumer role | What you implement | What object-log provides |
+|---------------|--------------------|---------------------------|
+| Broker (e.g. fjord) | `Sequencer` with your producer/`Meta` fields; map external acks → `Durability`; record framing in a protocol crate | `LogEngine` group-commit + `BlobStore` |
+| Cold-tier WAL (e.g. Niflheim) | Your hot tier + codecs/checksums; optional `Sequencer` or raw `BlobStore` | Durable put, `get_range`, list |
+| Queue projection (pqueue-class) | Opaque command bytes; ownership/fencing in your control plane or `Meta` | Produce/fetch by offset |
+
+See `docs/helix/02-design/technical-designs/TD-003-conformance-kafka-backend-and-extraction.md` for conformance cases and binding sketches. Sequencer implementors can mirror `tests/sequencer_conformance.rs`.
+
 ## Status
 
 `0.2.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024).
