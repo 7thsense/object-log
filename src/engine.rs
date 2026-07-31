@@ -485,7 +485,8 @@ where
         } else {
             EffectiveReason::DefaultCapacity
         };
-        let early = budget.allow_early_flush(now);
+        let queued = self.shared.queue.lock().expect("poisoned").bytes;
+        let early = budget.allow_early_flush(now, queued);
         let max_linger = self.shared.flush_config.linger;
         let eff_linger = if !budget.config.enabled {
             max_linger
@@ -641,14 +642,14 @@ fn flush_loop<S>(
     }
 }
 
-fn effective_linger<M>(shared: &Shared<M>, config: FlushConfig) -> Duration {
+fn effective_linger<M>(shared: &Shared<M>, config: FlushConfig, queued_bytes: usize) -> Duration {
     if config.linger.is_zero() || !config.budget.enabled {
         return config.linger;
     }
     let now = Instant::now();
     let mut budget = shared.budget.lock().expect("poisoned");
     budget.refill(now);
-    if budget.allow_early_flush(now) {
+    if budget.allow_early_flush(now, queued_bytes) {
         budget.note_early_flush(now);
         Duration::ZERO
     } else {
@@ -671,8 +672,9 @@ fn take_batch<M>(
                 return TakeBatch::Empty;
             }
             let linger = {
+                let queued = q.bytes;
                 drop(q);
-                let l = effective_linger(shared, config);
+                let l = effective_linger(shared, config, queued);
                 q = shared.queue.lock().expect("poisoned");
                 l
             };
@@ -689,8 +691,9 @@ fn take_batch<M>(
         }
 
         let linger = {
+            let queued = q.bytes;
             drop(q);
-            let l = effective_linger(shared, config);
+            let l = effective_linger(shared, config, queued);
             q = shared.queue.lock().expect("poisoned");
             l
         };

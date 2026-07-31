@@ -193,11 +193,14 @@ impl BlobStore for MemoryBlobStore {
 
 /// Filesystem-backed [`BlobStore`] rooted at a directory.
 ///
-/// Single-node. Writes are **durable-on-return**: each `put` writes a temp file,
-/// `fsync`s it, atomically renames it into place, then `fsync`s the parent
-/// directory — in that order, so both the bytes and the directory entry survive
-/// power loss. (On macOS, true device durability needs `F_FULLFSYNC`; this uses
-/// `sync_all`, which is correct on Linux.)
+/// Single-node. Writes are **durable-on-return**: each `put` / `put_chunks`:
+/// 1. write a temp file in the same directory as the final key  
+/// 2. [`File::sync_data`] (fdatasync on Unix) so payload bytes are durable  
+/// 3. `rename` into place  
+/// 4. `fsync` the parent directory so the directory entry survives power loss  
+///
+/// (On macOS, true device durability may need `F_FULLFSYNC`; Linux `sync_data` /
+/// dir `sync_all` is the intended contract.)
 #[derive(Clone)]
 pub struct LocalBlobStore {
     root: Arc<PathBuf>,
@@ -221,35 +224,63 @@ impl LocalBlobStore {
         }
         Ok(self.root.join(key))
     }
+
+    /// Durable publish: temp → sync_data → rename → dir fsync. No full pre-merge
+    /// of `chunks` (streams them to the temp file).
+    fn durable_publish_chunks(path: PathBuf, chunks: Vec<Bytes>) -> std::io::Result<u64> {
+        let parent = path.parent().expect("object path has a parent");
+        std::fs::create_dir_all(parent)?;
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(TMP_SUFFIX);
+        let tmp = PathBuf::from(tmp);
+        let mut byte_len = 0u64;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            for chunk in &chunks {
+                f.write_all(chunk)?;
+                byte_len += chunk.len() as u64;
+            }
+            // fdatasync on Unix: data durable; dir fsync below covers the name.
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(byte_len)
+    }
+
+    fn record_put(&self, byte_len: u64) {
+        // Two media ops: file data sync + parent directory sync.
+        self.media_ops.fetch_add(2, Ordering::Relaxed);
+        self.bytes_written.fetch_add(byte_len, Ordering::Relaxed);
+    }
 }
 
 #[async_trait]
 impl BlobStore for LocalBlobStore {
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
         let path = self.path_for(key)?;
-        let byte_len = value.len() as u64;
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let parent = path.parent().expect("object path has a parent");
-            std::fs::create_dir_all(parent)?;
-            let mut tmp = path.clone().into_os_string();
-            tmp.push(TMP_SUFFIX);
-            let tmp = PathBuf::from(tmp);
-            {
-                let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(&value)?;
-                f.sync_all()?; // fsync temp data BEFORE the rename is relied upon
-            }
-            std::fs::rename(&tmp, &path)?;
-            // fsync the parent directory so the rename survives power loss.
-            std::fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))??;
-        // Two media ops: file data sync + parent directory sync (TD-004 §4.1).
-        self.media_ops.fetch_add(2, Ordering::Relaxed);
-        self.bytes_written.fetch_add(byte_len, Ordering::Relaxed);
+        let byte_len =
+            tokio::task::spawn_blocking(move || Self::durable_publish_chunks(path, vec![value]))
+                .await
+                .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))??;
+        self.record_put(byte_len);
         Ok(())
+    }
+
+    async fn put_chunks(&self, key: &str, chunks: Vec<Bytes>) -> Result<(), ObjectLogError> {
+        match chunks.len() {
+            0 => self.put(key, Bytes::new()).await,
+            1 => self.put(key, chunks.into_iter().next().unwrap()).await,
+            _ => {
+                let path = self.path_for(key)?;
+                let byte_len =
+                    tokio::task::spawn_blocking(move || Self::durable_publish_chunks(path, chunks))
+                        .await
+                        .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))??;
+                self.record_put(byte_len);
+                Ok(())
+            }
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {

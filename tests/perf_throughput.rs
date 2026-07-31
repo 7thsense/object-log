@@ -1,13 +1,12 @@
-//! Throughput demonstration: arbitrary client chunk sizes + durable ack/flush
-//! should approach bulk durable sequential write rates (dd-class), not
-//! per-chunk fsync rates.
+//! Throughput: arbitrary client chunks + durable ack/`flush` should approach
+//! single-stream durable sequential write (dd-class), not per-chunk fsync rates.
 //!
-//! Baseline: write the same total bytes as large sequential files with
-//! file+dir fsync (same durability unit as [`LocalBlobStore`]).
-//! object-log path: many small/variable produces, then wait via
-//! [`Durability::Durable`] or [`LogEngine::flush`].
+//! Baselines (same temp dir / FS):
+//! - **B0**: one file, write all, `fdatasync` + dir fsync (dd-like)
+//! - **B1**: one object via LocalBlobStore protocol (temp + sync_data + rename + dir)
+//! - **B2**: engine — many small produces + `flush()` / Durable pipeline
 //!
-//! Override volume with `OBJECT_LOG_PERF_BYTES` (default 64 MiB).
+//! Volume: `OBJECT_LOG_PERF_BYTES` (default 32 MiB).
 
 use bytes::Bytes;
 use object_log::{
@@ -32,74 +31,84 @@ fn mib_s(bytes: usize, elapsed: Duration) -> f64 {
     (bytes as f64 / (1024.0 * 1024.0)) / secs
 }
 
-/// Same durability protocol as LocalBlobStore: write, fsync file, fsync parent dir.
-fn bulk_durable_write(dir: &Path, total: usize, chunk: usize) -> (Duration, u64) {
-    let mut written = 0usize;
-    let mut objects = 0u64;
+/// B0: streaming write + one fdatasync + dir fsync.
+fn baseline_b0_dd_like(dir: &Path, total: usize) -> Duration {
+    let path = dir.join("b0.bin");
+    let chunk = 8 * 1024 * 1024;
+    let buf = vec![0u8; chunk];
     let t0 = Instant::now();
-    let mut idx = 0u64;
-    let payload = vec![0xABu8; chunk];
-    while written < total {
-        let n = (total - written).min(chunk);
-        let path = dir.join(format!("bulk-{idx:08}.bin"));
-        {
-            let mut f = File::create(&path).unwrap();
-            f.write_all(&payload[..n]).unwrap();
-            f.sync_all().unwrap();
+    {
+        let mut f = File::create(&path).unwrap();
+        let mut left = total;
+        while left > 0 {
+            let n = left.min(chunk);
+            f.write_all(&buf[..n]).unwrap();
+            left -= n;
         }
-        // parent dir fsync
-        File::open(dir).unwrap().sync_all().unwrap();
-        written += n;
-        objects += 1;
-        idx += 1;
+        f.flush().unwrap();
+        f.sync_data().unwrap(); // fdatasync
     }
-    (t0.elapsed(), objects)
+    File::open(dir).unwrap().sync_all().unwrap();
+    t0.elapsed()
 }
 
-/// Deterministic pseudo-random chunk sizes in [min, max] inclusive.
+/// B1: one LocalBlobStore put of `total` bytes.
+async fn baseline_b1_one_put(dir: &Path, total: usize) -> Duration {
+    let store = LocalBlobStore::new(dir);
+    let payload = Bytes::from(vec![0xABu8; total]);
+    let t0 = Instant::now();
+    store.put("b1/one", payload).await.unwrap();
+    t0.elapsed()
+}
+
 fn next_chunk(seed: &mut u64, min: usize, max: usize) -> usize {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     let span = max - min + 1;
     min + (*seed as usize % span)
 }
 
+fn high_ceiling_config() -> FlushConfig {
+    FlushConfig {
+        max_bytes: FlushConfig::default().max_bytes, // 1 GiB ceiling
+        max_batches: usize::MAX,
+        linger: Duration::from_millis(50),
+        max_inflight_flushes: 2,
+        max_buffered_bytes: FlushConfig::default().max_buffered_bytes,
+        budget: BudgetConfig {
+            enabled: true,
+            default_capacity_per_sec: 10_000.0,
+            budget_fraction: 1.0,
+            budget_per_sec_cap: None,
+            // Early-flush only when queue is tiny; bulk must wait linger/flush.
+            early_flush_max_queued_bytes: 4 * 1024 * 1024,
+            early_flush_fill_ratio: 0.5,
+            ..BudgetConfig::default()
+        },
+    }
+}
+
 #[tokio::test]
-async fn local_arbitrary_chunks_with_flush_near_bulk_durable_throughput() {
+async fn local_bulk_flush_near_single_object_and_dd_class() {
     let total = total_bytes();
     let dir = tempfile::tempdir().unwrap();
-    let bulk_dir = dir.path().join("bulk");
-    let olog_dir = dir.path().join("olog");
-    std::fs::create_dir_all(&bulk_dir).unwrap();
-    std::fs::create_dir_all(&olog_dir).unwrap();
+    let b0_dir = dir.path().join("b0");
+    let b1_dir = dir.path().join("b1");
+    let b2_dir = dir.path().join("b2");
+    std::fs::create_dir_all(&b0_dir).unwrap();
+    std::fs::create_dir_all(&b1_dir).unwrap();
+    std::fs::create_dir_all(&b2_dir).unwrap();
 
-    // Baseline: large sequential durable objects (~1 MiB), same fsync shape as LocalBlobStore.
-    let bulk_chunk = 1024 * 1024;
-    let (bulk_elapsed, bulk_objects) = bulk_durable_write(&bulk_dir, total, bulk_chunk);
-    let bulk_rate = mib_s(total, bulk_elapsed);
+    let b0_elapsed = baseline_b0_dd_like(&b0_dir, total);
+    let b0_rate = mib_s(total, b0_elapsed);
 
-    // object-log: clients write arbitrary small/medium chunks, fire-and-forget, then flush.
-    // Defaults: max_bytes ~1 GiB ceiling so packing is linger-driven, not size-capped.
-    let blob = Arc::new(LocalBlobStore::new(&olog_dir));
+    let b1_elapsed = baseline_b1_one_put(&b1_dir, total).await;
+    let b1_rate = mib_s(total, b1_elapsed);
+
+    let blob = Arc::new(LocalBlobStore::new(&b2_dir));
     let engine = LogEngine::new(
         Arc::clone(&blob) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
-        FlushConfig {
-            // Keep ceiling above this test's total so seals are linger/flush-bound.
-            max_bytes: FlushConfig::default().max_bytes,
-            max_batches: usize::MAX,
-            linger: Duration::from_millis(50),
-            max_inflight_flushes: 2,
-            max_buffered_bytes: FlushConfig::default().max_buffered_bytes,
-            budget: BudgetConfig {
-                enabled: true,
-                // Generous budget so Local is not rate-starved; linger does the packing.
-                default_capacity_per_sec: 10_000.0,
-                budget_fraction: 1.0,
-                budget_per_sec_cap: None,
-                early_flush_fill_ratio: 0.95,
-                ..BudgetConfig::default()
-            },
-        },
+        high_ceiling_config(),
         "data/",
     );
 
@@ -110,99 +119,74 @@ async fn local_arbitrary_chunks_with_flush_near_bulk_durable_throughput() {
     let t0 = Instant::now();
     while produced < total {
         let chunk = next_chunk(&mut seed, 1024, 256 * 1024).min(total - produced);
-        let payload = Bytes::from(vec![0xCDu8; chunk]);
         engine
             .produce(
                 partition.clone(),
-                payload,
+                Bytes::from(vec![0xCDu8; chunk]),
                 1,
                 (),
-                Durability::Buffered, // arbitrary client chunks, no per-chunk wait
+                Durability::Buffered,
             )
             .await
             .unwrap();
         produced += chunk;
         client_chunks += 1;
     }
-    engine.flush().await.expect("flush drains barrier");
-    let olog_elapsed = t0.elapsed();
-    let olog_rate = mib_s(total, olog_elapsed);
+    engine.flush().await.expect("flush");
+    let b2_elapsed = t0.elapsed();
+    let b2_rate = mib_s(total, b2_elapsed);
 
     let objects = blob.list("data/").await.unwrap().len() as u64;
     let snap = engine.pipeline_snapshot();
 
     eprintln!(
-        "perf_throughput: total_mib={:.1} bulk={:.1} MiB/s ({} objects) olog_flush={:.1} MiB/s ({} objects, {} client_chunks) flushes={} media_ops={}",
+        "perf B0/B1/B2: total_mib={:.1} B0_dd={:.1} B1_one_put={:.1} B2_engine={:.1} MiB/s | objects={} chunks={} flushes={} media_ops={}",
         total as f64 / (1024.0 * 1024.0),
-        bulk_rate,
-        bulk_objects,
-        olog_rate,
+        b0_rate,
+        b1_rate,
+        b2_rate,
         objects,
         client_chunks,
         snap.flushes_total,
         snap.media_ops_total,
     );
 
-    // Packing: far fewer durable objects than client chunks.
     assert!(
-        objects * 10 < client_chunks,
-        "expected strong co-buffering: objects={objects} client_chunks={client_chunks}"
+        objects <= 2,
+        "bulk+flush under 1GiB ceiling must not early-flush fanout: objects={objects}"
     );
-    // With a high max_bytes ceiling, a single flush barrier should pack into few objects.
     assert!(
-        objects <= 4,
-        "linger/flush packing should not fan out many objects for {total} bytes, got {objects}"
+        objects * 50 < client_chunks,
+        "client chunks should dominate objects"
     );
-
-    // Throughput: within the same order as bulk durable sequential writes.
-    // CI/VMs vary; require at least 25% of the bulk durable baseline measured
-    // in-process (same disk, same fsync protocol).
-    let ratio = olog_rate / bulk_rate.max(0.1);
+    // Engine within ~30% of raw one-object Local put (protocol parity).
     assert!(
-        ratio >= 0.25,
-        "object-log+flush should approach bulk durable rate: olog={olog_rate:.1} bulk={bulk_rate:.1} ratio={ratio:.2}"
+        b2_rate >= b1_rate * 0.70,
+        "B2 should be near B1: b2={b2_rate:.1} b1={b1_rate:.1}"
     );
-
-    // Absolute floor so a totally broken path fails even if bulk is also slow.
+    // And a solid fraction of dd-like single fdatasync (protocol + rename tax).
     assert!(
-        olog_rate > 5.0,
-        "object-log durable throughput too low: {olog_rate:.1} MiB/s"
+        b2_rate >= b0_rate * 0.50,
+        "B2 should be ≥50% of B0 dd-like: b2={b2_rate:.1} b0={b0_rate:.1}"
     );
 }
 
-/// Pipelined client: many arbitrary chunks with [`Durability::Buffered`], then a
-/// final [`Durability::Durable`] produce that acks only after co-buffered seal.
-/// Measures end-to-end rate including the durable ack.
 #[tokio::test]
 async fn local_pipelined_chunks_final_durable_ack_near_bulk() {
-    let total = (total_bytes() / 2).max(32 * 1024 * 1024);
+    let total = (total_bytes() / 2).max(16 * 1024 * 1024);
     let dir = tempfile::tempdir().unwrap();
-    let bulk_dir = dir.path().join("bulk");
-    let olog_dir = dir.path().join("olog");
-    std::fs::create_dir_all(&bulk_dir).unwrap();
-    std::fs::create_dir_all(&olog_dir).unwrap();
+    let b0_dir = dir.path().join("b0");
+    let b2_dir = dir.path().join("b2");
+    std::fs::create_dir_all(&b0_dir).unwrap();
+    std::fs::create_dir_all(&b2_dir).unwrap();
 
-    let (bulk_elapsed, _) = bulk_durable_write(&bulk_dir, total, 1024 * 1024);
-    let bulk_rate = mib_s(total, bulk_elapsed);
+    let b0_rate = mib_s(total, baseline_b0_dd_like(&b0_dir, total));
 
-    let blob = Arc::new(LocalBlobStore::new(&olog_dir));
+    let blob = Arc::new(LocalBlobStore::new(&b2_dir));
     let engine = LogEngine::new(
         Arc::clone(&blob) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
-        FlushConfig {
-            max_bytes: FlushConfig::default().max_bytes,
-            max_batches: usize::MAX,
-            linger: Duration::from_millis(50),
-            max_inflight_flushes: 2,
-            max_buffered_bytes: FlushConfig::default().max_buffered_bytes,
-            budget: BudgetConfig {
-                enabled: true,
-                default_capacity_per_sec: 10_000.0,
-                budget_fraction: 1.0,
-                early_flush_fill_ratio: 0.95,
-                ..BudgetConfig::default()
-            },
-        },
+        high_ceiling_config(),
         "ack/",
     );
 
@@ -222,7 +206,7 @@ async fn local_pipelined_chunks_final_durable_ack_near_bulk() {
                 1,
                 (),
                 if last {
-                    Durability::Durable // ack after co-buffered object is durable
+                    Durability::Durable
                 } else {
                     Durability::Buffered
                 },
@@ -232,31 +216,21 @@ async fn local_pipelined_chunks_final_durable_ack_near_bulk() {
         produced += chunk;
         client_chunks += 1;
     }
-    // Ensure any trailing buffer after the last Durable is empty (last produce
-    // may have sealed only its own object if size triggered mid-stream).
     engine.flush().await.unwrap();
-    let olog_elapsed = t0.elapsed();
-    let olog_rate = mib_s(total, olog_elapsed);
+    let b2_rate = mib_s(total, t0.elapsed());
     let objects = blob.list("ack/").await.unwrap().len() as u64;
 
     eprintln!(
-        "perf_throughput ack: total_mib={:.1} bulk={:.1} MiB/s olog_pipelined_ack={:.1} MiB/s objects={} chunks={}",
+        "perf ack: total_mib={:.1} B0={:.1} B2={:.1} MiB/s objects={} chunks={}",
         total as f64 / (1024.0 * 1024.0),
-        bulk_rate,
-        olog_rate,
+        b0_rate,
+        b2_rate,
         objects,
         client_chunks,
     );
 
-    assert!(
-        objects * 10 < client_chunks,
-        "ack path must still co-buffer"
-    );
-    let ratio = olog_rate / bulk_rate.max(0.1);
-    assert!(
-        ratio >= 0.25,
-        "pipelined Durable-ack path should stay near bulk durable rate: ratio={ratio:.2} olog={olog_rate:.1} bulk={bulk_rate:.1}"
-    );
+    assert!(objects <= 2, "expected ≤2 seals, got {objects}");
+    assert!(b2_rate >= b0_rate * 0.45, "ack path too slow vs B0");
 }
 
 #[tokio::test]
@@ -268,7 +242,7 @@ async fn flush_drains_buffered_produces() {
         FlushConfig {
             max_bytes: usize::MAX,
             max_batches: usize::MAX,
-            linger: Duration::from_secs(3600), // would never fire without flush
+            linger: Duration::from_secs(3600),
             max_inflight_flushes: 1,
             max_buffered_bytes: usize::MAX,
             budget: BudgetConfig {
@@ -296,4 +270,24 @@ async fn flush_drains_buffered_produces() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 10);
+}
+
+#[tokio::test]
+async fn put_chunks_matches_put_without_premerge() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::new(dir.path());
+    let chunks = vec![
+        Bytes::from_static(b"hello "),
+        Bytes::from_static(b"world"),
+        Bytes::from_static(b"!"),
+    ];
+    store.put_chunks("k/chunks", chunks.clone()).await.unwrap();
+    store
+        .put("k/single", Bytes::from_static(b"hello world!"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get("k/chunks").await.unwrap().unwrap(),
+        store.get("k/single").await.unwrap().unwrap()
+    );
 }

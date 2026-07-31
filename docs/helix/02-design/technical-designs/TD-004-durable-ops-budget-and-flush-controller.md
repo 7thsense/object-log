@@ -170,6 +170,13 @@ effective_linger ∈ [0, config.linger]
 
 Hard triggers unchanged: `max_bytes`, `max_batches`, shutdown.
 
+**Early-flush gate (bulk must not split seals):** early-flush only when
+token headroom **and** `queued_bytes ≤ early_flush_max_queued_bytes` (default
+4 MiB). Sustained bulk always waits full linger (or size / `flush()`).
+
+**Local put protocol:** temp → `sync_data` (fdatasync) → rename → dir `fsync`.
+`put_chunks` streams chunks to the temp file (no full pre-merge copy).
+
 **Latency cannot lose:** at `effective_linger` / operator deadline, flush **even
 if undersized** and even if that **overdrafts** the budget under
 `latency_priority`. Under `budget_priority` / `fail_closed`, prefer

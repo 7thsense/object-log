@@ -33,6 +33,10 @@ pub struct BudgetConfig {
     pub early_flush_fill_ratio: f64,
     /// Suppress consecutive early-flushes for this long after one fires.
     pub early_flush_cooldown: Duration,
+    /// Early-flush only when the mutable queue holds at most this many bytes
+    /// (idle / sparse traffic). Bulk ingest above this threshold always waits
+    /// full linger (or size/`flush`). `0` disables early-flush entirely.
+    pub early_flush_max_queued_bytes: usize,
     /// Max wait for tokens under [`BudgetMode::BudgetPriority`].
     pub admission_timeout: Duration,
 }
@@ -49,6 +53,8 @@ impl Default for BudgetConfig {
             default_capacity_per_sec: 50.0,
             early_flush_fill_ratio: 0.5,
             early_flush_cooldown: Duration::from_millis(5),
+            // ~4 MiB: single-op / sparse OK; sustained bulk waits full linger.
+            early_flush_max_queued_bytes: 4 * 1024 * 1024,
             admission_timeout: Duration::from_millis(100),
         }
     }
@@ -153,9 +159,17 @@ impl BudgetRuntime {
         (self.tokens / burst).clamp(0.0, 1.0)
     }
 
-    /// Whether headroom allows early flush (effective linger 0).
-    pub fn allow_early_flush(&self, now: Instant) -> bool {
+    /// Whether headroom + idle queue allow early flush (effective linger 0).
+    ///
+    /// `queued_bytes` is the current mutable queue size. Bulk ingest
+    /// (`queued_bytes > early_flush_max_queued_bytes`) never early-flushes so
+    /// linger can pack seals (rate × wait).
+    pub fn allow_early_flush(&self, now: Instant, queued_bytes: usize) -> bool {
         if !self.config.enabled {
+            return false;
+        }
+        let max_q = self.config.early_flush_max_queued_bytes;
+        if max_q == 0 || queued_bytes > max_q {
             return false;
         }
         if self.fill_ratio() < self.config.early_flush_fill_ratio {
