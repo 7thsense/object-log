@@ -54,8 +54,9 @@ keys, or put Kafka semantics in object-log.
 
 1. Budget-aware **flush controller** in `LogEngine` (not rebuild group-commit).
 2. Currency = **media / billable durable ops**.
-3. Auto-drives **effective linger + headroom early-flush**; `max_bytes` /
-   `max_inflight` remain hard caps (indirectly governed by flush rate).
+3. Auto-drives **effective linger + headroom early-flush**. Segment size under
+   load is **rate × linger**; `max_bytes` is a high physics ceiling (default
+   ~1 GiB) so size does not short-circuit linger.
 4. Modes: `latency_priority` (default) | `budget_priority` | `fail_closed`.
    **Latency cannot lose** for admitted work: only **backpressure** and/or
    **small flushes** (overdraft + undersize metrics).
@@ -81,7 +82,7 @@ keys, or put Kafka semantics in object-log.
 
 ### Non-goals
 
-- Auto-mutating `max_bytes` / `max_inflight` directly.
+- Treating `max_bytes` as a performance knob (it is a safety ceiling; packing is linger).
 - Kafka idempotence / epoch fencing inside object-log.
 - Distributed multi-process Local coordination.
 - Weakening durable-on-return `put` or Sequenced semantics.

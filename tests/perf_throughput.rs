@@ -78,20 +78,21 @@ async fn local_arbitrary_chunks_with_flush_near_bulk_durable_throughput() {
     let bulk_rate = mib_s(total, bulk_elapsed);
 
     // object-log: clients write arbitrary small/medium chunks, fire-and-forget, then flush.
+    // Defaults: max_bytes ~1 GiB ceiling so packing is linger-driven, not size-capped.
     let blob = Arc::new(LocalBlobStore::new(&olog_dir));
-    let segment = 8 * 1024 * 1024; // co-buffer up to 8 MiB objects
     let engine = LogEngine::new(
         Arc::clone(&blob) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
         FlushConfig {
-            max_bytes: segment,
+            // Keep ceiling above this test's total so seals are linger/flush-bound.
+            max_bytes: FlushConfig::default().max_bytes,
             max_batches: usize::MAX,
             linger: Duration::from_millis(50),
-            max_inflight_flushes: 4,
-            max_buffered_bytes: 64 * 1024 * 1024,
+            max_inflight_flushes: 2,
+            max_buffered_bytes: FlushConfig::default().max_buffered_bytes,
             budget: BudgetConfig {
                 enabled: true,
-                // Generous budget so Local is not rate-starved; linger/size do the packing.
+                // Generous budget so Local is not rate-starved; linger does the packing.
                 default_capacity_per_sec: 10_000.0,
                 budget_fraction: 1.0,
                 budget_per_sec_cap: None,
@@ -147,9 +148,10 @@ async fn local_arbitrary_chunks_with_flush_near_bulk_durable_throughput() {
         objects * 10 < client_chunks,
         "expected strong co-buffering: objects={objects} client_chunks={client_chunks}"
     );
+    // With a high max_bytes ceiling, a single flush barrier should pack into few objects.
     assert!(
-        objects <= (total / segment) as u64 + 4,
-        "object count should track max_bytes packing, got {objects}"
+        objects <= 4,
+        "linger/flush packing should not fan out many objects for {total} bytes, got {objects}"
     );
 
     // Throughput: within the same order as bulk durable sequential writes.
@@ -184,16 +186,15 @@ async fn local_pipelined_chunks_final_durable_ack_near_bulk() {
     let bulk_rate = mib_s(total, bulk_elapsed);
 
     let blob = Arc::new(LocalBlobStore::new(&olog_dir));
-    let segment = 8 * 1024 * 1024;
     let engine = LogEngine::new(
         Arc::clone(&blob) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
         FlushConfig {
-            max_bytes: segment,
+            max_bytes: FlushConfig::default().max_bytes,
             max_batches: usize::MAX,
             linger: Duration::from_millis(50),
-            max_inflight_flushes: 4,
-            max_buffered_bytes: 64 * 1024 * 1024,
+            max_inflight_flushes: 2,
+            max_buffered_bytes: FlushConfig::default().max_buffered_bytes,
             budget: BudgetConfig {
                 enabled: true,
                 default_capacity_per_sec: 10_000.0,

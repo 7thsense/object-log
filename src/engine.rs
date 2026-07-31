@@ -33,22 +33,24 @@ pub enum Durability {
 /// Flush-trigger policy for the engine's group-commit buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct FlushConfig {
-    /// Flush once the buffered object reaches this many bytes (object-size lever;
-    /// the primary S3-cost knob).
+    /// Hard ceiling on one sealed object's payload size (memory / object-store
+    /// physics). **Not** the primary packing control: under normal load packing
+    /// is `ingest_rate × linger`. Keep this high enough that **linger binds**
+    /// before size (default **1 GiB**). Lower only for tight RAM or backend caps.
     pub max_bytes: usize,
-    /// Flush once this many batches are buffered.
+    /// Flush once this many batches are buffered (secondary ceiling).
     pub max_batches: usize,
     /// **Maximum** time a batch may wait before a deadline flush (hard ceiling).
-    /// The budget controller may use a shorter *effective* linger when media
-    /// headroom allows early flush (TD-004). `ZERO` forces ASAP flushes (legacy).
-    /// Default is `50ms` so co-buffering under load is possible while headroom
-    /// early-flush keeps idle latency low.
+    /// This is the latency↔throughput control surface: longer wait ⇒ more bytes
+    /// per seal ⇒ fewer durable ops/s. The budget controller may use a shorter
+    /// *effective* linger when media headroom allows early flush (TD-004).
+    /// `ZERO` forces ASAP flushes (legacy). Default `50ms`.
     pub linger: Duration,
-    /// Maximum number of sealed objects that may be PUT concurrently.
+    /// Max sealed objects PUT concurrently. Default **2** so a ~1 GiB ceiling
+    /// does not multiply into multi‑GiB inflight RAM.
     pub max_inflight_flushes: usize,
-    /// Maximum bytes owned by queued plus in-flight flush work. Producers block
-    /// once this budget is exhausted, which makes memory use an explicit tradeoff
-    /// against latency.
+    /// Max bytes in the mutable queue plus in-flight seals. Producers block when
+    /// exceeded. Default **2 GiB** (one segment assembling + one inflight).
     pub max_buffered_bytes: usize,
     /// Durable-ops budget controller (default on for Fjord).
     pub budget: BudgetConfig,
@@ -57,11 +59,12 @@ pub struct FlushConfig {
 impl Default for FlushConfig {
     fn default() -> Self {
         Self {
-            max_bytes: 128 * 1024 * 1024,
+            // Physics/safety ceiling so linger defines segment size under load.
+            max_bytes: 1024 * 1024 * 1024,
             max_batches: 10_000,
             linger: Duration::from_millis(50),
-            max_inflight_flushes: 4,
-            max_buffered_bytes: 512 * 1024 * 1024,
+            max_inflight_flushes: 2,
+            max_buffered_bytes: 2 * 1024 * 1024 * 1024,
             budget: BudgetConfig::default(),
         }
     }

@@ -189,7 +189,7 @@ fn env_bool(name: &str, default: bool) -> bool {
 #[cfg(feature = "s3")]
 fn config() -> Config {
     let batch_bytes = env_usize("OLOG_SAT_BATCH_BYTES", 8 * 1024 * 1024);
-    let segment_bytes = env_usize("OLOG_SAT_SEGMENT_BYTES", 128 * 1024 * 1024);
+    let segment_bytes = env_usize("OLOG_SAT_SEGMENT_BYTES", 1024 * 1024 * 1024);
     let part_bytes = env_usize("OLOG_SAT_PART_BYTES", 8 * 1024 * 1024);
     let producers = env_usize("OLOG_SAT_PRODUCERS", 32).max(1);
     let flush_inflight = env_usize("OLOG_SAT_FLUSH_INFLIGHT", 16).max(1);
