@@ -727,10 +727,10 @@ async fn headroom_allows_fast_single_produce() {
         )
         .await
         .unwrap();
-    // Should not wait the full 50ms linger when headroom early-flush applies.
+    // After early_flush_idle (10ms) + headroom, should seal before full 50ms linger.
     assert!(
         start.elapsed() < Duration::from_millis(40),
-        "idle produce should early-flush, elapsed={:?}",
+        "idle produce should early-flush after idle gap, elapsed={:?}",
         start.elapsed()
     );
 }

@@ -198,6 +198,10 @@ struct Queue<M> {
     force_flush: bool,
     /// Waiters: (barrier_seq inclusive, responder).
     flush_waiters: Vec<FlushWaiter>,
+    /// Last successful produce enqueue (for idle early-flush).
+    last_enqueue: Option<Instant>,
+    /// Enqueue time of the front item (linger deadline = oldest + linger).
+    oldest_enqueue: Option<Instant>,
 }
 
 struct Shared<M> {
@@ -256,6 +260,8 @@ where
                 completed_through: 0,
                 force_flush: false,
                 flush_waiters: Vec::new(),
+                last_enqueue: None,
+                oldest_enqueue: None,
             }),
             cv: Condvar::new(),
             max_buffered_bytes: config.max_buffered_bytes.max(config.max_bytes),
@@ -400,10 +406,15 @@ where
         if q.shutdown {
             return Err(ObjectLogError::Sequencer("engine shutting down".into()));
         }
+        let now = Instant::now();
         item.seq = q.next_seq;
         q.next_seq = q.next_seq.saturating_add(1);
         q.bytes += item_len;
         q.bytes_in_use += item_len;
+        q.last_enqueue = Some(now);
+        if q.oldest_enqueue.is_none() {
+            q.oldest_enqueue = Some(now);
+        }
         q.items.push_back(item);
         shared.cv.notify_all();
         Ok(())
@@ -485,8 +496,11 @@ where
         } else {
             EffectiveReason::DefaultCapacity
         };
-        let queued = self.shared.queue.lock().expect("poisoned").bytes;
-        let early = budget.allow_early_flush(now, queued);
+        let (queued, last_enq) = {
+            let q = self.shared.queue.lock().expect("poisoned");
+            (q.bytes, q.last_enqueue)
+        };
+        let early = budget.allow_early_flush(now, queued, last_enq);
         let max_linger = self.shared.flush_config.linger;
         let eff_linger = if !budget.config.enabled {
             max_linger
@@ -642,19 +656,48 @@ fn flush_loop<S>(
     }
 }
 
-fn effective_linger<M>(shared: &Shared<M>, config: FlushConfig, queued_bytes: usize) -> Duration {
-    if config.linger.is_zero() || !config.budget.enabled {
-        return config.linger;
+/// How long to sleep before re-evaluating a seal decision.
+/// - `ZERO` means seal now (early-flush or linger deadline hit).
+/// - Otherwise wait at most this long (interrupted by new produces).
+fn effective_linger<M>(
+    shared: &Shared<M>,
+    config: FlushConfig,
+    queued_bytes: usize,
+    last_enqueue: Option<Instant>,
+    oldest_enqueue: Option<Instant>,
+) -> Duration {
+    if config.linger.is_zero() {
+        return Duration::ZERO;
     }
     let now = Instant::now();
-    let mut budget = shared.budget.lock().expect("poisoned");
-    budget.refill(now);
-    if budget.allow_early_flush(now, queued_bytes) {
-        budget.note_early_flush(now);
-        Duration::ZERO
-    } else {
-        config.linger
+    if config.budget.enabled {
+        let mut budget = shared.budget.lock().expect("poisoned");
+        budget.refill(now);
+        if budget.allow_early_flush(now, queued_bytes, last_enqueue) {
+            budget.note_early_flush(now);
+            return Duration::ZERO;
+        }
     }
+    // True linger: seal when the oldest buffered item reaches max wait.
+    if let Some(oldest) = oldest_enqueue {
+        let deadline = oldest + config.linger;
+        if now >= deadline {
+            return Duration::ZERO;
+        }
+        let until_deadline = deadline.saturating_duration_since(now);
+        // Also wake when idle gate could open, so sparse produces don't wait full linger.
+        if config.budget.enabled
+            && !config.budget.early_flush_idle.is_zero()
+            && let Some(last) = last_enqueue
+        {
+            let idle_at = last + config.budget.early_flush_idle;
+            if idle_at > now && idle_at < deadline {
+                return idle_at.saturating_duration_since(now);
+            }
+        }
+        return until_deadline;
+    }
+    config.linger
 }
 
 fn take_batch<M>(
@@ -673,8 +716,10 @@ fn take_batch<M>(
             }
             let linger = {
                 let queued = q.bytes;
+                let last_enq = q.last_enqueue;
+                let oldest = q.oldest_enqueue;
                 drop(q);
-                let l = effective_linger(shared, config, queued);
+                let l = effective_linger(shared, config, queued, last_enq, oldest);
                 q = shared.queue.lock().expect("poisoned");
                 l
             };
@@ -692,8 +737,10 @@ fn take_batch<M>(
 
         let linger = {
             let queued = q.bytes;
+            let last_enq = q.last_enqueue;
+            let oldest = q.oldest_enqueue;
             drop(q);
-            let l = effective_linger(shared, config, queued);
+            let l = effective_linger(shared, config, queued, last_enq, oldest);
             q = shared.queue.lock().expect("poisoned");
             l
         };
@@ -703,7 +750,6 @@ fn take_batch<M>(
         let triggered = q.shutdown || size_trigger || linger.is_zero() || force;
         if triggered {
             if !size_trigger && !q.shutdown && !q.items.is_empty() {
-                // Deadline / early flush / force — may be undersized relative to max_bytes.
                 let mut budget = shared.budget.lock().expect("poisoned");
                 if q.bytes < config.max_bytes && q.items.len() < config.max_batches {
                     budget.undersized_deadline_flushes += 1;
@@ -712,15 +758,10 @@ fn take_batch<M>(
             break;
         }
 
-        let (guard, timeout) = shared.cv.wait_timeout(q, linger).expect("poisoned");
+        // Short wait (until idle gate or linger deadline); re-evaluate, do not
+        // seal solely because a probe sleep timed out.
+        let (guard, _timeout) = shared.cv.wait_timeout(q, linger).expect("poisoned");
         q = guard;
-        if timeout.timed_out() {
-            let mut budget = shared.budget.lock().expect("poisoned");
-            if q.bytes < config.max_bytes && q.items.len() < config.max_batches {
-                budget.undersized_deadline_flushes += 1;
-            }
-            break;
-        }
     }
 
     let force_drain = q.force_flush;
@@ -739,6 +780,12 @@ fn take_batch<M>(
             break;
         }
     }
+    q.oldest_enqueue = if q.items.is_empty() {
+        None
+    } else {
+        // Approximate: next seal window starts now for remaining items.
+        Some(Instant::now())
+    };
     // Keep forcing while a barrier still has queued work.
     if force_drain {
         q.force_flush = !q.items.is_empty() || !q.flush_waiters.is_empty();

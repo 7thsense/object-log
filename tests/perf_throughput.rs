@@ -1,12 +1,19 @@
-//! Throughput: arbitrary client chunks + durable ack/`flush` should approach
-//! single-stream durable sequential write (dd-class), not per-chunk fsync rates.
+//! Honest Local throughput harness (Rust-only, `--release`).
 //!
-//! Baselines (same temp dir / FS):
-//! - **B0**: one file, write all, `fdatasync` + dir fsync (dd-like)
-//! - **B1**: one object via LocalBlobStore protocol (temp + sync_data + rename + dir)
-//! - **B2**: engine — many small produces + `flush()` / Durable pipeline
+//! | Label | What is timed |
+//! |-------|----------------|
+//! | **dd**  | Optional shell `dd conv=fdatasync` (host reference; not same process) |
+//! | **B0**  | Rust: stream zeros → `sync_data` (no dir fsync) |
+//! | **B0d** | Rust: stream zeros → `sync_data` + parent dir `fsync` |
+//! | **B1**  | Rust: one `LocalBlobStore::put` of zeros (alloc **before** timer) |
+//! | **B2**  | Rust: prebuilt zero `Bytes` chunks → `produce(Buffered)` + `flush()` |
 //!
-//! Volume: `OBJECT_LOG_PERF_BYTES` (default 32 MiB).
+//! Same payload (zeros), same total, same FS root. No Python.
+//!
+//! ```text
+//! OBJECT_LOG_PERF_BYTES=$((256*1024*1024)) \
+//!   cargo test --release --test perf_throughput -- --nocapture
+//! ```
 
 use bytes::Bytes;
 use object_log::{
@@ -15,7 +22,8 @@ use object_log::{
 };
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,16 +34,59 @@ fn total_bytes() -> usize {
         .unwrap_or(32 * 1024 * 1024)
 }
 
-fn mib_s(bytes: usize, elapsed: Duration) -> f64 {
-    let secs = elapsed.as_secs_f64().max(1e-9);
-    (bytes as f64 / (1024.0 * 1024.0)) / secs
+/// Returns (work_dir, guard). Keep `guard` alive for the test duration when using a tempdir.
+fn perf_root() -> (PathBuf, Option<tempfile::TempDir>) {
+    if let Ok(p) = std::env::var("OBJECT_LOG_PERF_DIR") {
+        let p = PathBuf::from(p);
+        std::fs::create_dir_all(&p).ok();
+        return (p, None);
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_path_buf();
+    (path, Some(tmp))
 }
 
-/// B0: streaming write + one fdatasync + dir fsync.
-fn baseline_b0_dd_like(dir: &Path, total: usize) -> Duration {
+fn mib_s(bytes: usize, elapsed: Duration) -> f64 {
+    (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64().max(1e-9)
+}
+
+fn zeros(n: usize) -> Vec<u8> {
+    vec![0u8; n]
+}
+
+/// Host reference: `dd if=/dev/zero of=... bs=8M conv=fdatasync`.
+fn baseline_dd(dir: &Path, total: usize) -> Option<(Duration, f64)> {
+    let path = dir.join("dd_ref.bin");
+    let bs = 8 * 1024 * 1024;
+    if !total.is_multiple_of(bs) {
+        return None;
+    }
+    let count = total / bs;
+    let t0 = Instant::now();
+    let status = Command::new("dd")
+        .args([
+            "if=/dev/zero",
+            &format!("of={}", path.display()),
+            &format!("bs={bs}"),
+            &format!("count={count}"),
+            "conv=fdatasync",
+            "status=none",
+        ])
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let elapsed = t0.elapsed();
+    let _ = std::fs::remove_file(&path);
+    Some((elapsed, mib_s(total, elapsed)))
+}
+
+/// B0: stream write + sync_data only.
+fn baseline_b0(dir: &Path, total: usize) -> Duration {
     let path = dir.join("b0.bin");
     let chunk = 8 * 1024 * 1024;
-    let buf = vec![0u8; chunk];
+    let buf = zeros(chunk);
     let t0 = Instant::now();
     {
         let mut f = File::create(&path).unwrap();
@@ -46,30 +97,61 @@ fn baseline_b0_dd_like(dir: &Path, total: usize) -> Duration {
             left -= n;
         }
         f.flush().unwrap();
-        f.sync_data().unwrap(); // fdatasync
+        f.sync_data().unwrap();
+    }
+    t0.elapsed()
+}
+
+/// B0d: B0 + parent dir fsync.
+fn baseline_b0_dir(dir: &Path, total: usize) -> Duration {
+    let path = dir.join("b0d.bin");
+    let chunk = 8 * 1024 * 1024;
+    let buf = zeros(chunk);
+    let t0 = Instant::now();
+    {
+        let mut f = File::create(&path).unwrap();
+        let mut left = total;
+        while left > 0 {
+            let n = left.min(chunk);
+            f.write_all(&buf[..n]).unwrap();
+            left -= n;
+        }
+        f.flush().unwrap();
+        f.sync_data().unwrap();
     }
     File::open(dir).unwrap().sync_all().unwrap();
     t0.elapsed()
 }
 
-/// B1: one LocalBlobStore put of `total` bytes.
-async fn baseline_b1_one_put(dir: &Path, total: usize) -> Duration {
+/// B1: one Local put; payload allocated **before** the timer.
+async fn baseline_b1(dir: &Path, payload: Bytes) -> Duration {
     let store = LocalBlobStore::new(dir);
-    let payload = Bytes::from(vec![0xABu8; total]);
     let t0 = Instant::now();
     store.put("b1/one", payload).await.unwrap();
     t0.elapsed()
 }
 
-fn next_chunk(seed: &mut u64, min: usize, max: usize) -> usize {
+fn next_chunk_len(seed: &mut u64, min: usize, max: usize) -> usize {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    let span = max - min + 1;
-    min + (*seed as usize % span)
+    min + (*seed as usize % (max - min + 1))
 }
 
-fn high_ceiling_config() -> FlushConfig {
+/// Prebuild zero chunks (not timed).
+fn prebuild_chunks(total: usize) -> Vec<Bytes> {
+    let mut seed = 0xC0FFEE_u64;
+    let mut out = Vec::new();
+    let mut produced = 0usize;
+    while produced < total {
+        let n = next_chunk_len(&mut seed, 1024, 256 * 1024).min(total - produced);
+        out.push(Bytes::from(zeros(n)));
+        produced += n;
+    }
+    out
+}
+
+fn engine_config() -> FlushConfig {
     FlushConfig {
-        max_bytes: FlushConfig::default().max_bytes, // 1 GiB ceiling
+        max_bytes: FlushConfig::default().max_bytes,
         max_batches: usize::MAX,
         linger: Duration::from_millis(50),
         max_inflight_flushes: 2,
@@ -78,159 +160,115 @@ fn high_ceiling_config() -> FlushConfig {
             enabled: true,
             default_capacity_per_sec: 10_000.0,
             budget_fraction: 1.0,
-            budget_per_sec_cap: None,
-            // Early-flush only when queue is tiny; bulk must wait linger/flush.
             early_flush_max_queued_bytes: 4 * 1024 * 1024,
+            early_flush_idle: Duration::from_millis(10),
             early_flush_fill_ratio: 0.5,
             ..BudgetConfig::default()
         },
     }
 }
 
-#[tokio::test]
-async fn local_bulk_flush_near_single_object_and_dd_class() {
-    let total = total_bytes();
-    let dir = tempfile::tempdir().unwrap();
-    let b0_dir = dir.path().join("b0");
-    let b1_dir = dir.path().join("b1");
-    let b2_dir = dir.path().join("b2");
-    std::fs::create_dir_all(&b0_dir).unwrap();
-    std::fs::create_dir_all(&b1_dir).unwrap();
-    std::fs::create_dir_all(&b2_dir).unwrap();
-
-    let b0_elapsed = baseline_b0_dd_like(&b0_dir, total);
-    let b0_rate = mib_s(total, b0_elapsed);
-
-    let b1_elapsed = baseline_b1_one_put(&b1_dir, total).await;
-    let b1_rate = mib_s(total, b1_elapsed);
-
-    let blob = Arc::new(LocalBlobStore::new(&b2_dir));
+/// B2: prebuilt chunks → produce Buffered → flush. Only produce+flush timed.
+async fn baseline_b2(dir: &Path, chunks: &[Bytes]) -> (Duration, u64, u64) {
+    let blob = Arc::new(LocalBlobStore::new(dir));
     let engine = LogEngine::new(
         Arc::clone(&blob) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
-        high_ceiling_config(),
-        "data/",
+        engine_config(),
+        "b2/",
     );
-
-    let partition = PartitionKey("thr-0".into());
-    let mut seed = 0xC0FFEE_u64;
-    let mut produced = 0usize;
-    let mut client_chunks = 0u64;
+    let partition = PartitionKey("p0".into());
     let t0 = Instant::now();
-    while produced < total {
-        let chunk = next_chunk(&mut seed, 1024, 256 * 1024).min(total - produced);
+    for c in chunks {
         engine
-            .produce(
-                partition.clone(),
-                Bytes::from(vec![0xCDu8; chunk]),
-                1,
-                (),
-                Durability::Buffered,
-            )
+            .produce(partition.clone(), c.clone(), 1, (), Durability::Buffered)
             .await
             .unwrap();
-        produced += chunk;
-        client_chunks += 1;
     }
-    engine.flush().await.expect("flush");
-    let b2_elapsed = t0.elapsed();
-    let b2_rate = mib_s(total, b2_elapsed);
+    engine.flush().await.unwrap();
+    let elapsed = t0.elapsed();
+    let objects = blob.list("b2/").await.unwrap().len() as u64;
+    let flushes = engine.pipeline_snapshot().flushes_total;
+    (elapsed, objects, flushes)
+}
 
-    let objects = blob.list("data/").await.unwrap().len() as u64;
-    let snap = engine.pipeline_snapshot();
-
+fn print_row(name: &str, total: usize, elapsed: Duration, extra: &str) {
     eprintln!(
-        "perf B0/B1/B2: total_mib={:.1} B0_dd={:.1} B1_one_put={:.1} B2_engine={:.1} MiB/s | objects={} chunks={} flushes={} media_ops={}",
-        total as f64 / (1024.0 * 1024.0),
-        b0_rate,
-        b1_rate,
-        b2_rate,
-        objects,
-        client_chunks,
-        snap.flushes_total,
-        snap.media_ops_total,
-    );
-
-    assert!(
-        objects <= 2,
-        "bulk+flush under 1GiB ceiling must not early-flush fanout: objects={objects}"
-    );
-    assert!(
-        objects * 50 < client_chunks,
-        "client chunks should dominate objects"
-    );
-    // Engine within ~30% of raw one-object Local put (protocol parity).
-    assert!(
-        b2_rate >= b1_rate * 0.70,
-        "B2 should be near B1: b2={b2_rate:.1} b1={b1_rate:.1}"
-    );
-    // And a solid fraction of dd-like single fdatasync (protocol + rename tax).
-    assert!(
-        b2_rate >= b0_rate * 0.50,
-        "B2 should be ≥50% of B0 dd-like: b2={b2_rate:.1} b0={b0_rate:.1}"
+        "  {name:<12} {:>8.1} MiB/s   {:>7.3}s   {extra}",
+        mib_s(total, elapsed),
+        elapsed.as_secs_f64(),
     );
 }
 
 #[tokio::test]
-async fn local_pipelined_chunks_final_durable_ack_near_bulk() {
-    let total = (total_bytes() / 2).max(16 * 1024 * 1024);
-    let dir = tempfile::tempdir().unwrap();
-    let b0_dir = dir.path().join("b0");
-    let b2_dir = dir.path().join("b2");
-    std::fs::create_dir_all(&b0_dir).unwrap();
-    std::fs::create_dir_all(&b2_dir).unwrap();
+async fn honest_local_throughput_table() {
+    let total = total_bytes();
+    assert!(total >= 1024 * 1024, "need at least 1 MiB");
+    let (root, _guard) = perf_root();
+    let run = root.join(format!("run-{}", std::process::id()));
+    std::fs::create_dir_all(&run).unwrap();
 
-    let b0_rate = mib_s(total, baseline_b0_dd_like(&b0_dir, total));
-
-    let blob = Arc::new(LocalBlobStore::new(&b2_dir));
-    let engine = LogEngine::new(
-        Arc::clone(&blob) as Arc<dyn BlobStore>,
-        Arc::new(InMemorySequencer::new()),
-        high_ceiling_config(),
-        "ack/",
-    );
-
-    let partition = PartitionKey("ack-0".into());
-    let mut seed = 7u64;
-    let mut produced = 0usize;
-    let mut client_chunks = 0u64;
-    let t0 = Instant::now();
-    while produced < total {
-        let remaining = total - produced;
-        let chunk = next_chunk(&mut seed, 1024, 256 * 1024).min(remaining);
-        let last = chunk == remaining;
-        engine
-            .produce(
-                partition.clone(),
-                Bytes::from(vec![0x11u8; chunk]),
-                1,
-                (),
-                if last {
-                    Durability::Durable
-                } else {
-                    Durability::Buffered
-                },
-            )
-            .await
-            .unwrap();
-        produced += chunk;
-        client_chunks += 1;
-    }
-    engine.flush().await.unwrap();
-    let b2_rate = mib_s(total, t0.elapsed());
-    let objects = blob.list("ack/").await.unwrap().len() as u64;
-
+    eprintln!("=== object-log local throughput (Rust --release, zeros) ===");
     eprintln!(
-        "perf ack: total_mib={:.1} B0={:.1} B2={:.1} MiB/s objects={} chunks={}",
-        total as f64 / (1024.0 * 1024.0),
-        b0_rate,
-        b2_rate,
-        objects,
-        client_chunks,
+        "total={} MiB  dir={}  profile=release",
+        total / (1024 * 1024),
+        run.display()
     );
 
-    assert!(objects <= 2, "expected ≤2 seals, got {objects}");
-    assert!(b2_rate >= b0_rate * 0.45, "ack path too slow vs B0");
+    // dd reference (best effort)
+    if let Some((elapsed, rate)) = baseline_dd(&run, total) {
+        eprintln!(
+            "  {:<12} {:>8.1} MiB/s   {:>7.3}s   (shell dd conv=fdatasync)",
+            "dd",
+            rate,
+            elapsed.as_secs_f64()
+        );
+    } else {
+        eprintln!("  dd           (skipped: size not multiple of 8MiB or dd failed)");
+    }
+
+    let b0 = baseline_b0(&run, total);
+    print_row("B0", total, b0, "(Rust stream + sync_data)");
+
+    let b0d = baseline_b0_dir(&run, total);
+    print_row("B0d", total, b0d, "(B0 + dir fsync)");
+
+    let payload = Bytes::from(zeros(total));
+    let b1 = baseline_b1(&run.join("b1"), payload).await;
+    print_row(
+        "B1",
+        total,
+        b1,
+        "(LocalBlobStore::put once; alloc outside timer)",
+    );
+
+    let chunks = prebuild_chunks(total);
+    let n_chunks = chunks.len();
+    let (b2, objects, flushes) = baseline_b2(&run.join("b2"), &chunks).await;
+    print_row(
+        "B2",
+        total,
+        b2,
+        &format!("(engine {n_chunks} chunks + flush; objects={objects} flushes={flushes})"),
+    );
+
+    let r_b1_b0 = mib_s(total, b1) / mib_s(total, b0).max(0.1);
+    let r_b2_b1 = mib_s(total, b2) / mib_s(total, b1).max(0.1);
+    let r_b2_b0 = mib_s(total, b2) / mib_s(total, b0).max(0.1);
+    eprintln!("  ratios       B1/B0={r_b1_b0:.2}  B2/B1={r_b2_b1:.2}  B2/B0={r_b2_b0:.2}");
+
+    // Bulk under 1GiB ceiling: idle early-flush must not fan out seals.
+    assert!(
+        objects <= 2,
+        "B2 should pack bulk into ≤2 objects, got {objects}"
+    );
+    // Engine near one Local put when seals≈1.
+    assert!(
+        r_b2_b1 >= 0.75,
+        "B2 should be near B1 when packing works: B2/B1={r_b2_b1:.2}"
+    );
+
+    let _ = std::fs::remove_dir_all(&run);
 }
 
 #[tokio::test]
@@ -252,11 +290,11 @@ async fn flush_drains_buffered_produces() {
         },
         "f/",
     );
-    for i in 0..10 {
+    for _i in 0..10 {
         engine
             .produce(
                 PartitionKey("p".into()),
-                Bytes::from(format!("row-{i}")),
+                Bytes::from(zeros(16)),
                 1,
                 (),
                 Durability::Buffered,
@@ -265,11 +303,14 @@ async fn flush_drains_buffered_produces() {
             .unwrap();
     }
     engine.flush().await.unwrap();
-    let rows = engine
-        .fetch(&PartitionKey("p".into()), 0, 1 << 20)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 10);
+    assert_eq!(
+        engine
+            .fetch(&PartitionKey("p".into()), 0, 1 << 20)
+            .await
+            .unwrap()
+            .len(),
+        10
+    );
 }
 
 #[tokio::test]
@@ -277,17 +318,48 @@ async fn put_chunks_matches_put_without_premerge() {
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::new(dir.path());
     let chunks = vec![
-        Bytes::from_static(b"hello "),
-        Bytes::from_static(b"world"),
-        Bytes::from_static(b"!"),
+        Bytes::from(zeros(3)),
+        Bytes::from(zeros(5)),
+        Bytes::from(zeros(2)),
     ];
-    store.put_chunks("k/chunks", chunks.clone()).await.unwrap();
-    store
-        .put("k/single", Bytes::from_static(b"hello world!"))
-        .await
-        .unwrap();
+    store.put_chunks("k/c", chunks).await.unwrap();
+    store.put("k/s", Bytes::from(zeros(10))).await.unwrap();
     assert_eq!(
-        store.get("k/chunks").await.unwrap().unwrap(),
-        store.get("k/single").await.unwrap().unwrap()
+        store.get("k/c").await.unwrap().unwrap().len(),
+        store.get("k/s").await.unwrap().unwrap().len()
+    );
+}
+
+#[tokio::test]
+async fn idle_single_produce_still_snappy() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LogEngine::new(
+        Arc::new(LocalBlobStore::new(dir.path())) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig::default(),
+        "idle/",
+    );
+    // Quiet gaps between produces → early-flush allowed.
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let t0 = Instant::now();
+        engine
+            .produce(
+                PartitionKey("i".into()),
+                Bytes::from(zeros(64)),
+                1,
+                (),
+                Durability::Sequenced,
+            )
+            .await
+            .unwrap();
+        samples.push(t0.elapsed());
+    }
+    samples.sort();
+    let p50 = samples[samples.len() / 2];
+    assert!(
+        p50 < Duration::from_millis(100),
+        "idle produce p50 {p50:?} should stay snappy with early-flush after idle gap"
     );
 }

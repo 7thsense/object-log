@@ -33,10 +33,14 @@ pub struct BudgetConfig {
     pub early_flush_fill_ratio: f64,
     /// Suppress consecutive early-flushes for this long after one fires.
     pub early_flush_cooldown: Duration,
-    /// Early-flush only when the mutable queue holds at most this many bytes
-    /// (idle / sparse traffic). Bulk ingest above this threshold always waits
-    /// full linger (or size/`flush`). `0` disables early-flush entirely.
+    /// Early-flush only when the mutable queue holds at most this many bytes.
+    /// Combined with [`Self::early_flush_idle`]: bulk continuous ingest should
+    /// not early-flush. `0` disables the byte gate (idle gate may still apply).
     pub early_flush_max_queued_bytes: usize,
+    /// Early-flush only if no produce has been enqueued for at least this long
+    /// (true idle). Sustained produce keeps resetting the timer so bulk waits
+    /// full linger / `flush`. `ZERO` disables the idle gate.
+    pub early_flush_idle: Duration,
     /// Max wait for tokens under [`BudgetMode::BudgetPriority`].
     pub admission_timeout: Duration,
 }
@@ -53,8 +57,10 @@ impl Default for BudgetConfig {
             default_capacity_per_sec: 50.0,
             early_flush_fill_ratio: 0.5,
             early_flush_cooldown: Duration::from_millis(5),
-            // ~4 MiB: single-op / sparse OK; sustained bulk waits full linger.
+            // ~4 MiB: single-op / sparse OK when also idle.
             early_flush_max_queued_bytes: 4 * 1024 * 1024,
+            // Require a quiet gap so continuous bulk cannot be sliced into 4MiB seals.
+            early_flush_idle: Duration::from_millis(10),
             admission_timeout: Duration::from_millis(100),
         }
     }
@@ -159,18 +165,33 @@ impl BudgetRuntime {
         (self.tokens / burst).clamp(0.0, 1.0)
     }
 
-    /// Whether headroom + idle queue allow early flush (effective linger 0).
+    /// Whether headroom + idle allow early flush (effective linger 0).
     ///
-    /// `queued_bytes` is the current mutable queue size. Bulk ingest
-    /// (`queued_bytes > early_flush_max_queued_bytes`) never early-flushes so
-    /// linger can pack seals (rate × wait).
-    pub fn allow_early_flush(&self, now: Instant, queued_bytes: usize) -> bool {
+    /// - `queued_bytes` must be ≤ `early_flush_max_queued_bytes` (if that cap &gt; 0)
+    /// - `last_enqueue` must be at least `early_flush_idle` ago (if idle &gt; 0)
+    ///
+    /// Sustained produce keeps `last_enqueue` fresh → no early-flush → linger/`flush` pack.
+    pub fn allow_early_flush(
+        &self,
+        now: Instant,
+        queued_bytes: usize,
+        last_enqueue: Option<Instant>,
+    ) -> bool {
         if !self.config.enabled {
             return false;
         }
         let max_q = self.config.early_flush_max_queued_bytes;
-        if max_q == 0 || queued_bytes > max_q {
+        if max_q > 0 && queued_bytes > max_q {
             return false;
+        }
+        let idle_need = self.config.early_flush_idle;
+        if !idle_need.is_zero() {
+            let Some(last) = last_enqueue else {
+                return false;
+            };
+            if now.duration_since(last) < idle_need {
+                return false;
+            }
         }
         if self.fill_ratio() < self.config.early_flush_fill_ratio {
             return false;
