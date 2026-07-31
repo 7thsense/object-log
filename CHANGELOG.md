@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `s3_engine_produce_fetch_round_trip` live test; `scripts/s3-evidence.sh`
+  operator evidence runner (MinIO/Garage/AWS/R2).
+- Garage operator evidence recorded (path-style multipart + engine path).
+
 ### Changed
 
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.

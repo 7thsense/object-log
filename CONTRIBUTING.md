@@ -29,24 +29,23 @@ cargo run --features cli --bin object-log -- \
 cargo test --features cli --test cli_smoke
 ```
 
-### Optional: live S3 / MinIO evidence
+### Optional: live S3 operator evidence
 
 Hermetic unit tests never require S3. CI runs MinIO automatically (`s3-minio`
-job). Locally:
+job). To record **provider evidence** (and get a paste-ready TD-002 row):
 
 ```sh
-# Example against a local MinIO (path-style) with a pre-created bucket:
-export OBJECT_LOG_S3_ENDPOINT=http://127.0.0.1:19000
-export OBJECT_LOG_S3_BUCKET=object-log-test
-export OBJECT_LOG_S3_KEY_ID=minioadmin
-export OBJECT_LOG_S3_SECRET=minioadmin
-export OBJECT_LOG_S3_REGION=us-east-1
-cargo test --features s3 --test s3 -- --nocapture
+./scripts/s3-evidence.sh minio
+OBJECT_LOG_S3_KEY_ID=… OBJECT_LOG_S3_SECRET=… ./scripts/s3-evidence.sh garage
+# AWS / R2:
+OBJECT_LOG_S3_ENDPOINT=… OBJECT_LOG_S3_BUCKET=… \
+OBJECT_LOG_S3_KEY_ID=… OBJECT_LOG_S3_SECRET=… \
+  ./scripts/s3-evidence.sh aws
 ```
 
-Legacy `FJORD_GARAGE_*` env names are accepted as aliases. Without these vars the
-S3 tests skip and pass. For Garage/AWS/R2, use the same suite and record results
-in TD-002 before claiming that class.
+Paste the printed markdown row into
+`docs/helix/02-design/technical-designs/TD-002-s3-adapter-retention-and-snapshots.md`
+(evidence log). Legacy `FJORD_GARAGE_*` env names still work.
 
 ### Optional: honest local throughput
 

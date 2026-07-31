@@ -94,7 +94,7 @@ ddx:
 | Correctness gate | `cargo test --all-features` |
 | Perf evidence | CI job `perf`: `cargo test --release --test perf_throughput honest` with `OBJECT_LOG_PERF_BYTES=16MiB` |
 | Clippy | `cargo clippy --all-targets --all-features -- -D warnings` |
-| Live S3 | CI job `s3-minio` (MinIO); other providers via `OBJECT_LOG_S3_*` + `tests/s3.rs` |
+| Live S3 | CI `s3-minio`; operator `./scripts/s3-evidence.sh` (MinIO/Garage evidenced; AWS/R2 when creds available) |
 
 ## Risks
 

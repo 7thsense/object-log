@@ -90,35 +90,51 @@ Amortization is **group-commit + linger** (PRD FR-10/FR-24), not a min-records r
 
 ### Operator runbook (evidence)
 
+Preferred helper (prints a paste-ready evidence row; never prints secrets):
+
 ```bash
-# MinIO/Garage/LocalStack with path-style access and a dedicated bucket:
+# MinIO (defaults: 127.0.0.1:19000, minioadmin/minioadmin)
+./scripts/s3-evidence.sh minio
+
+# Garage (path-style; supply a key with R/W on the bucket)
+OBJECT_LOG_S3_KEY_ID=… OBJECT_LOG_S3_SECRET=… \
+  ./scripts/s3-evidence.sh garage
+
+# AWS / R2 / other S3-compatible (path-style endpoint URL)
 OBJECT_LOG_S3_ENDPOINT=… OBJECT_LOG_S3_BUCKET=… \
 OBJECT_LOG_S3_KEY_ID=… OBJECT_LOG_S3_SECRET=… \
-OBJECT_LOG_S3_REGION=us-east-1 \
-  cargo test --features s3 --test s3 -- --nocapture
+OBJECT_LOG_S3_REGION=… \
+  ./scripts/s3-evidence.sh aws   # or r2 / custom
 ```
 
-Record: date, endpoint class (MinIO/Garage/AWS), both tests green, and note that
-default CI remains hermetic (skips without env). Claim “S3 production supported”
-only when this suite has been run against the target class.
+Suite (`tests/s3.rs`, feature `s3`):
+
+1. `s3_blob_store_round_trip` — put/get/get_range/list/delete  
+2. `s3_multipart_put_get_range_round_trip` — 6 MiB multipart + range GET  
+3. `s3_engine_produce_fetch_round_trip` — LogEngine + ManifestSequencer over S3  
+
+Claim a provider class only when **all three** are green. Default CI remains
+hermetic without env; the `s3-minio` job runs continuously against MinIO.
 
 ### Evidence log
 
 | Date | Target | Result |
 |------|--------|--------|
-| 2026-07-31 | MinIO on `127.0.0.1:19000` (bucket `object-log-test`) | `s3_blob_store_round_trip` + `s3_multipart_put_get_range_round_trip` green |
+| 2026-07-31 | MinIO on `127.0.0.1:19000` (bucket `object-log-test`) | adapter put/get/range green (pre-engine suite) |
 | 2026-07-31+ | GitHub Actions `s3-minio` job (MinIO docker, path-style) | Continuous; blocks merge on failure |
+| 2026-07-31 | **minio** @ `http://127.0.0.1:19000` (bucket `object-log-evidence`, host `sindri`) | all three suite tests green via `./scripts/s3-evidence.sh minio` |
+| 2026-07-31 | **garage** v2.2.0 @ `http://127.0.0.1:3900` (bucket `object-log-evidence`, host `sindri`) | all three suite tests green via `./scripts/s3-evidence.sh garage`; CLI produce/consume `--lines` also green |
 
 ### Provider matrix (claims)
 
 | Provider class | Path-style | Evidence path | Status |
 |----------------|------------|---------------|--------|
-| MinIO | yes | CI `s3-minio` + local runbook | **Supported (evidenced)** |
-| Garage | yes | Operator: same env vars as MinIO | Candidate — re-run `tests/s3.rs` before claim |
-| AWS S3 | virtual-hosted default; force path-style may be limited | Operator evidence | Candidate |
-| Cloudflare R2 | S3-compatible endpoint | Operator evidence | Candidate |
+| MinIO | yes | CI `s3-minio` + operator script | **Supported (evidenced)** |
+| Garage (dxflrs ≥2.2) | yes | Operator script on live Garage | **Supported (evidenced)** |
+| AWS S3 | path-style forced in `S3BlobStore::new`; some regions prefer virtual-hosted | Operator: `./scripts/s3-evidence.sh aws` | **Candidate** — no credentials in this environment |
+| Cloudflare R2 | S3-compatible account endpoint | Operator: `./scripts/s3-evidence.sh r2` | **Candidate** — no credentials in this environment |
 
-Do **not** claim production support for a class without a green multipart+range suite against that class.
+Do **not** claim production support for a class without a green full suite against that class.
 
 ## Review Checklist
 
