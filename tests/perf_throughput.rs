@@ -397,9 +397,9 @@ async fn put_chunks_matches_put_without_premerge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_single_produce_still_snappy() {
-    let dir = tempfile::tempdir().unwrap();
+    // Memory: measure early-flush policy, not Local fsync latency.
     let engine = LogEngine::new(
-        Arc::new(LocalBlobStore::new(dir.path())) as Arc<dyn BlobStore>,
+        Arc::new(object_log::MemoryBlobStore::new()) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
         FlushConfig::default(),
         "idle/",
@@ -422,5 +422,8 @@ async fn idle_single_produce_still_snappy() {
     }
     samples.sort();
     let p50 = samples[samples.len() / 2];
-    assert!(p50 < Duration::from_millis(100), "idle produce p50 {p50:?}");
+    assert!(
+        p50 < Duration::from_millis(40),
+        "idle early-flush should beat full linger, p50={p50:?}"
+    );
 }
