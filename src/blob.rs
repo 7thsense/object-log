@@ -253,16 +253,35 @@ impl LocalBlobStore {
         self.media_ops.fetch_add(2, Ordering::Relaxed);
         self.bytes_written.fetch_add(byte_len, Ordering::Relaxed);
     }
+
+    async fn publish_async(
+        &self,
+        path: PathBuf,
+        chunks: Vec<Bytes>,
+    ) -> Result<u64, ObjectLogError> {
+        let run = move || {
+            Self::durable_publish_chunks(path, chunks)
+                .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Multi-thread worker: avoid spawn_blocking queue (flush path uses this).
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(run)
+            }
+            // Current-thread runtime (many unit tests): must not block_in_place.
+            Ok(_) => tokio::task::spawn_blocking(run)
+                .await
+                .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))?,
+            Err(_) => run(),
+        }
+    }
 }
 
 #[async_trait]
 impl BlobStore for LocalBlobStore {
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
         let path = self.path_for(key)?;
-        let byte_len =
-            tokio::task::spawn_blocking(move || Self::durable_publish_chunks(path, vec![value]))
-                .await
-                .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))??;
+        let byte_len = self.publish_async(path, vec![value]).await?;
         self.record_put(byte_len);
         Ok(())
     }
@@ -273,10 +292,7 @@ impl BlobStore for LocalBlobStore {
             1 => self.put(key, chunks.into_iter().next().unwrap()).await,
             _ => {
                 let path = self.path_for(key)?;
-                let byte_len =
-                    tokio::task::spawn_blocking(move || Self::durable_publish_chunks(path, chunks))
-                        .await
-                        .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))??;
+                let byte_len = self.publish_async(path, chunks).await?;
                 self.record_put(byte_len);
                 Ok(())
             }

@@ -63,7 +63,8 @@ impl Default for FlushConfig {
             max_bytes: 1024 * 1024 * 1024,
             max_batches: 10_000,
             linger: Duration::from_millis(50),
-            max_inflight_flushes: 2,
+            // 1 = single-flight seal (best Local bulk); raise for parallel S3 PUTs.
+            max_inflight_flushes: 1,
             max_buffered_bytes: 2 * 1024 * 1024 * 1024,
             budget: BudgetConfig::default(),
         }
@@ -586,8 +587,17 @@ fn flush_loop<S>(
             match take_batch(&shared, config, wait_for_more) {
                 TakeBatch::Batch(batch) => {
                     counter += 1;
-                    pending.push_back(start_flush_work(&rt, &blob, &prefix, counter, batch));
-                    active_puts += 1;
+                    // When only one inflight slot, run the put to completion on this
+                    // thread via block_on (Local uses block_in_place) — avoids an
+                    // extra task hop for the common single-seal bulk path.
+                    let work = if max_inflight == 1 {
+                        start_flush_work_blocking(&rt, &blob, &prefix, counter, batch)
+                    } else {
+                        let w = start_flush_work(&rt, &blob, &prefix, counter, batch);
+                        active_puts += 1;
+                        w
+                    };
+                    pending.push_back(work);
                 }
                 TakeBatch::Empty => break,
                 TakeBatch::Shutdown => shutdown = true,
@@ -841,15 +851,11 @@ fn send_durable_acks(responders: &mut [(Durability, Option<Responder>)]) {
     }
 }
 
-fn start_flush_work<M>(
-    rt: &tokio::runtime::Runtime,
-    blob: &Arc<dyn BlobStore>,
+fn prepare_flush_work<M>(
     prefix: &str,
     counter: u64,
     mut batch: Vec<Pending<M>>,
-) -> FlushWork<M> {
-    // Record each batch's range in the logical object. Payload chunks are handed
-    // to the BlobStore without first materializing one full contiguous buffer.
+) -> (FlushWork<M>, String, Vec<Bytes>) {
     let mut locations: Vec<BatchLocation> = Vec::with_capacity(batch.len());
     let mut chunks: Vec<Bytes> = Vec::with_capacity(batch.len());
     let key = format!("{prefix}{counter:020}");
@@ -870,31 +876,58 @@ fn start_flush_work<M>(
             batch.len()
         );
     }
-
-    // Move responders out (so the commit borrow of `batch` doesn't conflict).
     let responders: Vec<(Durability, Option<Responder>)> = batch
         .iter_mut()
         .map(|p| (p.durability, p.responder.take()))
         .collect();
     let max_seq = batch.iter().map(|p| p.seq).max().unwrap_or(0);
-
-    let blob = Arc::clone(blob);
-    // Reset stats so this put's media_ops can be isolated (shared store may have
-    // other traffic; best-effort for single-engine-per-store deployments).
-    let _ = blob.take_media_op_stats();
-    let put_started = Instant::now();
-    let put = rt.spawn(async move { put_chunks_with_retries(&blob, &key, chunks).await });
-
-    FlushWork {
+    let work = FlushWork {
         batch,
         locations,
         responders,
         bytes: offset,
         max_seq,
-        put: Some(put),
-        put_started,
+        put: None,
+        put_started: Instant::now(),
         put_result: None,
-    }
+    };
+    (work, key, chunks)
+}
+
+fn start_flush_work<M>(
+    rt: &tokio::runtime::Runtime,
+    blob: &Arc<dyn BlobStore>,
+    prefix: &str,
+    counter: u64,
+    batch: Vec<Pending<M>>,
+) -> FlushWork<M> {
+    let (mut work, key, chunks) = prepare_flush_work(prefix, counter, batch);
+    let blob = Arc::clone(blob);
+    let _ = blob.take_media_op_stats();
+    work.put_started = Instant::now();
+    work.put = Some(rt.spawn(async move { put_chunks_with_retries(&blob, &key, chunks).await }));
+    work
+}
+
+/// Run put to completion on the flush thread (no concurrent inflight put task).
+fn start_flush_work_blocking<M>(
+    rt: &tokio::runtime::Runtime,
+    blob: &Arc<dyn BlobStore>,
+    prefix: &str,
+    counter: u64,
+    batch: Vec<Pending<M>>,
+) -> FlushWork<M> {
+    let (mut work, key, chunks) = prepare_flush_work(prefix, counter, batch);
+    let blob = Arc::clone(blob);
+    let _ = blob.take_media_op_stats();
+    work.put_started = Instant::now();
+    let put_result = rt.block_on(put_chunks_with_retries(&blob, &key, chunks));
+    let elapsed = work.put_started.elapsed();
+    work.put_result = Some(match put_result {
+        Ok(()) => Ok(elapsed),
+        Err(e) => Err(e),
+    });
+    work
 }
 
 fn finish_flush_work<S, M>(
