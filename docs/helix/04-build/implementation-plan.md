@@ -5,6 +5,7 @@ ddx:
     - td-core-and-object-backend
     - td-s3-adapter-retention-snapshots
     - td-conformance-kafka-backend-extraction
+    - td-durable-ops-budget-and-flush-controller
     - test-plan
 ---
 
@@ -12,63 +13,66 @@ ddx:
 
 ## Build Order
 
-object-log must land before Fjord depends on it for durable Kafka produce/fetch
-behavior. Work is ordered so Fjord can still build protocol scaffolding against
-traits and conformance fixtures while object-log storage matures.
+object-log 0.2.x re-foundation (ADR-002) is **implemented**. Remaining work hardens conformance, documentation for consumers, and deferred P2s—not a rebuild of the Kafka-shaped 0.1 API.
 
 ## Milestones
 
-### M1: Harden Existing Core
+### M0: Re-foundation (done)
 
-- Extract conformance tests out of object-backend-specific tests.
-- Add pqueue and Niflheim opaque payload fixtures.
-- Add negative tests for malformed topics, offset gaps, stale epochs, manifest
-  conflicts, and duplicate idempotent appends.
-- Gate: `cargo test` and `cargo clippy --all-targets -- -D warnings`.
+- BlobStore + Memory/Local/S3
+- LogEngine group-commit + Durability
+- Sequencer + InMemory + Manifest
+- TD-004 budget controller
+- Gate: `cargo test` green for P0 suite
 
-### M2: Retention and Snapshot Hooks
+### M1: Conformance Hardening
 
-- Add snapshot and retention model types.
-- Implement retention planning without deleting objects.
-- Implement CAS-protected manifest rewrite for retired segments.
-- Implement orphan cleanup for failed CAS writes.
-- Gate: local/memory retention tests and corruption tests pass.
+- Extract reusable Sequencer conformance helpers (optional module under `tests/` or `src` test utils).
+- Add multi-producer send-order / in-flight contiguity test (ADR-002 residual).
+- Ensure FR→test table in test-plan stays accurate after renames.
+- Gate: `cargo test` + `cargo clippy --all-targets -- -D warnings`.
 
-### M3: S3-Compatible Adapter
+### M2: Consumer Integration Docs (FEAT-006)
 
-- Add runtime-configured S3 adapter.
-- Add capability detection and production config validation.
-- Add local S3-compatible integration tests.
-- Gate: adapter passes object-store and log-backend conformance.
+- Document fjord binding sketch (acks→Durability, Sequencer Meta) in TD-003 / README links.
+- Document Niflheim cold-tier BlobStore/`get_range` usage.
+- No product schemas in object-log.
+- Gate: docs review; no new Kafka types in public API.
 
-### M4: Kafka Backend and Shared Conformance
+### M3: S3 Production Evidence
 
-- Add runtime-configured Kafka backend adapter.
-- Add env-gated tests against a real Kafka-compatible broker.
-- Publish conformance fixtures for Fjord.
-- Gate: memory, local, S3-compatible, and Kafka backends pass shared tests.
+- Env-gated CI or operator runbook for MinIO/Garage/LocalStack.
+- Confirm multipart + get_range against at least one S3-compatible target.
+- Gate: recorded evidence before “S3 production supported” claims.
 
-### M5: Extraction Readiness
+### M4: Deferred P2 (optional)
 
-- Document Niflheim object-WAL migration map.
-- Document pqueue object-log/SQLite projection integration map.
-- Decide whether shared Kafka wire scaffolding becomes a separate sibling crate.
-- Gate: downstream integration beads can proceed without changing object-log
-  core semantics.
+- `fetch_stream` if Niflheim (or other) blocks on materializing wide fetches.
+- Orphan reaper design + implementation.
+- Gate: design snippet + tests; does not block 0.2.x consumers.
 
-## Test Plan
+### M5: 1.0 Readiness
 
-- Unit: model validation, segment codec, retention planning, provider
-  capability checks.
-- Integration: append/read, manifest CAS conflict, stale epoch, corruption,
-  retention, orphan cleanup.
-- Optional external: S3-compatible adapter and Kafka backend.
-- Performance: segment encode/decode throughput, records per segment, PUTs per
-  million records under representative pqueue and Niflheim batch sizes.
+- API freeze review against CONTRACT-001/002 v2.
+- CHANGELOG and semver discipline.
+- Gate: no open P0 FR without a test; layer-purity grep clean.
 
-## Exit Criteria
+## Explicitly Not Planned (rejected)
 
-- All P0 FRs in the PRD are covered by named tests or an explicit deferred bead.
-- No production profile permits one-record-per-object commits.
-- pqueue and Niflheim payload fixtures pass the same conformance suite.
-- Fjord can depend on object-log without forking storage or segment logic.
+- Restore `ObjectLogBackend` / segment codec / EpochGuard / CAS ObjectStore.
+- Kafka `LogBackend` adapter inside this crate.
+- Production min-records reject flag as the amortization mechanism.
+
+## Test Plan Summary
+
+- Unit/integration: see `docs/helix/03-test/test-plan.md`.
+- Perf: release-mode honest throughput; debug may not meet B2≈B0 floor.
+- Optional external: S3.
+
+## Exit Criteria (current product)
+
+- All P0 FRs covered by named tests in the test plan table.
+- Under continuous produce, PUT count tracks flushes (amortization tests green).
+- ManifestSequencer restart test green.
+- Public docs match ADR-002 (engine + sequencer, not Kafka core).
+- HELIX frame/contracts/TDs no longer describe ADR-001 surfaces.

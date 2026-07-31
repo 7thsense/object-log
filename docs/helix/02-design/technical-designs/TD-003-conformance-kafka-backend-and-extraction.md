@@ -3,124 +3,123 @@ ddx:
   id: td-conformance-kafka-backend-extraction
   depends_on:
     - td-core-and-object-backend
+    - adr-object-storage-log-engine-and-sequencer-seam
     - prd
 ---
 
-# Technical Design: TD-003 Conformance, Kafka Backend, and Extraction
+# Technical Design: TD-003 Conformance and Consumer Integration
+
+**Status**: accepted (rewritten for object-log 0.2.x / ADR-002)  
+**Related**: CONTRACT-001/002 v2, PRD FR-27..FR-30, FEAT-006  
+**Supersedes**: TD-003 v1 (Kafka-backed `LogBackend` inside object-log; wire scaffolding in this crate)
 
 ## Scope
 
-This design defines the shared test contract that keeps object-log usable by
-pqueue, Niflheim, Fjord, and a real Kafka backend.
+**In scope**
 
-In scope:
+- Shared behavioral expectations for BlobStore adapters and Sequencer implementations
+- Integration maps for fjord, Niflheim cold tier, and pqueue-class consumers
+- Explicit boundary: Kafka wire/protocol crates stay **outside** object-log
 
-- A backend conformance suite for append/read/idempotence/fencing semantics.
-- A Kafka-backed `LogBackend` adapter for low-latency deployments.
-- Niflheim extraction guidance for object WAL primitives.
-- Boundaries between object-log and a reusable Kafka protocol crate.
+**Out of scope**
 
-Out of scope:
+- Implementing a Kafka produce/fetch backend inside object-log
+- Kafka TCP, SASL, consumer groups, transactions
+- Shipping heimq or fjord code in this repository
 
-- Kafka TCP wire protocol inside object-log.
-- Consumer group coordination.
-- Niflheim event parsing or schema registry logic.
-- Fjord metadata/control-plane implementation.
+## Conformance Suites
 
-## Niflheim Kafka Protocol Lessons
+### BlobStore conformance
 
-Niflheim's Kafka path separates reusable protocol mechanics from product logic:
+Every `BlobStore` adapter MUST pass:
 
-- `kafka-protocol` crate handles Kafka message structs and record batch codecs.
-- Connection code handles frame length prefixes, request headers, API version
-  selection, SASL handshake/authenticate, handler dispatch, and Kafka error
-  frames.
-- The reader task only reads frames into a bounded channel while the writer
-  handles requests. This lets network reads continue while the durable WAL write
-  is waiting, improving batch coalescing.
-- Produce hot path avoids payload copies by cloning `Bytes` and decoding record
-  batches only once.
-- Domain logic begins after protocol decode: tenant/table routing, RBAC,
-  envelope parsing, schema handling, WAL entry encoding, and materialization
-  hooks are Niflheim-specific.
+| Case | Required behavior |
+|------|-------------------|
+| put/get round-trip | bytes preserved |
+| get missing | `None` |
+| get_range slice / empty / OOB | slice ok; empty range empty; OOB error |
+| list prefix | returns written keys under prefix |
+| delete missing | success |
+| invalid key | `InvalidObjectKey` |
+| Local durability | data readable after new `LocalBlobStore` on same root |
 
-Reusable candidate: Kafka wire scaffolding and compatibility harness.
-Non-reusable: Niflheim topic semantics, event parsing, row/WAL encoding, and
-materialization triggers.
+Reference: `tests/blob.rs` (`port_suite`).
 
-## Shared Kafka Protocol Boundary
+### Engine + Sequencer behavioral suite
 
-A future shared crate should be independent of object-log and Fjord:
+| Case | Required behavior | Reference test |
+|------|-------------------|----------------|
+| produce/fetch round-trip | opaque bytes + offsets | `produce_fetch_round_trip` |
+| PUT amortization | objects independent of partition count under group-commit | `put_count_independent_of_partition_count` |
+| Sequenced ⇒ durable | offsets only when sequenced | `sequenced_implies_durable` |
+| Dense concurrent offsets | no gaps under concurrent producers | `concurrent_producers_get_dense_contiguous_offsets` |
+| PUT hard fail | no ack, no offset | `put_failure_yields_no_ack_no_offset` |
+| Transient PUT retry | eventually acks | `transient_put_failure_is_retried_before_ack` |
+| Commit fail + retry | exactly-once visibility; fresh object key | `commit_failure_orphans_object_and_retry_is_exactly_once` |
+| Atomic multiplex | commit Err acks none | `multiplexed_commit_is_all_or_nothing` |
+| Duplicate outcome | prior offset, no double append | `idempotent_retry_does_not_duplicate` |
+| truncate_before | deletes only dead objects | `truncate_before_deletes_dead_objects` |
+| Manifest restart | index survives reopen | `manifest_index_survives_restart` |
 
-```rust
-pub trait KafkaRequestHandler: Send + Sync {
-    fn api_key(&self) -> i16;
-    fn min_version(&self) -> i16;
-    fn max_version(&self) -> i16;
-    async fn handle(&self, request: KafkaRequestContext, body: bytes::Bytes)
-        -> Result<bytes::BytesMut, KafkaProtocolError>;
-}
+### Sequencer implementor checklist
+
+A custom `Sequencer` MUST:
+
+1. Assign offsets atomically across the full `commit` slice (all-or-nothing).
+2. Return one `CommitOutcome` per input batch in order.
+3. Honor `Duplicate` when recognizing idempotent retries via `Meta`.
+4. Ensure `lookup` only returns entries whose bytes are durable (engine guarantees put-before-commit).
+5. On `truncate_before`, return only object ids with zero remaining references **across partitions**.
+
+Recommended follow-up (ALIGN residual): extract a shared `sequencer_conformance` helper module for third-party sequencers; today tests use InMemory + ad-hoc fakes.
+
+## Consumer Integration Maps
+
+### Fjord (broker)
+
+```text
+heimq: Kafka wire + record batch codec (offset stamp in format)
+fjord-coordinator: impl object_log::Sequencer (Meta = producer fields; fencing; EOS)
+fjord binding: map Kafka acks → Durability; LogEngine::produce/fetch
+object-log: BlobStore + group-commit only
 ```
 
-It may provide:
+object-log MUST NOT grow Kafka types to “help” fjord (PRD FR-30).
 
-- frame read/write with maximum frame limits,
-- request/response header version selection,
-- API version registry,
-- SASL PLAIN/TLS plumbing,
-- common error-frame construction,
-- Kafka record batch decode/encode helpers,
-- compatibility fixtures for Java client, librdkafka/kcat, and kafka-go.
+### Niflheim (cold tier)
 
-It must not provide:
+```text
+Niflheim hot tier: local fsync path (out of object-log scope)
+Niflheim cold: BlobStore put/get_range/list; durable-on-return marks cold_durable
+Optional: use LogEngine or raw BlobStore depending on whether offset index is desired
+Codecs/checksums: Niflheim-owned framing inside opaque bytes
+```
 
-- object-log storage,
-- Fjord group coordination,
-- Niflheim tenant/table resolution,
-- pqueue queue commands.
+### pqueue-class
 
-## Backend Conformance
+```text
+Opaque command bytes as produce payloads
+Projection reads via fetch by offset
+Ownership/fencing: consumer control plane or custom Sequencer Meta
+```
 
-Every `LogBackend` must pass the same semantic tests:
+## Shared Kafka Protocol Boundary (outside this crate)
 
-| Case | Required Behavior |
-|------|-------------------|
-| append batch | returns contiguous offsets after selected ack boundary |
-| read by offset | returns records in partition order |
-| duplicate idempotent append | returns prior offsets without duplicate visibility |
-| stale epoch | fails before acknowledgement |
-| manifest or backend conflict | returns retryable conflict without false ack |
-| corrupt bytes | replay fails closed |
-| opaque pqueue payload | bytes and headers survive round trip |
-| opaque Niflheim payload | bytes and headers survive round trip |
+A future shared protocol crate (heimq or successor) may own:
 
-The conformance suite should run against:
+- frame read/write, API versions, SASL/TLS plumbing
+- record batch encode/decode and offset stamping
 
-- in-memory object backend,
-- local filesystem object backend,
-- S3-compatible object backend,
-- Kafka backend adapter,
-- Fjord embedded object-log integration.
+It must **not** own object-log storage or BlobStore adapters.
 
-## Kafka Backend Adapter
+## Testing / Extraction Gates
 
-The Kafka backend maps `LogBackend` to a real Kafka-compatible broker:
+- object-log P0 suite green on Memory + Local.
+- Optional S3 env tests green before claiming S3 production support.
+- Fjord hermetic parity remains fjord’s merge gate after binding to object-log (not re-run inside this repo by default).
 
-- `append` maps to Kafka produce with explicit topic/partition and configured
-  `acks`.
-- `read` maps to Kafka fetch/consumer assignment by topic partition and offset.
-- Producer idempotence is delegated to Kafka when enabled.
-- Errors are normalized to `ObjectLogError` while preserving retryability.
+## Review Checklist
 
-The adapter is a deployment choice for pqueue/Niflheim when they prefer lower
-commit latency over object-storage cost optimization.
-
-## Implementation Sequence
-
-1. Extract backend conformance tests from `tests/object_backend.rs`.
-2. Run conformance against memory and local stores.
-3. Add pqueue and Niflheim opaque-payload fixtures.
-4. Add Kafka backend trait adapter as a normal runtime-configured backend.
-5. Add optional real-Kafka integration tests gated by environment variables.
-6. File a separate repo/crate proposal for shared Kafka wire scaffolding once
-   Fjord and Niflheim can agree on the minimal API.
+- [x] No Kafka LogBackend inside object-log
+- [x] Conformance cases name real tests
+- [x] Consumer maps respect ADR-002 layering

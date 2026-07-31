@@ -11,19 +11,23 @@ ddx:
 
 | Feature ID | Name | PRD Subsystem | Priority | Status | Notes |
 |------------|------|---------------|----------|--------|-------|
-| FEAT-001 | Kafka-Compatible Core Log | Kafka-Compatible Core Log Model | P0 | defined | Topic/partition/offset records, acks, idempotent producer metadata, backend-neutral append/read |
-| FEAT-002 | Object-Storage Segment Backend | Object Segment Durability | P0 | defined | Sealed segments, deterministic keys, manifest CAS, checksum replay, production batching |
-| FEAT-003 | Ownership and Fencing | Ownership and Concurrency | P0 | defined | External epoch guard, stale writer rejection, no internal consensus |
-| FEAT-004 | Storage Adapter Conformance | Storage Adapter Surface | P0 | defined | Object store trait, in-memory/local adapters, future S3 and Kafka adapters |
-| FEAT-005 | pqueue and Niflheim Compatibility | Compatibility Use Cases | P0 | defined | Opaque payloads and backend substitutability for both systems |
-| FEAT-006 | Kafka Client/Wire Adapters | Compatibility Use Cases | P2 | deferred | Producer client wrappers and wire protocol only after core semantics land |
+| FEAT-001 | BlobStore Port | BlobStore Port | P0 | implemented | put/get/get_range/list/delete; Memory + Local; key validation |
+| FEAT-002 | LogEngine Group-Commit | LogEngine and Group-Commit | P0 | implemented | produce/fetch/flush/truncate_before; Durability levels; linger packing |
+| FEAT-003 | Sequencer Seam | Sequencer Seam | P0 | implemented | sync trait, Meta, atomic commit; InMemory + Manifest sequencers |
+| FEAT-004 | Durable-Ops Budget | Operations and Cost | P1 | implemented | TD-004 budget modes, early-flush, pipeline_snapshot |
+| FEAT-005 | S3 BlobStore Adapter | Operations and Cost | P1 | implemented | feature `s3`; multipart; no store CAS |
+| FEAT-006 | Consumer Integration Maps | Consumer Compatibility | P1 | defined | fjord Sequencer binding + Niflheim cold-tier docs (not product schemas) |
+| FEAT-007 | Streaming Fetch | Non-Goals / P2 | P2 | deferred | `fetch_stream` for wide replay |
+| FEAT-008 | Orphan Reaper | Non-Goals / P2 | P2 | deferred | crash-between-PUT-and-commit cleanup |
+| FEAT-009 | Kafka Types in Core | — | — | rejected | Superseded by ADR-002; was ADR-001 FEAT-001 Kafka-shaped core |
+| FEAT-010 | CAS ObjectStore / EpochGuard | — | — | rejected | Removed in 0.2.0; fencing/dedupe live in Sequencer Meta |
 
 ## Dependency Notes
 
-FEAT-001 is the authority for the shared core contract. FEAT-002, FEAT-003, and FEAT-004 implement concrete backends and safety checks without changing FEAT-001 semantics. FEAT-005 validates that pqueue and Niflheim can consume the contract without product-specific code in object-log. FEAT-006 is explicitly deferred so the core library does not claim full broker compatibility prematurely.
+FEAT-001 and FEAT-003 are the ports. FEAT-002 is the engine that composes them. FEAT-004/005 improve production operability without changing the core contract. FEAT-006 is documentation/integration readiness, not new core types. FEAT-007/008 are explicit deferrals. FEAT-009/010 record rejections so evolve passes do not resurrect ADR-001 surfaces.
 
 ## Review Checklist
 
 - [x] Every PRD subsystem maps to at least one feature.
-- [x] P0 features cover the launch-critical behavior.
-- [x] Deferred Kafka wire/client work is separated from core semantic compatibility.
+- [x] P0 features cover launch-critical behavior and match 0.2.x code.
+- [x] Rejected Kafka/CAS core features are recorded to prevent regression.

@@ -4,128 +4,92 @@ ddx:
   depends_on:
     - td-core-and-object-backend
     - contract-object-store-api
+    - adr-object-storage-log-engine-and-sequencer-seam
     - prd
 ---
 
-# Technical Design: TD-002 S3 Adapter, Retention, and Snapshots
+# Technical Design: TD-002 S3 BlobStore and Retention Mechanism
+
+**Status**: accepted (rewritten for object-log 0.2.x / ADR-002)  
+**Related**: CONTRACT-002 v2, ADR-002, PRD FR-5/FR-17/FR-26  
+**Supersedes**: TD-002 v1 (CAS `ObjectStore`, delegated manifest CAS, snapshot policy types in core)
 
 ## Scope
 
-This design extends the v1 object backend from local/memory stores to real
-S3-compatible object storage and defines the retention/snapshot hooks needed by
-pqueue and Niflheim.
+**In scope**
 
-In scope:
+- Feature-gated `S3BlobStore` implementing `BlobStore`
+- Multipart upload for large puts
+- Retention **mechanism** via `Sequencer::truncate_before` + engine deletes
+- What remains consumer-owned (snapshot policy, when to truncate)
 
-- S3-compatible `ObjectStore` adapter.
-- Provider capability detection for conditional writes.
-- Delegated manifest CAS when the object provider cannot provide safe native
-  compare-and-set.
-- Segment retention after caller-owned snapshots.
-- Snapshot marker records for consumers that project log state elsewhere.
-- Cost guardrails that prevent one-command-per-object production use.
+**Out of scope**
 
-Out of scope:
+- Manifest compare-and-set on the object store
+- Built-in snapshot registry or projection state
+- Provider capability matrix for CAS
+- pqueue SQLite projection / Niflheim codecs
 
-- A pqueue SQLite projection implementation.
-- Niflheim row format migration.
-- Kafka wire protocol.
-- Managed hosted control-plane service.
+## S3-Compatible BlobStore
 
-## Design
+`S3BlobStore` (`src/s3.rs`, feature `s3`) implements CONTRACT-002 v2:
 
-### S3-Compatible Object Store
+| Behavior | Requirement |
+|----------|-------------|
+| Durable put | Service `PutObject` / multipart success ⇒ durable-on-return under S3 semantics |
+| Large objects | Multipart above configured size threshold; callers never manage parts |
+| `get_range` | HTTP Range GET |
+| `list` | Prefix list with internal pagination |
+| `delete` | Idempotent preferred |
+| CAS / put_if_absent | **Not required** and not exposed |
 
-The adapter implements `ObjectStore` over an S3-compatible SDK and reports a
-capability profile at startup:
+Configuration is runtime (endpoint, bucket, credentials, path-style). Production validation is “can put/get/get_range,” not “supports conditional writes.”
 
-| Capability | Required for Production | Notes |
-|------------|--------------------------|-------|
-| `put_if_absent` | Yes | Native conditional put or delegated CAS required |
-| `compare_and_set` | Yes | Manifest commit boundary depends on it |
-| `read_after_write` | Yes for committed keys | Adapter must document provider behavior |
-| `list_consistency` | No for correctness | Manifests, not LIST order, are authoritative |
-| multipart upload | P1 | Needed for large segments and Niflheim-sized batches |
+Optional tests: `tests/s3.rs` (env-gated against a real endpoint when configured).
 
-When native conditional writes are unavailable or ambiguous, configuration must
-name a delegated CAS provider. The preferred delegated provider for small-scale
-deployments is Postgres because pqueue already expects Postgres as a control
-plane option. Delegated CAS remains outside the data plane: segment bytes stay
-in object storage, while only manifest version decisions are stored elsewhere.
+## Retention and Snapshots
 
-### Manifest Commit Boundary
+### Mechanism (in object-log)
 
-Append acknowledgement for `AckMode::All` remains:
+```text
+engine.truncate_before(partition, offset)
+  → sequencer.truncate_before drops index entries with end <= offset
+  → returns object_ids with zero remaining references across ALL partitions
+  → engine deletes those object ids via BlobStore::delete
+```
 
-1. Encode segment bytes.
-2. Put the immutable segment object.
-3. Compare-and-set the manifest from expected version to new version.
-4. Return offsets only after manifest CAS succeeds.
+Multiplexed objects are shared; an object is reclaimable only when **no** partition still references it.
 
-If step 3 fails, the segment object is an unreferenced orphan and must not be
-visible to replay. Background cleanup may delete orphaned segments after a safe
-age threshold.
+### Policy (consumer-owned)
 
-### Retention and Snapshots
+- When truncation is safe (consumer watermark, Kafka DeleteRecords, WAL retire).
+- Snapshot markers and projection high-watermarks live in the consumer’s control plane.
+- object-log does **not** store `SnapshotRef` / `RetentionPolicy` types in core.
 
-object-log does not own downstream projection state, but it must let callers
-record which offsets are safe to retire.
+### Orphans
 
-Core concepts:
+Crash between put and commit can leave unreferenced objects. **Out of scope for 0.2.x.** Consumers or operators may build a reaper with `BlobStore::list` minus the sequencer’s referenced set.
 
-- `SnapshotRef`: caller-owned opaque metadata for a projection snapshot.
-- `RetainedRange`: topic/partition offset range still required for replay.
-- `RetentionPolicy`: delete-by-age, delete-before-offset, and keep-last-N
-  segments.
-- `RetentionPlan`: dry-run result that lists deletable manifest entries,
-  segment objects, and blockers.
+## Cost Guardrails
 
-Snapshot flow:
+Amortization is **group-commit + linger** (PRD FR-10/FR-24), not a min-records reject flag. Under continuous produce, objects ≈ flushes. Idle early-flush may create smaller objects for latency (TD-004).
 
-1. Caller projects log records into its local state.
-2. Caller writes its snapshot through its own storage path.
-3. Caller registers a `SnapshotRef` with the highest fully projected offset.
-4. object-log computes a retention plan that keeps segments after the snapshot
-   offset plus configured safety margin.
-5. object-log rewrites the manifest to mark retired segments before deleting
-   objects.
+## Integration Notes
 
-The manifest rewrite is itself CAS-protected. A failed retention CAS produces a
-retryable conflict and does not delete objects.
-
-## pqueue Requirements
-
-- pqueue can snapshot SQLite projections to object storage and retire old log
-  segments after the snapshot's high watermark.
-- pqueue can choose high-latency low-cost batching for S3 and a Postgres/Kafka
-  backend for lower latency.
-- Retention must never delete commands newer than the last durable SQLite
-  snapshot plus replay safety margin.
-
-## Niflheim Requirements
-
-- Niflheim can reuse the same segment put, manifest CAS, retry, checksum, and
-  orphan cleanup mechanics for WAL cold-tier storage.
-- Niflheim can keep domain-specific row encoding and materialization outside
-  object-log.
-- Retention must support large batches and multipart segment objects.
+| Consumer | S3 role | Retention |
+|----------|---------|-----------|
+| Fjord | BlobStore for multiplexed produce objects | Coordinator policy → `truncate_before` |
+| Niflheim cold tier | BlobStore for coalesced cold objects; may use get_range for chunks | Watermark-driven truncate or consumer-side GC |
+| pqueue-class | Optional S3 log storage | Snapshot HW then truncate |
 
 ## Testing
 
-- Unit tests for provider capability validation.
-- Integration tests against `LocalObjectStore` for retention planning,
-  manifest rewrite, and orphan cleanup.
-- S3 adapter tests against at least one local S3-compatible server before any
-  production profile is accepted.
-- Corruption and stale-manifest tests reused from TD-001.
-- Cost guard test that rejects production configuration below minimum segment
-  size or record count thresholds.
+- Unit/integration without S3: Memory/Local port suite.
+- Optional: env-gated S3 round-trip.
+- Engine tests cover truncate_before delete of dead objects.
 
-## Implementation Sequence
+## Review Checklist
 
-1. Add retention and snapshot model types with pure unit tests.
-2. Add retention planning against in-memory manifests.
-3. Add manifest rewrite and object deletion flow for local/memory stores.
-4. Add S3-compatible store adapter as a normal runtime-configured backend.
-5. Add provider capability validation and production config gates.
-6. Add local S3-compatible integration tests.
+- [x] S3 is BlobStore, not CAS ObjectStore
+- [x] Retention is mechanism-only
+- [x] Aligns with ADR-002 and CONTRACT-002 v2
