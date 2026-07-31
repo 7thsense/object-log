@@ -18,6 +18,8 @@ Project Concerns declare active cross-cutting context for downstream work. They 
 | layer-purity | project-local | `area:api` | Kafka/WAL product types must not leak into the storage engine | No Kafka record/acks/producer triple in public API; consumers map external semantics onto Durability + Meta |
 | tenancy-and-isolation | project-local | `area:api`, `area:data` | Consumers need prefix isolation without a baked-in tenant model | Caller-supplied key prefixes; reject path traversal; no authorization inside the core library |
 | verification | project-local | `area:api`, `area:data`, `area:infra` | Correctness-critical shared infrastructure | Every P0 FR has a named test; BlobStore + engine + sequencer failure modes covered; no phantom claims about Kafka/CAS/wire support |
+| product-microsite-ia | helix concern | `area:site` | Public product surface for evaluators and embedders | Reader modes Evaluate/Start/Decide/Operate → Why / Get Started / Concepts / Reference; homepage first viewport; Playwright screenshots + dead links |
+| hugo-hextra | helix concern | `area:site` | Static docs microsite | `website/` Hugo+Hextra; GitHub Pages; content mirrors IA |
 
 ## Framing Exception: User Stories
 
@@ -45,6 +47,7 @@ If a future operator-facing surface is added, re-open user stories under `frame`
 - `area:data` — payloads, objects, index, replay, checksums (consumer-owned framing)
 - `area:infra` — S3-compatible backends, local filesystem backend, CI and benchmarks
 - `area:cli` — diagnostics binary (`object-log`, feature `cli`): list, inspect, orphans, fetch
+- `area:site` — public microsite (`website/`), Pages deploy, Playwright e2e
 
 ## Concern Conflicts
 

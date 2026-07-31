@@ -20,6 +20,7 @@ ddx:
 | FEAT-007 | Streaming Fetch | LogEngine | P2 | implemented | `LogEngine::fetch_stream` visitor API |
 | FEAT-008 | Orphan Reaper | Operations | P2 | implemented | `reap_orphans` + `live_object_ids` (quiescent-only) |
 | FEAT-011 | Diagnostics CLI | Operations | P2 | implemented | `object-log` bin: produce/consume/roundtrip + list/inspect/orphans |
+| FEAT-012 | Public microsite | Docs / site | P1 | implemented | Hugo+Hextra product IA; Pages deploy; Playwright screenshots + link check |
 | FEAT-009 | Kafka Types in Core | — | — | rejected | Superseded by ADR-002; was ADR-001 FEAT-001 Kafka-shaped core |
 | FEAT-010 | CAS ObjectStore / EpochGuard | — | — | rejected | Removed in 0.2.0; fencing/dedupe live in Sequencer Meta |
 

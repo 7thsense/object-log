@@ -121,6 +121,17 @@ object-log is a **storage engine**, not a Kafka broker or WAL codec.
 
 See `docs/helix/02-design/technical-designs/TD-003-conformance-kafka-backend-and-extraction.md` for conformance cases and binding sketches. Sequencer implementors can mirror `tests/sequencer_conformance.rs`.
 
+## Website
+
+Product microsite (Hugo + Hextra): [7thsense.github.io/object-log](https://7thsense.github.io/object-log/)
+
+```bash
+cd website && npm ci && hugo server
+cd website && npx playwright test   # screenshots + dead-link checks
+```
+
+Deployed by `.github/workflows/pages.yml` on push to `main`.
+
 ## Status
 
 `0.3.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024).

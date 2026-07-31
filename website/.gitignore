@@ -1,0 +1,8 @@
+public/
+resources/
+.hugo_build.lock
+node_modules/
+test-results/
+playwright-report/
+playwright/.cache/
+website/_vendor/

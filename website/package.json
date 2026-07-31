@@ -1,0 +1,14 @@
+{
+  "name": "object-log-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "hugo --gc --minify",
+    "serve": "hugo server -D --bind 127.0.0.1 --baseURL http://127.0.0.1:1313/",
+    "test:e2e": "playwright test",
+    "test:e2e:update": "playwright test --update-snapshots"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
+}

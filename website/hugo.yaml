@@ -1,0 +1,64 @@
+# Public microsite for object-log (HELIX product-microsite-ia + hugo-hextra).
+baseURL: https://7thsense.github.io/object-log/
+languageCode: en-us
+title: object-log
+
+module:
+  imports:
+    - path: github.com/imfing/hextra
+
+enableRobotsTXT: true
+enableGitInfo: true
+
+markup:
+  goldmark:
+    renderer:
+      unsafe: true
+  highlight:
+    noClasses: false
+
+menu:
+  main:
+    - name: Why
+      pageRef: /why
+      weight: 1
+    - name: Get Started
+      pageRef: /get-started
+      weight: 2
+    - name: Concepts
+      pageRef: /concepts
+      weight: 3
+    - name: Reference
+      pageRef: /reference
+      weight: 4
+    - name: GitHub
+      url: https://github.com/7thsense/object-log
+      weight: 10
+      params:
+        icon: github
+
+params:
+  description: >-
+    Embeddable Rust log engine: opaque batches over pluggable object storage,
+    group-committed so PUTs track flushes—not produces—with a pluggable sequencer.
+
+  navbar:
+    displayTitle: true
+    displayLogo: false
+
+  page:
+    width: wide
+
+  theme:
+    default: system
+    displayToggle: true
+
+  footer:
+    displayCopyright: true
+    displayPoweredBy: false
+
+  editURL:
+    enable: true
+    base: https://github.com/7thsense/object-log/tree/main/website/content
+
+defaultContentLanguage: en

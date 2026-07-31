@@ -11,6 +11,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `s3_engine_produce_fetch_round_trip` live test; `scripts/s3-evidence.sh`
   operator evidence runner (MinIO/Garage/AWS/R2).
 - Garage operator evidence recorded (path-style multipart + engine path).
+- Public microsite (`website/`, Hugo+Hextra) with product-microsite-ia sections
+  (Why / Get Started / Concepts / Reference), Playwright e2e (screenshots +
+  dead links), and GitHub Pages deploy workflow.
 
 ### Changed
 
