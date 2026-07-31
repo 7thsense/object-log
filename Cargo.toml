@@ -1,6 +1,6 @@
 [package]
 name = "object-log"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A buffered, multiplexing append log over pluggable object storage, with a sequencing seam (opaque payloads, durable-on-return writes, group-commit)."

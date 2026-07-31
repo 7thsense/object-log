@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-31
+
+Additive release on the ADR-002 engine: conformance hardening, streaming fetch,
+orphan reaping, S3 evidence tooling, and a produce/consume diagnostics CLI.
+No intentional break of the 0.2.0 public engine API.
+
 ### Added
 
 - Sequencer conformance suite (`tests/sequencer_conformance.rs`) for InMemory and
@@ -23,17 +29,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inspect|orphans|fetch` with file/stdin framing (`lines`/`nul`/`framed`) for
   black-box testing; Local and S3 (`cli,s3`).
 - `ManifestSequencer::snapshot` / `IndexSnapshot` for inspect tooling.
+- HELIX frame/contracts/TDs/test plans evolved to match ADR-002 (docs only).
 
 ### Changed
 
-- HELIX frame and design stack evolved to match ADR-002 / 0.2.x: vision, PRD
-  (FR-1..FR-30), concerns, feature registry, CONTRACT-001/002 v2, TD-001..003,
-  test plan, and implementation plan. Kafka-shaped core, CAS `ObjectStore`, and
-  epoch-guard requirements removed from governing docs.
-- Library user-story AC floor waived in concerns; P0 FR→named-test mapping is
-  the coverage gate.
 - Honest local throughput ratio assert runs in `--release` (or with
   `OBJECT_LOG_PERF_ASSERT=1`); debug builds still print the table.
+- Library user-story AC floor waived in concerns; P0 FR→named-test mapping is
+  the coverage gate for this embeddable library.
 
 ## [0.2.0] — 2026-06-17
 

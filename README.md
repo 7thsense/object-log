@@ -37,7 +37,7 @@ Prints dd / B0 / B1 / B2 (zeros, fair timers). See TD-004.
 
 ```toml
 [dependencies]
-object-log = "0.2"
+object-log = "0.3"
 ```
 
 ```rust
@@ -123,7 +123,7 @@ See `docs/helix/02-design/technical-designs/TD-003-conformance-kafka-backend-and
 
 ## Status
 
-`0.2.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024).
+`0.3.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024).
 
 ## License
 
