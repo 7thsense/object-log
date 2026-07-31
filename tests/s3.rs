@@ -59,9 +59,7 @@ fn store(env: &S3Env) -> S3BlobStore {
 }
 
 fn skip() {
-    eprintln!(
-        "OBJECT_LOG_S3_* (or FJORD_GARAGE_*) not fully set — skipping live S3 tests"
-    );
+    eprintln!("OBJECT_LOG_S3_* (or FJORD_GARAGE_*) not fully set — skipping live S3 tests");
 }
 
 #[tokio::test]

@@ -19,8 +19,7 @@
 use bytes::Bytes;
 use clap::{Parser, Subcommand, ValueEnum};
 use object_log::{
-    BlobStore, Durability, FlushConfig, LocalBlobStore, LogEngine, ManifestSequencer,
-    PartitionKey,
+    BlobStore, Durability, FlushConfig, LocalBlobStore, LogEngine, ManifestSequencer, PartitionKey,
 };
 use std::fs;
 use std::io::{self, Read, Write};
@@ -448,7 +447,9 @@ fn collect_batches(inputs: &[PathBuf], mode: IoMode) -> Result<Vec<Bytes>, Strin
             }
             split_buffer(&buf, mode)
         }
-        IoMode::Raw => Err("--mode raw is consume-only; use file/lines/nul/framed for produce".into()),
+        IoMode::Raw => {
+            Err("--mode raw is consume-only; use file/lines/nul/framed for produce".into())
+        }
     }
 }
 
@@ -716,9 +717,8 @@ async fn cmd_roundtrip(
     let mut stdout = io::stdout().lock();
     let mut n = 0usize;
     eng.fetch_stream(&p, 0, |b| {
-        write_batch(&mut stdout, &b.payload, out_mode).map_err(|e| {
-            object_log::ObjectLogError::InvalidBatch(e)
-        })?;
+        write_batch(&mut stdout, &b.payload, out_mode)
+            .map_err(|e| object_log::ObjectLogError::InvalidBatch(e))?;
         n += 1;
         Ok(())
     })
@@ -732,7 +732,10 @@ async fn cmd_roundtrip(
             batches.len()
         ));
     }
-    eprintln!("# roundtrip ok batches={n} partition={:?}", engine.partition);
+    eprintln!(
+        "# roundtrip ok batches={n} partition={:?}",
+        engine.partition
+    );
     Ok(())
 }
 

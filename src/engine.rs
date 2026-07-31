@@ -468,7 +468,7 @@ where
     ///
     /// Calls `visit` once per index entry in order. Suitable for wide offset
     /// windows (bounded-RAM replay). Stops and returns the error if `visit`
-    /// fails. Unlike [`fetch`], there is no byte budget — visit every remaining
+    /// fails. Unlike [`Self::fetch`], there is no byte budget — visit every remaining
     /// batch (or stop yourself inside `visit`).
     pub async fn fetch_stream<F>(
         &self,

@@ -195,7 +195,7 @@ impl BlobStore for MemoryBlobStore {
 ///
 /// Single-node. Writes are **durable-on-return**: each `put` / `put_chunks`:
 /// 1. write a temp file in the same directory as the final key  
-/// 2. [`File::sync_data`] (fdatasync on Unix) so payload bytes are durable  
+/// 2. [`std::fs::File::sync_data`] (fdatasync on Unix) so payload bytes are durable  
 /// 3. `rename` into place  
 /// 4. `fsync` the parent directory so the directory entry survives power loss  
 ///

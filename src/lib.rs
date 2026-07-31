@@ -56,7 +56,7 @@ mod sequencer;
 pub use blob::{BlobStore, LocalBlobStore, MediaOpStats, MemoryBlobStore};
 pub use budget::{BudgetConfig, BudgetMode, EffectiveKnob, EffectiveReason, PipelineSnapshot};
 pub use engine::{
-    reap_orphans, AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine,
+    AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine, reap_orphans,
 };
 pub use error::ObjectLogError;
 pub use manifest_sequencer::{IndexSnapshot, ManifestSequencer, PartitionSnapshot};

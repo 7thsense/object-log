@@ -172,11 +172,7 @@ fn sequencer_err_commits_nothing_template() {
         fn log_start_offset(&self, _: &PartitionKey) -> Result<i64, ObjectLogError> {
             Ok(0)
         }
-        fn truncate_before(
-            &self,
-            _: &PartitionKey,
-            _: i64,
-        ) -> Result<Vec<String>, ObjectLogError> {
+        fn truncate_before(&self, _: &PartitionKey, _: i64) -> Result<Vec<String>, ObjectLogError> {
             Ok(vec![])
         }
     }

@@ -8,9 +8,9 @@ use object_log::{
     InMemorySequencer, IndexEntry, LogEngine, MemoryBlobStore, ObjectLogError, PartitionKey,
     Sequencer,
 };
-use std::sync::atomic::AtomicBool;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
