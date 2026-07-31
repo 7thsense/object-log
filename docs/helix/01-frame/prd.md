@@ -215,7 +215,7 @@ Object storage (memory / local / S3)
 - [x] Is Kafka a backend *inside* object-log? — **No.** Sequencing/coordination stay in the consumer. Closed by ADR-002.
 - [x] Is manifest CAS required of BlobStore? — **No.** Unique object keys + durable put; ManifestSequencer writes its own manifest objects. Closed by ADR-002.
 - [ ] Should `fetch_stream` land before 1.0? — product priority; default defer to P2 unless Niflheim blocks.
-- [ ] Which S3-compatible providers are CI-gated first? — operators; LocalStack/MinIO/Garage candidates.
+- [x] Which S3-compatible providers are evidence-gated first? — **MinIO** (local path-style) recorded 2026-07-31 in TD-002; Garage/AWS/R2 re-run `tests/s3.rs` before claiming.
 
 ## Success Criteria
 

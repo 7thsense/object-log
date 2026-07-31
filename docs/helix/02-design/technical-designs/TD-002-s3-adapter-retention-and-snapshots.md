@@ -85,8 +85,28 @@ Amortization is **group-commit + linger** (PRD FR-10/FR-24), not a min-records r
 ## Testing
 
 - Unit/integration without S3: Memory/Local port suite.
-- Optional: env-gated S3 round-trip.
+- Optional live S3: `tests/s3.rs` (`s3_blob_store_round_trip`, `s3_multipart_put_get_range_round_trip`).
 - Engine tests cover truncate_before delete of dead objects.
+
+### Operator runbook (evidence)
+
+```bash
+# MinIO/Garage/LocalStack with path-style access and a dedicated bucket:
+OBJECT_LOG_S3_ENDPOINT=… OBJECT_LOG_S3_BUCKET=… \
+OBJECT_LOG_S3_KEY_ID=… OBJECT_LOG_S3_SECRET=… \
+OBJECT_LOG_S3_REGION=us-east-1 \
+  cargo test --features s3 --test s3 -- --nocapture
+```
+
+Record: date, endpoint class (MinIO/Garage/AWS), both tests green, and note that
+default CI remains hermetic (skips without env). Claim “S3 production supported”
+only when this suite has been run against the target class.
+
+### Evidence log
+
+| Date | Target | Result |
+|------|--------|--------|
+| 2026-07-31 | MinIO on `127.0.0.1:19000` (bucket `object-log-test`) | `s3_blob_store_round_trip` + `s3_multipart_put_get_range_round_trip` green |
 
 ## Review Checklist
 

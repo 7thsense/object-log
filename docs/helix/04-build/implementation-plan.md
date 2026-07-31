@@ -37,11 +37,12 @@ object-log 0.2.x re-foundation (ADR-002) is **implemented**. Remaining work hard
 - README consumer integration table; TD-003 binding sketches for fjord / Niflheim / pqueue-class.
 - No product schemas in object-log.
 
-### M3: S3 Production Evidence
+### M3: S3 Production Evidence (done for MinIO class)
 
-- Env-gated CI or operator runbook for MinIO/Garage/LocalStack.
-- Confirm multipart + get_range against at least one S3-compatible target.
-- Gate: recorded evidence before “S3 production supported” claims.
+- Operator runbook in CONTRIBUTING + TD-002; `OBJECT_LOG_S3_*` env names.
+- Live tests: round-trip + multipart put/get_range (`tests/s3.rs`).
+- Evidence recorded against local MinIO (2026-07-31) in TD-002.
+- Gate: re-run suite before claiming other providers (Garage/AWS/R2).
 
 ### M4: Deferred P2 (optional)
 

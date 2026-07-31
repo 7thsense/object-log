@@ -13,6 +13,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Engine test: per-producer send-order contiguity on a shared partition
   (`per_producer_send_order_is_contiguous_on_shared_partition`).
 - README + TD-003 consumer integration binding sketches (fjord / Niflheim / pqueue).
+- Live S3 multipart + get_range test; `OBJECT_LOG_S3_*` env aliases; MinIO
+  evidence runbook in CONTRIBUTING/TD-002.
 
 ### Changed
 
