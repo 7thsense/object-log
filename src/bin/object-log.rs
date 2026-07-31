@@ -718,7 +718,7 @@ async fn cmd_roundtrip(
     let mut n = 0usize;
     eng.fetch_stream(&p, 0, |b| {
         write_batch(&mut stdout, &b.payload, out_mode)
-            .map_err(|e| object_log::ObjectLogError::InvalidBatch(e))?;
+            .map_err(object_log::ObjectLogError::InvalidBatch)?;
         n += 1;
         Ok(())
     })
