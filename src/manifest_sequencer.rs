@@ -92,6 +92,19 @@ impl ManifestSequencer {
             }),
         })
     }
+
+    /// Object ids referenced by any live index entry (for orphan reaping).
+    /// Does not include manifest object keys themselves.
+    pub fn live_object_ids(&self) -> HashSet<String> {
+        let st = self.inner.lock().expect("poisoned");
+        let mut live = HashSet::new();
+        for p in st.parts.values() {
+            for e in &p.entries {
+                live.insert(e.location.object_id.clone());
+            }
+        }
+        live
+    }
 }
 
 impl Sequencer for ManifestSequencer {

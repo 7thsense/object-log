@@ -148,6 +148,18 @@ impl InMemorySequencer {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Object ids referenced by any live index entry (for orphan reaping).
+    pub fn live_object_ids(&self) -> HashSet<String> {
+        let state = self.state.lock().expect("poisoned");
+        let mut live = HashSet::new();
+        for ps in state.values() {
+            for e in &ps.entries {
+                live.insert(e.location.object_id.clone());
+            }
+        }
+        live
+    }
 }
 
 impl Sequencer for InMemorySequencer {

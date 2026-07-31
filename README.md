@@ -18,9 +18,11 @@ is decoupled from produce count. It is the storage engine extracted from the
   `Durability::{Buffered,Durable,Sequenced}` or pipeline + **`flush()`**.
   **Linger** packs under load (default 50 ms); **`max_bytes` default 1 GiB** is
   only a safety ceiling. Default-on durable-ops budget; early-flush only when
-  idle (`pipeline_snapshot()`).
+  idle (`pipeline_snapshot()`). **`fetch_stream`** for bounded-RAM replay;
+  **`reap_orphans`** for crash-between-PUT-and-commit cleanup (quiescent only).
 - **`Sequencer` seam** — offsets + index; `InMemorySequencer` and
-  `ManifestSequencer`. Engine forwards `Meta` uninterpreted.
+  `ManifestSequencer` (both expose `live_object_ids()` for reaping). Engine
+  forwards `Meta` uninterpreted.
 
 ## Performance check
 

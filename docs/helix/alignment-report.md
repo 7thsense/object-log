@@ -35,7 +35,7 @@ ddx:
 | ALIGN-004 test-plan + implementation-plan | **Closed** — FR→named-test table; M0 done |
 | ALIGN-005 CHANGELOG Unreleased | **Closed** — removed 0.1 phantom bullets |
 | ALIGN-006 library US waiver | **Closed** — concerns framing exception |
-| Residual | **M1–M3 closed**. Remaining optional: M4 P2 (`fetch_stream`, orphan reaper), M5 1.0 API freeze |
+| Residual | **M1–M4 closed**. M5 draft checklist in implementation-plan; 1.0 version cut is an operator decision |
 
 ## Executive summary (original diagnose)
 

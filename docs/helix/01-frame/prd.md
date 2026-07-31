@@ -54,8 +54,7 @@ Brokers and ingestion systems need amortized durable appends on object storage. 
 - Epoch fencing, leader election, or cluster consensus inside object-log.
 - Product-specific pqueue command envelopes or Niflheim row/WAL codecs.
 - Local hot-tier fsync latency tiers (consumers that need sub-PUT local durability front their own buffer).
-- Orphan-object reaper for crash-between-PUT-and-commit (deferred; `list` enables external reapers).
-- Streaming `fetch_stream` API (optional/deferred; size-bounded `fetch` is P0).
+- Automatic background orphan reaping while writers are active (manual quiescent `reap_orphans` is in scope).
 
 ## Users and Scope
 
@@ -95,8 +94,8 @@ Brokers and ingestion systems need amortized durable appends on object storage. 
 
 ### Nice to Have (P2)
 
-1. Streaming fetch for wide offset windows (`fetch_stream`).
-2. Built-in orphan reaper.
+1. Streaming fetch for wide offset windows (`fetch_stream`) — **implemented**.
+2. Quiescent orphan reaper (`reap_orphans` + `live_object_ids`) — **implemented**.
 3. CLI tools for manifest inspection and object listing.
 
 ## Functional Requirements
@@ -122,7 +121,9 @@ Brokers and ingestion systems need amortized durable appends on object storage. 
 - **FR-14** — On commit failure, no batch in that object MUST be acknowledged as sequenced; a retry MUST use a fresh object key (no aliasing of a failed PUT).
 - **FR-15** — For any single partition key, batches MUST be presented to `commit` in arrival order and MUST NOT be split across concurrent in-flight commits.
 - **FR-16** — `fetch(partition, offset, max_bytes)` MUST use sequencer lookup and `get_range` to return opaque batch payloads with base offsets.
+- **FR-16a** — The library SHOULD provide `fetch_stream` (or equivalent visitor) that yields batches without materializing a full `Vec` for wide replay.
 - **FR-17** — `truncate_before(partition, offset)` MUST drop index entries via the sequencer and delete only object ids the sequencer reports as unreferenced across all partitions.
+- **FR-17a** — The library SHOULD provide orphan reaping that deletes data-prefix objects absent from a live-object set, documented as safe only when writers on that prefix are quiescent.
 
 ### Subsystem: Sequencer Seam
 

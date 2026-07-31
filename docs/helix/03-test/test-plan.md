@@ -66,7 +66,8 @@ ddx:
 |-----|----------|-------|
 | Multi-producer send-order contiguity | **Closed** | `per_producer_send_order_is_contiguous_on_shared_partition` |
 | Sequencer conformance extract | **Closed** | `tests/sequencer_conformance.rs` |
-| `fetch_stream` | P2 | Deferred feature |
+| `fetch_stream` | **Closed** | `fetch_stream_visits_batches_in_order`, `fetch_stream_stops_on_visitor_error` |
+| Orphan reaper | **Closed** | `reap_orphans_deletes_unreferenced_data_objects` |
 
 ## Critical Paths (P0)
 

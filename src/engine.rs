@@ -4,9 +4,11 @@ use crate::budget::{
     BudgetConfig, BudgetMode, BudgetRuntime, EffectiveKnob, EffectiveReason, PipelineSnapshot,
 };
 use crate::sequencer::BatchLocation;
-use crate::{BlobStore, CommitBatch, CommitOutcome, ObjectLogError, PartitionKey, Sequencer};
+use crate::{
+    BlobStore, CommitBatch, CommitOutcome, IndexEntry, ObjectLogError, PartitionKey, Sequencer,
+};
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -228,6 +230,8 @@ pub struct LogEngine<S: Sequencer> {
     shared: Arc<Shared<S::Meta>>,
     blob: Arc<dyn BlobStore>,
     sequencer: Arc<S>,
+    /// Data-object key prefix (`<prefix><counter:020>`). Used by orphan reaping.
+    key_prefix: String,
     flush_thread: Option<JoinHandle<()>>,
 }
 
@@ -270,11 +274,12 @@ where
             budget: Mutex::new(budget_rt),
             flush_config: config,
         });
+        let key_prefix = key_prefix.into();
         let flush_thread = {
             let shared = Arc::clone(&shared);
             let blob = Arc::clone(&blob);
             let sequencer = Arc::clone(&sequencer);
-            let prefix = key_prefix.into();
+            let prefix = key_prefix.clone();
             std::thread::Builder::new()
                 .name("object-log-flush".into())
                 .spawn(move || flush_loop(shared, blob, sequencer, config, prefix))
@@ -284,8 +289,24 @@ where
             shared,
             blob,
             sequencer,
+            key_prefix,
             flush_thread: Some(flush_thread),
         }
+    }
+
+    /// Prefix used for data objects written by this engine.
+    pub fn data_prefix(&self) -> &str {
+        &self.key_prefix
+    }
+
+    /// Borrow the engine's blob store (e.g. for orphan reaping or inspection).
+    pub fn blob_store(&self) -> &Arc<dyn BlobStore> {
+        &self.blob
+    }
+
+    /// Borrow the engine's sequencer.
+    pub fn sequencer(&self) -> &Arc<S> {
+        &self.sequencer
     }
 
     /// Buffer a batch and resolve at the requested [`Durability`].
@@ -436,19 +457,46 @@ where
             if total >= max_bytes && !out.is_empty() {
                 break;
             }
-            let start = e.location.byte_start as u64;
-            let end = start + e.location.byte_len as u64;
-            let bytes = get_range_with_retries(&self.blob, &e.location.object_id, start..end)
-                .await?
-                .ok_or_else(|| ObjectLogError::MissingObject(e.location.object_id.clone()))?;
-            total += bytes.len();
-            out.push(FetchedBatch {
-                base_offset: e.base_offset,
-                record_count: e.record_count,
-                payload: bytes,
-            });
+            let batch = self.load_entry(&e).await?;
+            total += batch.payload.len();
+            out.push(batch);
         }
         Ok(out)
+    }
+
+    /// Stream batches from `offset` onward without materializing a full `Vec`.
+    ///
+    /// Calls `visit` once per index entry in order. Suitable for wide offset
+    /// windows (bounded-RAM replay). Stops and returns the error if `visit`
+    /// fails. Unlike [`fetch`], there is no byte budget — visit every remaining
+    /// batch (or stop yourself inside `visit`).
+    pub async fn fetch_stream<F>(
+        &self,
+        partition: &PartitionKey,
+        offset: i64,
+        mut visit: F,
+    ) -> Result<(), ObjectLogError>
+    where
+        F: FnMut(FetchedBatch) -> Result<(), ObjectLogError>,
+    {
+        let entries = self.sequencer.lookup(partition, offset)?;
+        for e in entries {
+            visit(self.load_entry(&e).await?)?;
+        }
+        Ok(())
+    }
+
+    async fn load_entry(&self, e: &IndexEntry) -> Result<FetchedBatch, ObjectLogError> {
+        let start = e.location.byte_start as u64;
+        let end = start + e.location.byte_len as u64;
+        let bytes = get_range_with_retries(&self.blob, &e.location.object_id, start..end)
+            .await?
+            .ok_or_else(|| ObjectLogError::MissingObject(e.location.object_id.clone()))?;
+        Ok(FetchedBatch {
+            base_offset: e.base_offset,
+            record_count: e.record_count,
+            payload: bytes,
+        })
     }
 
     /// Drop the partition's log below `offset` and delete any object that thereby
@@ -463,6 +511,22 @@ where
             self.blob.delete(&object_id).await?;
         }
         Ok(())
+    }
+
+    /// Delete data-prefix objects that are not in `live`.
+    ///
+    /// **Safety:** call only when this engine (and any other writer using the
+    /// same prefix) is quiescent — otherwise an in-flight put that has not yet
+    /// been committed may be deleted as an "orphan". Prefer running offline or
+    /// after drop. Does not touch keys outside [`data_prefix`](Self::data_prefix)
+    /// (e.g. a separate manifest prefix is safe).
+    ///
+    /// Returns the deleted object keys.
+    pub async fn reap_orphans(
+        &self,
+        live: &HashSet<String>,
+    ) -> Result<Vec<String>, ObjectLogError> {
+        reap_orphans(self.blob.as_ref(), &self.key_prefix, live).await
     }
 
     /// Return a point-in-time snapshot of queued and in-flight payload bytes.
@@ -541,6 +605,28 @@ where
             budget_mode: budget.config.mode,
         }
     }
+}
+
+/// Delete objects under `data_prefix` whose keys are absent from `live`.
+///
+/// See [`LogEngine::reap_orphans`] for safety notes. `live` is typically
+/// [`InMemorySequencer::live_object_ids`](crate::InMemorySequencer::live_object_ids)
+/// or [`ManifestSequencer::live_object_ids`](crate::ManifestSequencer::live_object_ids).
+pub async fn reap_orphans(
+    blob: &dyn BlobStore,
+    data_prefix: &str,
+    live: &HashSet<String>,
+) -> Result<Vec<String>, ObjectLogError> {
+    let keys = blob.list(data_prefix).await?;
+    let mut deleted = Vec::new();
+    for key in keys {
+        if live.contains(&key) {
+            continue;
+        }
+        blob.delete(&key).await?;
+        deleted.push(key);
+    }
+    Ok(deleted)
 }
 
 impl<S: Sequencer> Drop for LogEngine<S> {

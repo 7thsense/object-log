@@ -15,6 +15,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - README + TD-003 consumer integration binding sketches (fjord / Niflheim / pqueue).
 - Live S3 multipart + get_range test; `OBJECT_LOG_S3_*` env aliases; MinIO
   evidence runbook in CONTRIBUTING/TD-002.
+- `LogEngine::fetch_stream` for bounded-RAM ordered replay (visitor API).
+- Orphan reaping: `reap_orphans`, `LogEngine::reap_orphans`, and
+  `live_object_ids()` on `InMemorySequencer` / `ManifestSequencer` (quiescent-only).
+- `LogEngine::data_prefix`, `blob_store`, and `sequencer` accessors.
 
 ### Changed
 

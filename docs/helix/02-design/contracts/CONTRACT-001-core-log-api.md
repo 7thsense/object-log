@@ -41,7 +41,10 @@ This contract defines object-log’s normative **engine and sequencer** surface.
 | `LogEngine::produce` | async | yes | Enqueues batch; resolves at requested durability | Empty batch → `InvalidBatch` |
 | `LogEngine::flush` | async | yes | Barrier for all work enqueued at or before the call | |
 | `LogEngine::fetch` | async | yes | lookup → get_range slices → ordered batches | Size-bounded by max_bytes |
+| `LogEngine::fetch_stream` | async visitor | yes (P2) | Same order as fetch; no full `Vec` materialization | Bounded-RAM replay |
 | `LogEngine::truncate_before` | async | yes | Sequencer truncate then delete returned object ids | Shared objects deleted only when unreferenced |
+| `reap_orphans` / `LogEngine::reap_orphans` | async | yes (P2) | Delete data-prefix keys not in live set | Quiescent writers only |
+| `live_object_ids` (default sequencers) | sync | yes for shipped sequencers | Set of object ids in the index | Feeds reaper |
 | `Sequencer::Meta` | associated type | yes | Engine forwards uninterpreted; `Send + Sync` | Default sequencers use `()` |
 | `BatchLocation` | `{ object_id, byte_start, byte_len }` | yes | **Authored by engine** after layout | Sequencer stores in index |
 | `CommitBatch` | `{ partition, record_count, location, meta }` | yes | Engine fills all but interprets only partition/count/location | |

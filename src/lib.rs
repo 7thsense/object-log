@@ -55,7 +55,9 @@ mod sequencer;
 
 pub use blob::{BlobStore, LocalBlobStore, MediaOpStats, MemoryBlobStore};
 pub use budget::{BudgetConfig, BudgetMode, EffectiveKnob, EffectiveReason, PipelineSnapshot};
-pub use engine::{AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine};
+pub use engine::{
+    reap_orphans, AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine,
+};
 pub use error::ObjectLogError;
 pub use manifest_sequencer::ManifestSequencer;
 #[cfg(feature = "s3")]

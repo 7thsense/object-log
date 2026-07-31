@@ -8,6 +8,7 @@ use object_log::{
     InMemorySequencer, IndexEntry, LogEngine, MemoryBlobStore, ObjectLogError, PartitionKey,
     Sequencer,
 };
+use std::sync::atomic::AtomicBool;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -864,5 +865,175 @@ async fn headroom_allows_fast_single_produce() {
         start.elapsed() < Duration::from_millis(40),
         "headroom early-flush should beat full linger, elapsed={:?}",
         start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn fetch_stream_visits_batches_in_order() {
+    let engine = LogEngine::new(
+        Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig::default(),
+        "log/",
+    );
+    let p = pk("stream-0");
+    for (i, payload) in [b"a" as &[u8], b"bb", b"ccc"].into_iter().enumerate() {
+        engine
+            .produce(
+                p.clone(),
+                Bytes::copy_from_slice(payload),
+                1,
+                (),
+                Durability::Sequenced,
+            )
+            .await
+            .unwrap();
+        let _ = i;
+    }
+
+    let mut seen = Vec::new();
+    engine
+        .fetch_stream(&p, 0, |b| {
+            seen.push((b.base_offset, b.payload.to_vec()));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        seen,
+        vec![
+            (0, b"a".to_vec()),
+            (1, b"bb".to_vec()),
+            (2, b"ccc".to_vec()),
+        ]
+    );
+
+    // Mid-stream start matches fetch mid-offset behavior.
+    let mut mid = Vec::new();
+    engine
+        .fetch_stream(&p, 1, |b| {
+            mid.push(b.base_offset);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(mid, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn fetch_stream_stops_on_visitor_error() {
+    let engine = LogEngine::new(
+        Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
+        Arc::new(InMemorySequencer::new()),
+        FlushConfig::default(),
+        "log/",
+    );
+    let p = pk("stream-err");
+    for _ in 0..3 {
+        engine
+            .produce(
+                p.clone(),
+                Bytes::from_static(b"x"),
+                1,
+                (),
+                Durability::Sequenced,
+            )
+            .await
+            .unwrap();
+    }
+    let n = AtomicUsize::new(0);
+    let err = engine
+        .fetch_stream(&p, 0, |_| {
+            if n.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(ObjectLogError::InvalidBatch("stop".into()));
+            }
+            Ok(())
+        })
+        .await;
+    assert!(matches!(err, Err(ObjectLogError::InvalidBatch(_))));
+    assert_eq!(n.load(Ordering::SeqCst), 2);
+}
+
+// ---- Sequencer that fails the first commit (orphan after successful PUT). ----
+struct FailCommitOnce {
+    inner: InMemorySequencer,
+    failed: AtomicBool,
+}
+impl Sequencer for FailCommitOnce {
+    type Meta = ();
+    fn commit(
+        &self,
+        batches: &[CommitBatch<'_, ()>],
+    ) -> Result<Vec<CommitOutcome>, ObjectLogError> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            return Err(ObjectLogError::Sequencer("first commit fails".into()));
+        }
+        self.inner.commit(batches)
+    }
+    fn lookup(&self, p: &PartitionKey, o: i64) -> Result<Vec<IndexEntry>, ObjectLogError> {
+        self.inner.lookup(p, o)
+    }
+    fn high_watermark(&self, p: &PartitionKey) -> Result<i64, ObjectLogError> {
+        self.inner.high_watermark(p)
+    }
+    fn log_start_offset(&self, p: &PartitionKey) -> Result<i64, ObjectLogError> {
+        self.inner.log_start_offset(p)
+    }
+    fn truncate_before(&self, p: &PartitionKey, o: i64) -> Result<Vec<String>, ObjectLogError> {
+        self.inner.truncate_before(p, o)
+    }
+}
+
+#[tokio::test]
+async fn reap_orphans_deletes_unreferenced_data_objects() {
+    let blob = Arc::new(MemoryBlobStore::new());
+    let seq = Arc::new(FailCommitOnce {
+        inner: InMemorySequencer::new(),
+        failed: AtomicBool::new(false),
+    });
+    let engine = LogEngine::new(
+        Arc::clone(&blob) as Arc<dyn BlobStore>,
+        Arc::clone(&seq),
+        FlushConfig::default(),
+        "log/",
+    );
+    let p = pk("orphan-0");
+
+    // First produce: PUT succeeds, commit fails → orphan object, no index entry.
+    let first = engine
+        .produce(
+            p.clone(),
+            Bytes::from_static(b"orphan"),
+            1,
+            (),
+            Durability::Sequenced,
+        )
+        .await;
+    assert!(first.is_err());
+    assert_eq!(blob.object_count(), 1);
+
+    // Second produce succeeds.
+    engine
+        .produce(
+            p.clone(),
+            Bytes::from_static(b"live"),
+            1,
+            (),
+            Durability::Sequenced,
+        )
+        .await
+        .unwrap();
+    assert_eq!(blob.object_count(), 2);
+    assert_eq!(engine.fetch(&p, 0, 1 << 20).await.unwrap().len(), 1);
+
+    let live = seq.inner.live_object_ids();
+    assert_eq!(live.len(), 1);
+    let deleted = engine.reap_orphans(&live).await.unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(blob.object_count(), 1);
+    // Live payload still fetchable.
+    assert_eq!(
+        engine.fetch(&p, 0, 1 << 20).await.unwrap()[0].payload,
+        "live"
     );
 }

@@ -44,17 +44,29 @@ object-log 0.2.x re-foundation (ADR-002) is **implemented**. Remaining work hard
 - Evidence recorded against local MinIO (2026-07-31) in TD-002.
 - Gate: re-run suite before claiming other providers (Garage/AWS/R2).
 
-### M4: Deferred P2 (optional)
+### M4: Streaming Fetch + Orphan Reaper (done)
 
-- `fetch_stream` if Niflheim (or other) blocks on materializing wide fetches.
-- Orphan reaper design + implementation.
-- Gate: design snippet + tests; does not block 0.2.x consumers.
+- `LogEngine::fetch_stream` visitor API + tests.
+- `reap_orphans` free function + `LogEngine::reap_orphans`; `live_object_ids` on
+  InMemory/Manifest sequencers; quiescent-only safety docs.
+- Gate: engine tests for stream order/error stop and orphan delete.
 
 ### M5: 1.0 Readiness
 
-- API freeze review against CONTRACT-001/002 v2.
+- API freeze review against CONTRACT-001/002 v2 (see checklist below).
 - CHANGELOG and semver discipline.
 - Gate: no open P0 FR without a test; layer-purity grep clean.
+
+#### 1.0 readiness checklist (draft)
+
+| Check | Status |
+|-------|--------|
+| P0 FR→named tests | Yes (test-plan) |
+| CONTRACT-001/002 v2 match public API | Yes for produce/fetch/stream/reap/BlobStore/Sequencer |
+| Layer purity (no Kafka types in public API) | Yes |
+| S3 evidence (MinIO class) | Yes (TD-002) |
+| MSRV + CI | Yes (1.88, `.github/workflows/ci.yml`) |
+| Semver 1.0 decision | **Open** — operator call; crate remains 0.2.x until cut |
 
 ## Explicitly Not Planned (rejected)
 
