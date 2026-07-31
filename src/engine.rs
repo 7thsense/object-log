@@ -43,14 +43,14 @@ pub struct FlushConfig {
     /// **Maximum** time a batch may wait before a deadline flush (hard ceiling).
     /// This is the latency↔throughput control surface: longer wait ⇒ more bytes
     /// per seal ⇒ fewer durable ops/s. The budget controller may use a shorter
-    /// *effective* linger when media headroom allows early flush (TD-004).
-    /// `ZERO` forces ASAP flushes (legacy). Default `50ms`.
+    /// *effective* linger when media is idle (TD-004). `ZERO` = seal as soon as
+    /// any data is buffered (no co-buffer wait). Default `50ms`.
     pub linger: Duration,
-    /// Max sealed objects PUT concurrently. Default **2** so a ~1 GiB ceiling
-    /// does not multiply into multi‑GiB inflight RAM.
+    /// Max sealed objects PUT concurrently. Default **1** (single-flight bulk
+    /// path). Raise for parallel S3 PUTs.
     pub max_inflight_flushes: usize,
     /// Max bytes in the mutable queue plus in-flight seals. Producers block when
-    /// exceeded. Default **2 GiB** (one segment assembling + one inflight).
+    /// exceeded. Default **2 GiB**.
     pub max_buffered_bytes: usize,
     /// Durable-ops budget controller (default on for Fjord).
     pub budget: BudgetConfig,
@@ -124,6 +124,7 @@ async fn put_chunks_with_retries(
     key: &str,
     chunks: Vec<Bytes>,
 ) -> Result<(), ObjectLogError> {
+    // `Bytes::clone` is refcount-only; Local put_chunks streams without re-merge.
     let mut attempt = 0usize;
     loop {
         match blob.put_chunks(key, chunks.clone()).await {
@@ -587,16 +588,11 @@ fn flush_loop<S>(
             match take_batch(&shared, config, wait_for_more) {
                 TakeBatch::Batch(batch) => {
                     counter += 1;
-                    // When only one inflight slot, run the put to completion on this
-                    // thread via block_on (Local uses block_in_place) — avoids an
-                    // extra task hop for the common single-seal bulk path.
-                    let work = if max_inflight == 1 {
-                        start_flush_work_blocking(&rt, &blob, &prefix, counter, batch)
-                    } else {
-                        let w = start_flush_work(&rt, &blob, &prefix, counter, batch);
+                    let concurrent = max_inflight > 1;
+                    let work = start_flush_work(&rt, &blob, &prefix, counter, batch, concurrent);
+                    if concurrent {
                         active_puts += 1;
-                        w
-                    };
+                    }
                     pending.push_back(work);
                 }
                 TakeBatch::Empty => break,
@@ -894,39 +890,34 @@ fn prepare_flush_work<M>(
     (work, key, chunks)
 }
 
+/// Start a durable put for a sealed batch.
+///
+/// - `concurrent == false` (default `max_inflight_flushes == 1`): `block_on` the
+///   put on the flush thread; Local uses `block_in_place` (no spawn_blocking queue).
+/// - `concurrent == true`: spawn put tasks for parallel S3-style throughput.
 fn start_flush_work<M>(
     rt: &tokio::runtime::Runtime,
     blob: &Arc<dyn BlobStore>,
     prefix: &str,
     counter: u64,
     batch: Vec<Pending<M>>,
+    concurrent: bool,
 ) -> FlushWork<M> {
     let (mut work, key, chunks) = prepare_flush_work(prefix, counter, batch);
     let blob = Arc::clone(blob);
     let _ = blob.take_media_op_stats();
     work.put_started = Instant::now();
-    work.put = Some(rt.spawn(async move { put_chunks_with_retries(&blob, &key, chunks).await }));
-    work
-}
-
-/// Run put to completion on the flush thread (no concurrent inflight put task).
-fn start_flush_work_blocking<M>(
-    rt: &tokio::runtime::Runtime,
-    blob: &Arc<dyn BlobStore>,
-    prefix: &str,
-    counter: u64,
-    batch: Vec<Pending<M>>,
-) -> FlushWork<M> {
-    let (mut work, key, chunks) = prepare_flush_work(prefix, counter, batch);
-    let blob = Arc::clone(blob);
-    let _ = blob.take_media_op_stats();
-    work.put_started = Instant::now();
-    let put_result = rt.block_on(put_chunks_with_retries(&blob, &key, chunks));
-    let elapsed = work.put_started.elapsed();
-    work.put_result = Some(match put_result {
-        Ok(()) => Ok(elapsed),
-        Err(e) => Err(e),
-    });
+    if concurrent {
+        work.put =
+            Some(rt.spawn(async move { put_chunks_with_retries(&blob, &key, chunks).await }));
+    } else {
+        let put_result = rt.block_on(put_chunks_with_retries(&blob, &key, chunks));
+        let elapsed = work.put_started.elapsed();
+        work.put_result = Some(match put_result {
+            Ok(()) => Ok(elapsed),
+            Err(e) => Err(e),
+        });
+    }
     work
 }
 

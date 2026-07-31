@@ -59,13 +59,13 @@ trait BlobStore: Send + Sync {
     /// Ok as a durability barrier. (The `Memory` adapter is test/dev only and is
     /// NOT crash-durable — do not use it where the durability contract matters.)
     /// The `Local` adapter MUST persist in EXACTLY this order, or it loses data on
-    /// power loss while returning Ok: write a temp file → `fsync(temp)` → `rename`
-    /// into place → `fsync(parent dir)`. (macOS needs `F_FULLFSYNC` for true
-    /// device durability.) `value` may be ARBITRARILY LARGE: the `S3` adapter
-    /// dispatches multipart upload above a size threshold so a 100 MiB+ object is
-    /// not one whole-buffer PUT — object-log owns multipart internally; callers
-    /// never see it. (An optional `put_streaming(key, reader)` may be added later
-    /// for writers that cannot hold the whole object in RAM; not required for v1.)
+    /// power loss while returning Ok: write a temp file → `sync_data`/`fdatasync`
+    /// on the temp → `rename` into place → `fsync(parent dir)`. (macOS may need
+    /// `F_FULLFSYNC` for true device durability.) `value` may be ARBITRARILY LARGE:
+    /// the `S3` adapter dispatches multipart upload above a size threshold so a
+    /// 100 MiB+ object is not one whole-buffer PUT — object-log owns multipart
+    /// internally; callers never see it. Local `put_chunks` streams chunk bytes
+    /// to the temp file without a full pre-merge copy.
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError>;
     async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError>;
     /// Read a byte sub-range (S3 Range GET; local pread) — pull one batch/chunk
@@ -96,7 +96,7 @@ segments and big multiplexed objects don't become a single PUT), and **`get_rang
 (sub-object byte addressing — niflheim loads one chunk from a coalesced segment; the
 engine's `fetch` reads only the needed slice). `list` paginates internally.
 
-**2. `LogEngine<S: Sequencer>` — buffered group-commit.** Accepts opaque batch payloads with a partition key, a record count, and `S`'s metadata; **group-commits**: many batches across many partitions are multiplexed into **one** object, PUT durably, then handed to the sequencer in one call. Owns the flush policy `FlushConfig { max_bytes, max_batches, linger }`. The engine **authors each batch's `BatchLocation { object_id, byte_start, byte_len }`** (its concern); it never inspects `S`'s metadata.
+**2. `LogEngine<S: Sequencer>` — buffered group-commit.** Accepts opaque batch payloads with a partition key, a record count, and `S`'s metadata; **group-commits**: many batches across many partitions are multiplexed into **one** object, PUT durably, then handed to the sequencer in one call. Owns `FlushConfig` (linger is the packing control; `max_bytes` is a high safety ceiling — default 1 GiB), durable-ops budget / early-flush policy (TD-004), and `flush()` barriers. The engine **authors each batch's `BatchLocation { object_id, byte_start, byte_len }`** (its concern); it never inspects `S`'s metadata.
 
 **3. Durability levels — object-log's own vocabulary, not Kafka `acks`.** A produce future resolves at the requested level:
 - `Buffered` — in the flush buffer (may be lost on crash).

@@ -710,10 +710,17 @@ async fn fail_closed_rejects_when_budget_starved() {
 
 #[tokio::test]
 async fn headroom_allows_fast_single_produce() {
+    // Isolate headroom+small-queue early-flush (idle gap tested in perf_throughput).
     let engine = LogEngine::new(
         Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>,
         Arc::new(InMemorySequencer::new()),
-        FlushConfig::default(),
+        FlushConfig {
+            budget: object_log::BudgetConfig {
+                early_flush_idle: Duration::ZERO,
+                ..object_log::BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        },
         "log/",
     );
     let start = std::time::Instant::now();
@@ -727,10 +734,9 @@ async fn headroom_allows_fast_single_produce() {
         )
         .await
         .unwrap();
-    // After early_flush_idle (10ms) + headroom, should seal before full 50ms linger.
     assert!(
         start.elapsed() < Duration::from_millis(40),
-        "idle produce should early-flush after idle gap, elapsed={:?}",
+        "headroom early-flush should beat full linger, elapsed={:?}",
         start.elapsed()
     );
 }

@@ -11,19 +11,25 @@ is decoupled from produce count. It is the storage engine extracted from the
 
 ## Highlights
 
-- **`BlobStore` port** — a minimal async trait (`put` / `get` / `get_range` /
-  `list` / `delete`) with durable-on-return writes. Ships with `MemoryBlobStore`,
-  `LocalBlobStore`, and `S3BlobStore` (feature `s3`; multipart + range reads).
-- **`LogEngine`** — buffers and group-commits many batches into one object, PUTs
-  it durably, then sequences it; `produce` resolves at a chosen `Durability`
-  (`Buffered` / `Durable` / `Sequenced`), or clients can pipeline with
-  `Buffered` and wait on `flush()`. A default-on **durable-ops budget** adapts
-  effective linger (early flush when media is idle; co-buffer under load within
-  `FlushConfig.linger`) so Fjord/S3 and Local share one latency↔throughput
-  controller (`pipeline_snapshot()`).
-- **`Sequencer` seam** — a sync trait that assigns offsets and owns the index;
-  ships `InMemorySequencer` and a crash-durable `ManifestSequencer`. Plug your own
-  (e.g. a Kafka coordinator); the engine forwards its `Meta` uninterpreted.
+- **`BlobStore` port** — minimal async trait with durable-on-return writes.
+  `LocalBlobStore`: temp → `sync_data` → rename → dir `fsync`; streaming
+  `put_chunks`. Optional `S3BlobStore` (`s3` feature).
+- **`LogEngine`** — group-commit: many `produce` calls → one object. Ack via
+  `Durability::{Buffered,Durable,Sequenced}` or pipeline + **`flush()`**.
+  **Linger** packs under load (default 50 ms); **`max_bytes` default 1 GiB** is
+  only a safety ceiling. Default-on durable-ops budget; early-flush only when
+  idle (`pipeline_snapshot()`).
+- **`Sequencer` seam** — offsets + index; `InMemorySequencer` and
+  `ManifestSequencer`. Engine forwards `Meta` uninterpreted.
+
+## Performance check
+
+```bash
+OBJECT_LOG_PERF_BYTES=$((256*1024*1024)) \
+  cargo test --release --test perf_throughput honest -- --nocapture
+```
+
+Prints dd / B0 / B1 / B2 (zeros, fair timers). See TD-004.
 
 ## Usage
 
