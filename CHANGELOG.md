@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
+- MSRV CI builds with `--all-features`.
+
 ## [0.3.0] — 2026-07-31
 
 Additive release on the ADR-002 engine: conformance hardening, streaming fetch,

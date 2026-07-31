@@ -26,6 +26,59 @@ jobs:
       - name: Package (dry-run)
         run: cargo publish --dry-run
 
+  # Honest Local throughput ratio (B2.flush ≈ B0) only holds in --release.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-perf
+      - name: Release perf_throughput (honest floor)
+        run: cargo test --release --test perf_throughput honest -- --nocapture
+        env:
+          # Keep CI time bounded; ratio gate is what matters, not absolute MiB/s.
+          OBJECT_LOG_PERF_BYTES: "16777216"
+          OBJECT_LOG_PERF_B1_RUNS: "3"
+
+  # Live S3BlobStore against MinIO (path-style). Catches multipart + get_range.
+  s3-minio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              echo "minio ready"
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9000/minio/health/live
+      - name: Create bucket
+        run: |
+          docker run --rm --network host --entrypoint /bin/sh minio/mc -c '
+            mc alias set local http://127.0.0.1:9000 minioadmin minioadmin &&
+            mc mb -p local/object-log-ci
+          '
+      - name: S3 adapter tests
+        run: cargo test --features s3 --test s3 -- --nocapture
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+          OBJECT_LOG_S3_REGION: us-east-1
+
   docs:
     runs-on: ubuntu-latest
     steps:
@@ -45,7 +98,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: Build on MSRV
-        run: cargo build --all-targets
+        run: cargo build --all-targets --all-features
 
   deny:
     runs-on: ubuntu-latest

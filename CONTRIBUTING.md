@@ -31,7 +31,8 @@ cargo test --features cli --test cli_smoke
 
 ### Optional: live S3 / MinIO evidence
 
-Hermetic tests never require S3. To exercise `S3BlobStore` (including multipart):
+Hermetic unit tests never require S3. CI runs MinIO automatically (`s3-minio`
+job). Locally:
 
 ```sh
 # Example against a local MinIO (path-style) with a pre-created bucket:
@@ -44,12 +45,17 @@ cargo test --features s3 --test s3 -- --nocapture
 ```
 
 Legacy `FJORD_GARAGE_*` env names are accepted as aliases. Without these vars the
-S3 tests skip and pass.
+S3 tests skip and pass. For Garage/AWS/R2, use the same suite and record results
+in TD-002 before claiming that class.
 
 ### Optional: honest local throughput
 
+CI runs a release-mode floor (`perf` job, 16 MiB). Locally:
+
 ```sh
 cargo test --release --test perf_throughput honest -- --nocapture
+# larger sample:
+OBJECT_LOG_PERF_BYTES=$((256*1024*1024)) cargo test --release --test perf_throughput honest -- --nocapture
 ```
 
 ## Guidelines

@@ -107,6 +107,18 @@ only when this suite has been run against the target class.
 | Date | Target | Result |
 |------|--------|--------|
 | 2026-07-31 | MinIO on `127.0.0.1:19000` (bucket `object-log-test`) | `s3_blob_store_round_trip` + `s3_multipart_put_get_range_round_trip` green |
+| 2026-07-31+ | GitHub Actions `s3-minio` job (MinIO docker, path-style) | Continuous; blocks merge on failure |
+
+### Provider matrix (claims)
+
+| Provider class | Path-style | Evidence path | Status |
+|----------------|------------|---------------|--------|
+| MinIO | yes | CI `s3-minio` + local runbook | **Supported (evidenced)** |
+| Garage | yes | Operator: same env vars as MinIO | Candidate — re-run `tests/s3.rs` before claim |
+| AWS S3 | virtual-hosted default; force path-style may be limited | Operator evidence | Candidate |
+| Cloudflare R2 | S3-compatible endpoint | Operator evidence | Candidate |
+
+Do **not** claim production support for a class without a green multipart+range suite against that class.
 
 ## Review Checklist
 

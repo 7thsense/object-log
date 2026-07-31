@@ -91,10 +91,10 @@ ddx:
 
 | Requirement | Specification |
 |-------------|---------------|
-| Correctness gate | `cargo test` (default; excludes needing release perf floor) |
-| Perf evidence | `cargo test --release --test perf_throughput honest -- --nocapture` (ratio assert is release-only unless `OBJECT_LOG_PERF_ASSERT=1`) |
-| Clippy | `cargo clippy --all-targets -- -D warnings` |
-| Optional S3 | document env vars in `tests/s3.rs` |
+| Correctness gate | `cargo test --all-features` |
+| Perf evidence | CI job `perf`: `cargo test --release --test perf_throughput honest` with `OBJECT_LOG_PERF_BYTES=16MiB` |
+| Clippy | `cargo clippy --all-targets --all-features -- -D warnings` |
+| Live S3 | CI job `s3-minio` (MinIO); other providers via `OBJECT_LOG_S3_*` + `tests/s3.rs` |
 
 ## Risks
 

@@ -56,11 +56,11 @@ object-log 0.2.x re-foundation (ADR-002) is **implemented**. Remaining work hard
 - Feature `cli` binary `object-log`: list, inspect, orphans, fetch.
 - `ManifestSequencer::snapshot` + CLI smoke test (`tests/cli_smoke.rs`).
 
-### M5: 1.0 Readiness
+### M5: 0.3.0 shipped; 1.0 still open
 
-- API freeze review against CONTRACT-001/002 v2 (see checklist below).
-- CHANGELOG and semver discipline.
-- Gate: no open P0 FR without a test; layer-purity grep clean.
+- **0.3.0** tagged/published (2026-07-31): fetch_stream, orphans, CLI, conformance.
+- Hardening: CI `perf` (release ratio) + `s3-minio` live adapter tests.
+- 1.0 remains an operator API-freeze decision (checklist below).
 
 #### 1.0 readiness checklist (draft)
 
