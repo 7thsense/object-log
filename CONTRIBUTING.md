@@ -18,10 +18,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 All public items must be documented (the crate sets `#![deny(missing_docs)]`).
 
-### Optional: diagnostics CLI
+### Optional: diagnostics / black-box CLI
 
 ```sh
 cargo run --features cli --bin object-log -- --help
+printf 'a\nb\n' | cargo run --features cli --bin object-log -- \
+  produce --root /tmp/olog --partition t --lines
+cargo run --features cli --bin object-log -- \
+  consume --root /tmp/olog --partition t --lines
 cargo test --features cli --test cli_smoke
 ```
 

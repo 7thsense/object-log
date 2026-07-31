@@ -69,22 +69,45 @@ assert_eq!(read[0].payload, "hello");
 To target S3/Garage/MinIO, enable the `s3` feature and use `S3BlobStore`, or
 implement the `BlobStore` trait for your client.
 
-## Diagnostics CLI
+## CLI (produce / consume / inspect)
 
-Optional binary (feature `cli`):
+Optional binary (feature `cli`). It is a deliberately odd shell tool: **files and
+stdin become opaque batches**, and **consume writes them back** with matching
+framing — handy for black-box tests and operator visibility, not a Kafka client.
 
 ```bash
 cargo install --path . --features cli
 # or: cargo run --features cli --bin object-log -- --help
 
-object-log list --root /var/lib/mylog --prefix log/
-object-log inspect --root /var/lib/mylog --manifest-prefix _manifest/ --summary
-object-log orphans --root /var/lib/mylog --data-prefix log/ --manifest-prefix _manifest/
-object-log fetch --root /var/lib/mylog --partition events-0 --text
+# Line records through a local store
+printf 'a\nb\nc\n' | object-log produce --root /tmp/olog --partition demo --lines
+object-log consume --root /tmp/olog --partition demo --lines
+# → a / b / c
+
+# Binary-safe length-prefix framing (u64 BE + payload)
+object-log produce --root /tmp/olog --partition demo --framed a.bin b.bin
+object-log consume --root /tmp/olog --partition demo --framed > out.framed
+
+# In-process memory round-trip (no disk)
+printf 'x\ny\n' | object-log roundtrip --memory --partition t --lines
+# → x / y
+
+# Inspect / repair visibility
+object-log list --root /tmp/olog --prefix log/
+object-log inspect --root /tmp/olog --summary
+object-log orphans --root /tmp/olog          # dry-run
+object-log fetch --root /tmp/olog --partition demo --text
 ```
 
-S3 stores: build with `--features cli,s3` and pass `--s3-endpoint` / `--s3-bucket` /
-`OBJECT_LOG_S3_KEY_ID` / `OBJECT_LOG_S3_SECRET`.
+| Mode | Produce | Consume |
+|------|---------|---------|
+| `file` (default produce) | each path = one batch; `-` = stdin | — |
+| `lines` | newline-split | payload + `\n` |
+| `nul` | NUL-split | payload + `NUL` |
+| `framed` | u64 BE length + bytes | same |
+| `raw` (default consume) | — | concatenate payloads |
+
+S3: `--features cli,s3` plus `--s3-endpoint` / `--s3-bucket` / `OBJECT_LOG_S3_*`.
 
 ## Consumer integration
 
