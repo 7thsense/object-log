@@ -18,6 +18,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 All public items must be documented (the crate sets `#![deny(missing_docs)]`).
 
+### Optional: diagnostics CLI
+
+```sh
+cargo run --features cli --bin object-log -- --help
+cargo test --features cli --test cli_smoke
+```
+
 ### Optional: live S3 / MinIO evidence
 
 Hermetic tests never require S3. To exercise `S3BlobStore` (including multipart):

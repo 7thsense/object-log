@@ -19,12 +19,21 @@ exclude = [
 ]
 
 [features]
+default = []
 # Optional S3-compatible BlobStore adapter (AWS S3, MinIO, Garage).
 s3 = ["dep:aws-sdk-s3"]
+# Diagnostics binary: `cargo run --features cli --bin object-log -- --help`
+cli = ["dep:clap"]
+
+[[bin]]
+name = "object-log"
+path = "src/bin/object-log.rs"
+required-features = ["cli"]
 
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
+clap = { version = "4", features = ["derive", "env"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

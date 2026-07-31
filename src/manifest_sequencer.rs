@@ -105,6 +105,54 @@ impl ManifestSequencer {
         }
         live
     }
+
+    /// Point-in-time view of the rebuilt index (diagnostics / CLI).
+    pub fn snapshot(&self) -> IndexSnapshot {
+        let st = self.inner.lock().expect("poisoned");
+        let mut partitions: Vec<PartitionSnapshot> = st
+            .parts
+            .iter()
+            .map(|(k, p)| PartitionSnapshot {
+                partition: k.0.clone(),
+                log_start: p.log_start,
+                high_watermark: p.next_offset,
+                entry_count: p.entries.len(),
+                entries: p.entries.clone(),
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.partition.cmp(&b.partition));
+        IndexSnapshot {
+            manifest_prefix: self.prefix.clone(),
+            manifest_count: st.counter,
+            partitions,
+        }
+    }
+}
+
+/// Full index view from [`ManifestSequencer::snapshot`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IndexSnapshot {
+    /// Prefix used for manifest objects.
+    pub manifest_prefix: String,
+    /// Number of manifest objects replayed (commit counter).
+    pub manifest_count: u64,
+    /// Per-partition index state.
+    pub partitions: Vec<PartitionSnapshot>,
+}
+
+/// One partition's index bounds and entries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PartitionSnapshot {
+    /// Partition key string.
+    pub partition: String,
+    /// First readable offset.
+    pub log_start: i64,
+    /// Next offset to assign (high watermark).
+    pub high_watermark: i64,
+    /// Number of index entries.
+    pub entry_count: usize,
+    /// Ordered index entries (may be large; CLI can omit via flag).
+    pub entries: Vec<IndexEntry>,
 }
 
 impl Sequencer for ManifestSequencer {

@@ -59,7 +59,7 @@ pub use engine::{
     reap_orphans, AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine,
 };
 pub use error::ObjectLogError;
-pub use manifest_sequencer::ManifestSequencer;
+pub use manifest_sequencer::{IndexSnapshot, ManifestSequencer, PartitionSnapshot};
 #[cfg(feature = "s3")]
 pub use s3::S3BlobStore;
 pub use sequencer::{

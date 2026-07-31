@@ -7,6 +7,7 @@ use object_log::{
     PartitionKey, Sequencer,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 fn pk(s: &str) -> PartitionKey {
     PartitionKey(s.to_string())
@@ -90,4 +91,59 @@ async fn manifest_index_survives_restart() {
         .await
         .unwrap();
     assert_eq!(out.base_offset, Some(3));
+}
+
+#[tokio::test]
+async fn manifest_snapshot_lists_partitions_and_entries() {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let seq = Arc::new(
+        ManifestSequencer::open(Arc::clone(&blob), "_manifest/")
+            .await
+            .unwrap(),
+    );
+    let engine = LogEngine::new(
+        Arc::clone(&blob),
+        Arc::clone(&seq),
+        FlushConfig {
+            linger: Duration::from_secs(3600),
+            max_batches: 1,
+            budget: object_log::BudgetConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..FlushConfig::default()
+        },
+        "log/",
+    );
+    engine
+        .produce(
+            pk("alpha"),
+            Bytes::from_static(b"a"),
+            1,
+            (),
+            Durability::Sequenced,
+        )
+        .await
+        .unwrap();
+    engine
+        .produce(
+            pk("beta"),
+            Bytes::from_static(b"bb"),
+            2,
+            (),
+            Durability::Sequenced,
+        )
+        .await
+        .unwrap();
+
+    let snap = seq.snapshot();
+    assert_eq!(snap.manifest_prefix, "_manifest/");
+    assert_eq!(snap.manifest_count, 2);
+    assert_eq!(snap.partitions.len(), 2);
+    assert_eq!(snap.partitions[0].partition, "alpha");
+    assert_eq!(snap.partitions[0].high_watermark, 1);
+    assert_eq!(snap.partitions[0].entry_count, 1);
+    assert_eq!(snap.partitions[1].partition, "beta");
+    assert_eq!(snap.partitions[1].high_watermark, 2);
+    assert!(!seq.live_object_ids().is_empty());
 }

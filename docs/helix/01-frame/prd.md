@@ -96,7 +96,7 @@ Brokers and ingestion systems need amortized durable appends on object storage. 
 
 1. Streaming fetch for wide offset windows (`fetch_stream`) — **implemented**.
 2. Quiescent orphan reaper (`reap_orphans` + `live_object_ids`) — **implemented**.
-3. CLI tools for manifest inspection and object listing.
+3. CLI tools for manifest inspection and object listing — **implemented** (`cli` feature).
 
 ## Functional Requirements
 

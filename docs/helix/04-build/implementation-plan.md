@@ -51,6 +51,11 @@ object-log 0.2.x re-foundation (ADR-002) is **implemented**. Remaining work hard
   InMemory/Manifest sequencers; quiescent-only safety docs.
 - Gate: engine tests for stream order/error stop and orphan delete.
 
+### M4b: Diagnostics CLI (done)
+
+- Feature `cli` binary `object-log`: list, inspect, orphans, fetch.
+- `ManifestSequencer::snapshot` + CLI smoke test (`tests/cli_smoke.rs`).
+
 ### M5: 1.0 Readiness
 
 - API freeze review against CONTRACT-001/002 v2 (see checklist below).

@@ -44,7 +44,7 @@ If a future operator-facing surface is added, re-open user stories under `frame`
 - `area:api` — Rust API, Sequencer seam, Durability, engine surface
 - `area:data` — payloads, objects, index, replay, checksums (consumer-owned framing)
 - `area:infra` — S3-compatible backends, local filesystem backend, CI and benchmarks
-- `area:cli` — future diagnostics and repair tooling
+- `area:cli` — diagnostics binary (`object-log`, feature `cli`): list, inspect, orphans, fetch
 
 ## Concern Conflicts
 

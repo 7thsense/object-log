@@ -69,6 +69,23 @@ assert_eq!(read[0].payload, "hello");
 To target S3/Garage/MinIO, enable the `s3` feature and use `S3BlobStore`, or
 implement the `BlobStore` trait for your client.
 
+## Diagnostics CLI
+
+Optional binary (feature `cli`):
+
+```bash
+cargo install --path . --features cli
+# or: cargo run --features cli --bin object-log -- --help
+
+object-log list --root /var/lib/mylog --prefix log/
+object-log inspect --root /var/lib/mylog --manifest-prefix _manifest/ --summary
+object-log orphans --root /var/lib/mylog --data-prefix log/ --manifest-prefix _manifest/
+object-log fetch --root /var/lib/mylog --partition events-0 --text
+```
+
+S3 stores: build with `--features cli,s3` and pass `--s3-endpoint` / `--s3-bucket` /
+`OBJECT_LOG_S3_KEY_ID` / `OBJECT_LOG_S3_SECRET`.
+
 ## Consumer integration
 
 object-log is a **storage engine**, not a Kafka broker or WAL codec.

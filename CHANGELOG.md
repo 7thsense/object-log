@@ -19,6 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Orphan reaping: `reap_orphans`, `LogEngine::reap_orphans`, and
   `live_object_ids()` on `InMemorySequencer` / `ManifestSequencer` (quiescent-only).
 - `LogEngine::data_prefix`, `blob_store`, and `sequencer` accessors.
+- Diagnostics CLI (`cli` feature): `object-log list|inspect|orphans|fetch` over
+  Local (and S3 with `cli,s3`).
+- `ManifestSequencer::snapshot` / `IndexSnapshot` for inspect tooling.
 
 ### Changed
 
