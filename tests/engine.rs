@@ -1037,3 +1037,96 @@ async fn reap_orphans_deletes_unreferenced_data_objects() {
         "live"
     );
 }
+
+/// fireweed-481d3e43: reopening LogEngine must not reissue data-object keys under
+/// the same prefix. Overwriting sealed objects while manifests still reference them
+/// yields RangeOutOfBounds / mid-JSON EOF on fetch.
+#[tokio::test]
+async fn reopen_does_not_overwrite_sealed_data_objects() {
+    use object_log::{LocalBlobStore, ManifestSequencer};
+
+    let root = std::env::temp_dir().join(format!(
+        "object-log-reopen-counter-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let payload_a = Bytes::from(vec![b'A'; 24_000]);
+    let payload_b = Bytes::from(vec![b'B'; 1_000]);
+
+    // Process 1: seal a large batch.
+    {
+        let blob: Arc<dyn BlobStore> = Arc::new(LocalBlobStore::new(&root));
+        let seq = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        let engine = LogEngine::new(
+            Arc::clone(&blob),
+            seq,
+            FlushConfig {
+                linger: Duration::ZERO,
+                ..FlushConfig::default()
+            },
+            "data/",
+        );
+        let p = pk("t-0");
+        engine
+            .produce(p.clone(), payload_a.clone(), 1, (), Durability::Sequenced)
+            .await
+            .unwrap();
+        let got = engine.fetch(&p, 0, 1 << 20).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload, payload_a);
+        drop(engine);
+    }
+
+    // Process 2: reopen, produce more, fetch full history including process-1 payload.
+    {
+        let blob: Arc<dyn BlobStore> = Arc::new(LocalBlobStore::new(&root));
+        let seq = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        let engine = LogEngine::new(
+            Arc::clone(&blob),
+            seq,
+            FlushConfig {
+                linger: Duration::ZERO,
+                ..FlushConfig::default()
+            },
+            "data/",
+        );
+        let p = pk("t-0");
+        engine
+            .produce(p.clone(), payload_b.clone(), 1, (), Durability::Sequenced)
+            .await
+            .unwrap();
+        let all = engine.fetch(&p, 0, 1 << 20).await.unwrap();
+        assert_eq!(all.len(), 2, "both generations must be readable");
+        assert_eq!(all[0].payload, payload_a, "first sealed object must not be overwritten");
+        assert_eq!(all[1].payload, payload_b);
+        // Distinct data keys under data/ (counter advanced past recovered max).
+        let data_keys: Vec<_> = blob
+            .list("data/")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.starts_with("data/"))
+            .collect();
+        assert!(
+            data_keys.len() >= 2,
+            "reopen must allocate a new object id, got {data_keys:?}"
+        );
+        drop(engine);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}

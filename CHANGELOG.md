@@ -20,6 +20,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
 
+## [0.3.1] — 2026-08-01
+
+### Fixed
+
+- LogEngine data-object counter now resumes past existing keys under the data
+  prefix on reopen. Restarting at 0 overwrote sealed objects while manifests
+  still referenced the old ranges, causing `RangeOutOfBounds` / mid-JSON EOF on
+  `fetch` after process restart (fireweed-481d3e43).
+
 ## [0.3.0] — 2026-07-31
 
 Additive release on the ADR-002 engine: conformance hardening, streaming fetch,

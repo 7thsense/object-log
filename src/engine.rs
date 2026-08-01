@@ -642,6 +642,25 @@ impl<S: Sequencer> Drop for LogEngine<S> {
     }
 }
 
+/// Highest numeric suffix already present under `data_prefix` (keys shaped
+/// `{prefix}{counter:020}`). Used so a reopened engine never reissues object ids.
+async fn recover_data_object_counter(
+    blob: &dyn BlobStore,
+    prefix: &str,
+) -> Result<u64, ObjectLogError> {
+    let keys = blob.list(prefix).await?;
+    let mut max = 0u64;
+    for key in keys {
+        let Some(suffix) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        if let Ok(n) = suffix.parse::<u64>() {
+            max = max.max(n);
+        }
+    }
+    Ok(max)
+}
+
 fn flush_loop<S>(
     shared: Arc<Shared<S::Meta>>,
     blob: Arc<dyn BlobStore>,
@@ -663,7 +682,12 @@ fn flush_loop<S>(
         .enable_all()
         .build()
         .expect("flush runtime");
-    let mut counter: u64 = 0;
+    // Resume the data-object counter past any keys already under `prefix`. Restarting
+    // at 0 on reopen overwrites sealed objects while manifests still point at the old
+    // byte ranges → RangeOutOfBounds / mid-JSON EOF on fetch (fireweed-481d3e43).
+    let mut counter = rt
+        .block_on(recover_data_object_counter(blob.as_ref(), &prefix))
+        .unwrap_or(0);
     let mut pending: VecDeque<FlushWork<S::Meta>> = VecDeque::new();
     let mut active_puts = 0usize;
     let mut shutdown = false;
