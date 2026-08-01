@@ -29,7 +29,8 @@ h4,
 .hx\:text-5xl,
 .hextra-card-icon {
   font-family: var(--olog-font-display) !important;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.015em;
+  font-synthesis: none;
 }
 
 code,
@@ -288,13 +289,17 @@ button:focus-visible {
 
 .olog-display {
   font-family: var(--olog-font-display);
-  font-weight: 800;
-  font-size: clamp(2.35rem, 6vw, 3.65rem);
-  line-height: 1.05;
-  letter-spacing: -0.035em;
+  font-weight: 700;
+  font-size: clamp(2.4rem, 5vw, 3.75rem);
+  /* Syne is already a tight geometric; heavy weight + negative tracking
+     + leading-none made the two-line hero look horizontally/vertically squashed. */
+  line-height: 1.12;
+  letter-spacing: -0.015em;
+  font-synthesis: none;
   color: var(--olog-chalk);
-  max-width: 14ch;
+  max-width: none;
   margin: 0 0 1.25rem;
+  text-wrap: balance;
 }
 
 .olog-lede {
