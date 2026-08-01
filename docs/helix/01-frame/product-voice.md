@@ -26,7 +26,7 @@ Kafka broker or wire protocol in this crate.
 
 > Many writes. Few objects.  
 > An embeddable log engine that group-commits opaque batches onto pluggable
-> object storage. A sequencer you control assigns the offsets.
+> object storage. Strong ordering is maintained per log, similar to Kafka.
 
 Shorter badge line: `v0.3 · Rust · object storage`
 

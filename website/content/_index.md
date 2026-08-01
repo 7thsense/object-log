@@ -10,7 +10,7 @@ layout: hextra-home
 
   <p class="olog-lede">
     An embeddable log engine that group-commits opaque batches onto pluggable
-    object storage. A sequencer you control assigns the offsets.
+    object storage. Strong ordering is maintained per log, similar to Kafka.
   </p>
 
   <div class="olog-actions">
