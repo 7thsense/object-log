@@ -75,6 +75,32 @@ jobs:
             website/test-results
           retention-days: 7
 
+      # Belt-and-suspenders: Playwright starts `hugo server` for e2e. Hugo 0.159+
+      # writes to disk by default and can clobber public/ with a 127.0.0.1
+      # livereload build. Rebuild production output right before upload.
+      - name: Rebuild production site for deploy
+        if: github.event_name != 'pull_request'
+        working-directory: website
+        run: rm -rf public resources && hugo --gc --minify
+        env:
+          HUGO_ENVIRONMENT: production
+
+      - name: Assert production artifact (no livereload / localhost)
+        if: github.event_name != 'pull_request'
+        working-directory: website
+        run: |
+          set -euo pipefail
+          test -f public/index.html
+          if grep -E 'livereload|127\.0\.0\.1' public/index.html; then
+            echo "::error::Production public/ still contains livereload or 127.0.0.1"
+            exit 1
+          fi
+          grep -q 'Many writes' public/index.html
+          grep -q 'olog-btn-primary' public/index.html
+          ls public/css/compiled/main.min.*.css | head -1
+          grep -q 'olog-btn-primary' public/css/compiled/main.min.*.css
+          grep -q -- '--olog-copper' public/css/compiled/main.min.*.css
+
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3

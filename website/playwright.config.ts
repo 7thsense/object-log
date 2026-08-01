@@ -33,10 +33,12 @@ export default defineConfig({
     },
   ],
   webServer: {
-    // Serve the production build so CI/local match what Pages ships.
+    // Hugo 0.159+ serves from disk by default and would overwrite website/public
+    // with a 127.0.0.1 / livereload build — which Pages then deployed.
+    // Always render to memory so the production artifact stays intact.
     command: process.env.CI
-      ? `hugo server --bind 127.0.0.1 --port ${port} --baseURL ${baseURL} --disableFastRender --environment production`
-      : `hugo server --bind 127.0.0.1 --port ${port} --baseURL ${baseURL} --disableFastRender`,
+      ? `hugo server --renderToMemory --bind 127.0.0.1 --port ${port} --baseURL ${baseURL} --disableFastRender --environment production`
+      : `hugo server --renderToMemory --bind 127.0.0.1 --port ${port} --baseURL ${baseURL} --disableFastRender`,
     url: baseURL,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
