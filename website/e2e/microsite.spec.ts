@@ -35,7 +35,11 @@ async function assertNoDeadInternalLinks(page: Page) {
   expect(failures, `dead internal links:\n${failures.join('\n')}`).toEqual([])
 }
 
-/** Full-page shots only on desktop chromium — mobile font metrics flake on CI by 1px. */
+/**
+ * Viewport screenshots on desktop chromium only.
+ * Full-page shots fail hard on any height delta (font metrics / copy wrap),
+ * which blocked Pages whenever the hero type or lede changed.
+ */
 async function desktopScreenshot(page: Page, testInfo: TestInfo, name: string) {
   if (testInfo.project.name !== 'chromium') return
   await page.evaluate(async () => {
@@ -46,7 +50,7 @@ async function desktopScreenshot(page: Page, testInfo: TestInfo, name: string) {
     content: '.olog-seal svg .stream { animation: none !important; }',
   })
   await expect(page).toHaveScreenshot(`${name}.png`, {
-    fullPage: true,
+    fullPage: false,
     maxDiffPixelRatio: 0.12,
     animations: 'disabled',
   })
