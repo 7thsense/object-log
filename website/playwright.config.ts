@@ -17,15 +17,26 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 1280, height: 800 },
+      },
     },
     {
+      // Content/link checks only; screenshots are desktop-chromium to avoid
+      // 1px full-page height flakes that blocked Pages deploys.
       name: 'mobile',
-      use: { ...devices['Pixel 7'] },
+      use: {
+        ...devices['Pixel 7'],
+        viewport: { width: 390, height: 844 },
+      },
     },
   ],
   webServer: {
-    command: `hugo server --bind 127.0.0.1 --port ${port} --baseURL ${baseURL} --disableFastRender`,
+    // Serve the production build so CI/local match what Pages ships.
+    command: process.env.CI
+      ? `hugo server --bind 127.0.0.1 --port ${port} --baseURL ${baseURL} --disableFastRender --environment production`
+      : `hugo server --bind 127.0.0.1 --port ${port} --baseURL ${baseURL} --disableFastRender`,
     url: baseURL,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

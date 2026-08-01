@@ -5,3 +5,11 @@
   rel="stylesheet"
 />
 <meta name="theme-color" content="#0A0F1A" />
+{{/* Force dark theme before first paint so the brand skin is not a light flash. */}}
+<script>
+  try {
+    document.documentElement.classList.add('dark')
+    document.documentElement.style.colorScheme = 'dark'
+    localStorage.setItem('theme', 'dark')
+  } catch (_) {}
+</script>

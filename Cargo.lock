@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "object-log"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",

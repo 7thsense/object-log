@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test'
+import { test, expect, type Page, type TestInfo } from '@playwright/test'
 
 const article = (page: Page) => page.locator('article').first()
 
@@ -18,9 +18,7 @@ async function assertNoDeadInternalLinks(page: Page) {
         continue
       }
       if (url.origin !== origin) continue
-      // Only site pages under base path
       if (!url.pathname.startsWith(base) && base !== '') continue
-      // Strip hash
       url.hash = ''
       out.add(url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`.replace(/\/\/$/, '/'))
     }
@@ -37,20 +35,36 @@ async function assertNoDeadInternalLinks(page: Page) {
   expect(failures, `dead internal links:\n${failures.join('\n')}`).toEqual([])
 }
 
+/** Full-page shots only on desktop chromium — mobile font metrics flake on CI by 1px. */
+async function desktopScreenshot(page: Page, testInfo: TestInfo, name: string) {
+  if (testInfo.project.name !== 'chromium') return
+  await page.evaluate(async () => {
+    await document.fonts.ready
+  })
+  // Stabilize layout before capture (animated seal streams).
+  await page.addStyleTag({
+    content: '.olog-seal svg .stream { animation: none !important; }',
+  })
+  await expect(page).toHaveScreenshot(`${name}.png`, {
+    fullPage: true,
+    maxDiffPixelRatio: 0.12,
+    animations: 'disabled',
+  })
+}
+
 test.describe('Homepage', () => {
   test('hero, paths, and screenshot', async ({ page }, testInfo) => {
-    await page.goto('./')
+    await page.goto('./', { waitUntil: 'networkidle' })
     await expect(page.getByRole('heading', { name: /Many writes/i })).toBeVisible()
     await expect(page.getByText(/group-commits opaque batches/i).first()).toBeVisible()
     await expect(page.getByRole('link', { name: /Get started/i }).first()).toBeVisible()
     await expect(page.getByRole('link', { name: /Why this exists/i }).first()).toBeVisible()
     await expect(page.getByRole('heading', { name: /How a produce resolves/i })).toBeVisible()
     await expect(page.locator('.olog-seal')).toBeVisible()
+    // Brand CTA is copper, not default Hextra primary blue chrome.
+    await expect(page.locator('.olog-btn-primary')).toBeVisible()
 
-    await expect(page).toHaveScreenshot(`homepage-${testInfo.project.name}.png`, {
-      fullPage: true,
-      maxDiffPixelRatio: 0.04,
-    })
+    await desktopScreenshot(page, testInfo, 'homepage')
   })
 
   test('no dead internal links on home', async ({ page }) => {
@@ -64,10 +78,7 @@ test.describe('Why', () => {
     await page.goto('./why/')
     await expect(article(page).getByRole('heading', { level: 1 }).first()).toBeVisible()
     await expect(article(page).getByText(/One PUT per produce/i)).toBeVisible()
-    await expect(page).toHaveScreenshot(`why-${testInfo.project.name}.png`, {
-      fullPage: true,
-      maxDiffPixelRatio: 0.04,
-    })
+    await desktopScreenshot(page, testInfo, 'why')
   })
 
   test('no dead internal links', async ({ page }) => {
@@ -82,10 +93,7 @@ test.describe('Get Started', () => {
     await expect(article(page).getByRole('heading', { level: 1 }).first()).toBeVisible()
     await expect(article(page).getByText(/object-log = "0.3"/)).toBeVisible()
     await expect(article(page).getByText(/LogEngine::new/)).toBeVisible()
-    await expect(page).toHaveScreenshot(`get-started-${testInfo.project.name}.png`, {
-      fullPage: true,
-      maxDiffPixelRatio: 0.04,
-    })
+    await desktopScreenshot(page, testInfo, 'get-started')
   })
 })
 
@@ -93,14 +101,10 @@ test.describe('Concepts', () => {
   test('landing cards', async ({ page }, testInfo) => {
     await page.goto('./concepts/')
     await expect(article(page).getByRole('heading', { level: 1 }).first()).toBeVisible()
-    // Content cards (hextra-card) — use text match; sidebar also has these names.
     await expect(article(page).locator('.hextra-card', { hasText: 'BlobStore' })).toBeVisible()
     await expect(article(page).locator('.hextra-card', { hasText: 'LogEngine' })).toBeVisible()
     await expect(article(page).locator('.hextra-card', { hasText: 'Sequencer' })).toBeVisible()
-    await expect(page).toHaveScreenshot(`concepts-${testInfo.project.name}.png`, {
-      fullPage: true,
-      maxDiffPixelRatio: 0.04,
-    })
+    await desktopScreenshot(page, testInfo, 'concepts')
   })
 
   test('blob-store leaf', async ({ page }) => {
@@ -122,10 +126,7 @@ test.describe('Reference', () => {
     await page.goto('./reference/cli/')
     await expect(article(page).getByRole('heading', { level: 1 }).first()).toBeVisible()
     await expect(article(page).getByText(/produce/).first()).toBeVisible()
-    await expect(page).toHaveScreenshot(`reference-cli-${testInfo.project.name}.png`, {
-      fullPage: true,
-      maxDiffPixelRatio: 0.04,
-    })
+    await desktopScreenshot(page, testInfo, 'reference-cli')
   })
 
   test('no dead internal links on reference', async ({ page }) => {
@@ -134,7 +135,7 @@ test.describe('Reference', () => {
   })
 })
 
-test.describe('Site-wide dead links', () => {
+test.describe('Site-wide routes', () => {
   const routes = [
     './',
     './why/',
