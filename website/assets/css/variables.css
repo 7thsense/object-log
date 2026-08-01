@@ -1,0 +1,47 @@
+/* object-log design tokens — see website/DESIGN.md */
+
+:root {
+  --primary-hue: 28deg;
+  --primary-saturation: 58%;
+  --primary-lightness: 49%;
+
+  --olog-ink: #0a0f1a;
+  --olog-panel: #141c2b;
+  --olog-panel-2: #1a2438;
+  --olog-line: #243049;
+  --olog-mute: #8b9bb4;
+  --olog-chalk: #e8edf5;
+  --olog-copper: #c17a3a;
+  --olog-copper-hi: #e0a05a;
+  --olog-ice: #6ba3c7;
+  --olog-good: #3d9b8f;
+
+  --olog-font-display: "Syne", ui-sans-serif, system-ui, sans-serif;
+  --olog-font-body: "Source Sans 3", "Source Sans Pro", ui-sans-serif, system-ui, sans-serif;
+  --olog-font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Code", monospace;
+
+  --hextra-max-page-width: 88rem;
+  --hextra-max-content-width: 48rem;
+  --hextra-max-navbar-width: 88rem;
+  --hextra-max-footer-width: 88rem;
+  --navbar-height: 3.75rem;
+}
+
+.dark {
+  --primary-hue: 28deg;
+  --primary-saturation: 62%;
+  --primary-lightness: 54%;
+}
+
+.hextra-max-page-width {
+  max-width: var(--hextra-max-page-width);
+}
+.hextra-max-content-width {
+  max-width: var(--hextra-max-content-width);
+}
+.hextra-max-navbar-width {
+  max-width: var(--hextra-max-navbar-width);
+}
+.hextra-max-footer-width {
+  max-width: var(--hextra-max-footer-width);
+}

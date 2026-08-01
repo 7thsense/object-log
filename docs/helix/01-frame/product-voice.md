@@ -8,66 +8,67 @@ ddx:
 
 # Product Voice — object-log
 
-Governing voice for the public microsite, README hero copy, and release notes.
-Derived from product vision + PRD; not marketing fluff.
+Governing voice for the microsite, README hero, and release notes.
+Paired with `website/DESIGN.md` (visual system).
 
-## Who we speak to
+## Audience
 
-Rust infrastructure engineers embedding durable storage under brokers, queue
-engines, WAL cold tiers, and ingestion systems. They already understand
-offsets, durability, and object storage cost. They do not need a Kafka tutorial.
+**Primary:** Rust infrastructure engineers embedding durable storage under
+brokers, queue engines, cold-tier WALs, and ingestion services.
 
-## Who we are not speaking to
+They already understand offsets, fsync, and S3 request pricing. Speak as a
+peer who has paid the PUT bill—not as a tutorial or a sales deck.
 
-- Application developers looking for a drop-in message bus
-- Operators seeking a managed Kafka replacement
-- Readers who want product schemas, tenancy models, or wire protocols in-box
+**Out of audience:** app devs wanting a managed bus; teams that need a full
+Kafka broker or wire protocol in this crate.
 
-## Positioning sentence (use verbatim or lightly adapted)
+## Positioning (canonical)
 
-> object-log is an embeddable Rust log engine: opaque batches over pluggable
-> object storage, group-committed so PUTs track flushes—not produces—with a
-> pluggable sequencer for offsets.
+> Many writes. Few objects.  
+> An embeddable log engine that group-commits opaque batches onto pluggable
+> object storage, with a sequencer seam for offsets you control.
 
-## Voice attributes
+Shorter badge line: `v0.3 · Rust · object storage`
 
-| Attribute | Do | Don't |
-|-----------|----|-------|
-| Precise | Name BlobStore, LogEngine, Sequencer, Durability | Vague “cloud-native log platform” |
-| Honest | State what lives above the library (Kafka, codecs, fencing) | Claim Kafka compatibility in-core |
-| Operator-minded | Cost = PUTs amortized; durability = put + commit | Promise sub-ms local fsync tiers |
-| Layered | “Consumers own Meta and framing” | “All-in-one streaming stack” |
-| Calm | Short sentences; concrete nouns | Hype, exclamation marks, emojis |
+## Register
 
-## Words we prefer
+| Do | Don't |
+|----|-------|
+| Concrete: PUT, flush, seal, commit, offset | Vague: “cloud-native platform” |
+| Name seams: BlobStore, LogEngine, Sequencer | Invent marketing product tiers |
+| State layer boundaries clearly | Imply Kafka drop-in or EOS in-core |
+| Prefer short declarative sentences | Hype, emoji, exclamation |
+| Active voice for actions | “It can be used to…” filler |
 
-amortize, opaque payload, partition key, group-commit, linger, durable-on-return,
-sequencer seam, crash-durable index, path-style S3, quiescent reaper
+Tone is **calm, dry, precise**—closer to a well-written ADR than a launch post.
 
-## Words we avoid (or qualify hard)
+## Vocabulary
 
-- “Kafka-compatible” without “in the consumer / above object-log”
-- “drop-in broker”, “serverless streaming”, “zero-ops”
-- “manifest CAS” (superseded; ManifestSequencer uses ordinary durable puts)
-- “exactly-once” as a core library claim (belongs in sequencer Meta)
+**Prefer:** amortize, opaque payload, partition key, group-commit, linger,
+durable-on-return, sequencer seam, sealed object, crash-durable index,
+path-style, quiescent reaper, media ops
 
-## Homepage first viewport must answer
+**Avoid or qualify:** Kafka-compatible (only “in the consumer”), drop-in
+broker, serverless streaming, zero-ops, manifest CAS (obsolete), exactly-once
+as a library claim
 
-1. **What** — embeddable object-storage log engine (Rust library)
-2. **Why** — one PUT per produce is unaffordable; forked write paths duplicate bugs
-3. **Next** — Get started (cargo add) + secondary proof (concepts / docs.rs)
+## Microsite copy rules
 
-## Trust claims (only if evidenced)
+1. **Home headline** carries the thesis (many → few), not the product name alone.
+2. **First supporting sentence** names the mechanism (group-commit + opaque + sequencer).
+3. **Primary CTA** = Get started; **secondary** = Why / proof.
+4. Section openers answer a **reader question** in one line (product-microsite-ia).
+5. Trust claims only when evidenced (CI, TD-002, crates.io).
 
-- MinIO + Garage operator evidence (TD-002)
-- CI: unit tests, release perf floor, live MinIO job
-- Layer purity: no Kafka types in public API
+## Example lines (approved)
 
-## Microsite reader modes → sections
+- “Under load, PUT count tracks flushes—not produces.”
+- “Payloads are raw bytes. Framing lives above the library.”
+- “Sequenced means durable put **and** sequencer commit.”
+- “Kafka types, codecs, and fencing stay in the consumer.”
 
-| Mode | Question | Section |
-|------|----------|---------|
-| Evaluate | What is this? | Home, Why |
-| Start | How do I try it? | Get Started |
-| Decide | Which concept next? | Concepts |
-| Operate | Exact behavior? | Reference (API, CLI) |
+## Example lines (rejected)
+
+- “The last log library you’ll ever need.”
+- “Kafka-compatible out of the box.”
+- “Blazing-fast cloud-native durability.”

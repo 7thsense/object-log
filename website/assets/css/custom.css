@@ -1,0 +1,588 @@
+/* object-log microsite skin — DESIGN.md "cold storage bay" */
+
+/* ---------- base ---------- */
+html {
+  color-scheme: dark;
+}
+
+body {
+  font-family: var(--olog-font-body) !important;
+  background: var(--olog-ink) !important;
+  color: var(--olog-chalk) !important;
+  letter-spacing: 0.005em;
+}
+
+/* Force dark palette even if class toggles lag */
+body,
+.dark body,
+html.dark body {
+  background-color: var(--olog-ink) !important;
+  color: var(--olog-chalk) !important;
+}
+
+/* ---------- type ---------- */
+h1,
+h2,
+h3,
+h4,
+.hx\:text-4xl,
+.hx\:text-5xl,
+.hextra-card-icon {
+  font-family: var(--olog-font-display) !important;
+  letter-spacing: -0.02em;
+}
+
+code,
+pre,
+kbd,
+.hextra-code-block,
+.chroma {
+  font-family: var(--olog-font-mono) !important;
+  font-size: 0.9em;
+}
+
+/* ---------- nav ---------- */
+.hextra-nav-container,
+.hextra-nav-container-blur {
+  background: color-mix(in oklab, var(--olog-ink) 88%, transparent) !important;
+  border-bottom: 1px solid var(--olog-line) !important;
+  backdrop-filter: blur(12px);
+}
+
+nav a {
+  font-family: var(--olog-font-body);
+  font-weight: 500;
+  font-size: 0.92rem;
+  color: var(--olog-mute) !important;
+  transition: color 0.12s ease;
+}
+
+nav a:hover {
+  color: var(--olog-chalk) !important;
+}
+
+/* brand */
+.hextra-nav-container a[href$="/object-log/"],
+.hextra-nav-container a[href$="/object-log"],
+.hextra-nav-container a[href="/"] {
+  font-family: var(--olog-font-display) !important;
+  font-weight: 700 !important;
+  color: var(--olog-chalk) !important;
+  letter-spacing: -0.03em;
+}
+
+/* ---------- sidebar ---------- */
+.hextra-sidebar-container {
+  background: var(--olog-ink) !important;
+  border-color: var(--olog-line) !important;
+}
+
+.hextra-sidebar-item a {
+  color: var(--olog-mute) !important;
+  border-radius: 6px !important;
+  border-left: 2px solid transparent;
+}
+
+.hextra-sidebar-item a:hover {
+  background: var(--olog-panel-2) !important;
+  color: var(--olog-chalk) !important;
+}
+
+.hextra-sidebar-active-item,
+a.hextra-sidebar-active-item {
+  background: var(--olog-panel-2) !important;
+  color: var(--olog-chalk) !important;
+  border-left-color: var(--olog-copper) !important;
+  font-weight: 600 !important;
+}
+
+/* ---------- content surface ---------- */
+article,
+main#content,
+.content {
+  color: var(--olog-chalk);
+}
+
+.content h1 {
+  font-size: 1.85rem;
+  font-weight: 700;
+  margin-bottom: 1rem;
+  color: var(--olog-chalk);
+}
+
+.content h2 {
+  font-size: 1.28rem;
+  font-weight: 650;
+  margin-top: 2.25rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--olog-line);
+  color: var(--olog-chalk);
+}
+
+.content h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--olog-ice);
+}
+
+.content p,
+.content li {
+  color: color-mix(in oklab, var(--olog-chalk) 92%, var(--olog-mute));
+  line-height: 1.7;
+}
+
+.content a:not(.hextra-card):not(.olog-btn) {
+  color: var(--olog-ice);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.content a:not(.hextra-card):not(.olog-btn):hover {
+  color: var(--olog-copper-hi);
+}
+
+.content strong {
+  color: var(--olog-chalk);
+  font-weight: 600;
+}
+
+/* tables */
+.content table {
+  font-size: 0.92rem;
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.content th {
+  font-family: var(--olog-font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--olog-mute);
+  border-bottom: 1px solid var(--olog-copper) !important;
+  background: transparent !important;
+  font-weight: 500;
+}
+
+.content td {
+  border-color: var(--olog-line) !important;
+  color: var(--olog-chalk);
+}
+
+.content tr:hover td {
+  background: color-mix(in oklab, var(--olog-panel) 70%, transparent) !important;
+}
+
+/* code */
+.content pre,
+.hextra-code-block {
+  background: #070b14 !important;
+  border: 1px solid var(--olog-line) !important;
+  border-radius: 6px !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.content :not(pre) > code {
+  background: var(--olog-panel-2) !important;
+  color: var(--olog-copper-hi) !important;
+  border: 1px solid var(--olog-line);
+  border-radius: 4px;
+  font-size: 0.86em;
+  padding: 0.12em 0.35em;
+}
+
+/* cards */
+.hextra-card {
+  background: var(--olog-panel) !important;
+  border-color: var(--olog-line) !important;
+  border-radius: 6px !important;
+  transition: border-color 0.15s ease, transform 0.15s ease !important;
+  box-shadow: none !important;
+}
+
+.hextra-card:hover {
+  border-color: var(--olog-copper) !important;
+  background: var(--olog-panel-2) !important;
+  transform: translateY(-1px);
+}
+
+.hextra-card-icon {
+  color: var(--olog-chalk) !important;
+  font-size: 1.05rem !important;
+}
+
+.hextra-card-subtitle {
+  color: var(--olog-mute) !important;
+}
+
+/* feature grid on home — restyle if present */
+.hextra-feature-grid > div,
+.hextra-feature-card {
+  background: var(--olog-panel) !important;
+  border: 1px solid var(--olog-line) !important;
+  border-radius: 6px !important;
+}
+
+/* TOC */
+.hextra-toc a {
+  color: var(--olog-mute) !important;
+  font-size: 0.8rem;
+}
+
+.hextra-toc a.hextra-toc-active {
+  color: var(--olog-ice) !important;
+}
+
+/* footer */
+footer {
+  border-top: 1px solid var(--olog-line) !important;
+  background: var(--olog-ink) !important;
+  color: var(--olog-mute) !important;
+}
+
+/* focus */
+a:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--olog-copper-hi) !important;
+  outline-offset: 2px !important;
+}
+
+/* ---------- homepage: custom hero + seal rail ---------- */
+.olog-home {
+  max-width: 56rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 4rem;
+}
+
+@media (min-width: 768px) {
+  .olog-home {
+    padding: 3.5rem 2rem 5rem;
+  }
+}
+
+.olog-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--olog-font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--olog-copper);
+  border: 1px solid var(--olog-line);
+  background: var(--olog-panel);
+  border-radius: 999px;
+  padding: 0.35rem 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.olog-eyebrow::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--olog-good);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--olog-good) 25%, transparent);
+}
+
+.olog-display {
+  font-family: var(--olog-font-display);
+  font-weight: 800;
+  font-size: clamp(2.35rem, 6vw, 3.65rem);
+  line-height: 1.05;
+  letter-spacing: -0.035em;
+  color: var(--olog-chalk);
+  max-width: 14ch;
+  margin: 0 0 1.25rem;
+}
+
+.olog-lede {
+  font-size: 1.125rem;
+  line-height: 1.55;
+  color: var(--olog-mute);
+  max-width: 36rem;
+  margin: 0 0 1.75rem;
+}
+
+.olog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 2.75rem;
+}
+
+.olog-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--olog-font-body);
+  font-weight: 600;
+  font-size: 0.95rem;
+  padding: 0.7rem 1.15rem;
+  border-radius: 6px;
+  text-decoration: none !important;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.olog-btn-primary {
+  background: var(--olog-copper);
+  color: #0a0f1a !important;
+  border: 1px solid var(--olog-copper-hi);
+}
+
+.olog-btn-primary:hover {
+  background: var(--olog-copper-hi);
+  color: #0a0f1a !important;
+}
+
+.olog-btn-ghost {
+  background: transparent;
+  color: var(--olog-chalk) !important;
+  border: 1px solid var(--olog-line);
+}
+
+.olog-btn-ghost:hover {
+  border-color: var(--olog-mute);
+  background: var(--olog-panel);
+}
+
+/* signature: seal rail */
+.olog-seal {
+  margin: 0 0 3rem;
+  padding: 1.25rem 1rem 1rem;
+  background: linear-gradient(180deg, var(--olog-panel) 0%, #0d1320 100%);
+  border: 1px solid var(--olog-line);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.olog-seal::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 80% 50% at 70% 0%, color-mix(in oklab, var(--olog-copper) 12%, transparent), transparent 55%);
+  pointer-events: none;
+}
+
+.olog-seal-label {
+  font-family: var(--olog-font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--olog-mute);
+  margin-bottom: 0.75rem;
+  position: relative;
+}
+
+.olog-seal svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  position: relative;
+}
+
+.olog-seal-caption {
+  font-family: var(--olog-font-mono);
+  font-size: 0.75rem;
+  color: var(--olog-mute);
+  margin-top: 0.75rem;
+  position: relative;
+}
+
+.olog-seal-caption strong {
+  color: var(--olog-copper-hi);
+  font-weight: 500;
+}
+
+/* three pillars */
+.olog-pillars {
+  display: grid;
+  gap: 1rem;
+  margin: 0 0 3rem;
+}
+
+@media (min-width: 720px) {
+  .olog-pillars {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+.olog-pillar {
+  background: var(--olog-panel);
+  border: 1px solid var(--olog-line);
+  border-radius: 6px;
+  padding: 1.15rem 1.15rem 1.25rem;
+}
+
+.olog-pillar-kicker {
+  font-family: var(--olog-font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--olog-copper);
+  margin-bottom: 0.5rem;
+}
+
+.olog-pillar h2 {
+  font-family: var(--olog-font-display);
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin: 0 0 0.5rem;
+  border: none !important;
+  padding: 0 !important;
+  color: var(--olog-chalk);
+}
+
+.olog-pillar p {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--olog-mute);
+  line-height: 1.55;
+}
+
+/* section blocks */
+.olog-section {
+  margin-bottom: 2.75rem;
+}
+
+.olog-section > h2 {
+  font-family: var(--olog-font-display);
+  font-size: 1.35rem;
+  font-weight: 700;
+  border: none;
+  padding: 0;
+  margin: 0 0 1rem;
+  color: var(--olog-chalk);
+}
+
+.olog-flow {
+  font-family: var(--olog-font-mono);
+  font-size: 0.78rem;
+  line-height: 1.55;
+  background: #070b14;
+  border: 1px solid var(--olog-line);
+  border-radius: 6px;
+  padding: 1rem 1.1rem;
+  color: var(--olog-mute);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.olog-flow .hi {
+  color: var(--olog-copper-hi);
+}
+
+.olog-flow .ok {
+  color: var(--olog-good);
+}
+
+.olog-trust {
+  display: grid;
+  gap: 0.5rem;
+  font-size: 0.92rem;
+}
+
+@media (min-width: 640px) {
+  .olog-trust {
+    grid-template-columns: auto 1fr;
+    column-gap: 1.25rem;
+    row-gap: 0.45rem;
+  }
+}
+
+.olog-trust dt {
+  font-family: var(--olog-font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--olog-mute);
+  margin: 0;
+}
+
+.olog-trust dd {
+  margin: 0;
+  color: var(--olog-chalk);
+}
+
+.olog-trust a {
+  color: var(--olog-ice);
+}
+
+/* hide default hextra home chrome when we use custom home content */
+.hextra-home .content > .hx\:mt-6,
+.hextra-home .hextra-feature-grid {
+  /* legacy paths unused after custom home */
+}
+
+/* content pages: slightly tighter prose */
+article .content {
+  max-width: 42rem;
+}
+
+/* home article full width of content col */
+.hextra-home article .content,
+.hextra-home main#content {
+  max-width: none;
+}
+
+/* light mode fallback — still readable, brand stays dark-ish surfaces */
+html:not(.dark) body {
+  background: #f4f6fa !important;
+  color: #121826 !important;
+}
+
+html:not(.dark) {
+  --olog-ink: #f4f6fa;
+  --olog-panel: #ffffff;
+  --olog-panel-2: #eef2f8;
+  --olog-line: #d5dde8;
+  --olog-mute: #5a6b82;
+  --olog-chalk: #121826;
+}
+
+html:not(.dark) .olog-display,
+html:not(.dark) .content h1,
+html:not(.dark) .content h2 {
+  color: #121826;
+}
+
+html:not(.dark) .olog-seal {
+  background: #fff;
+}
+
+html:not(.dark) .olog-flow,
+html:not(.dark) .content pre {
+  background: #0f1520 !important;
+  color: #c5d0e0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .olog-seal svg .stream {
+    animation: none !important;
+  }
+}
+
+@keyframes olog-stream {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.olog-seal svg .stream {
+  stroke-dasharray: 6 6;
+  animation: olog-stream 1.2s linear infinite;
+}
+
+.olog-seal svg .stream-2 {
+  animation-duration: 1.6s;
+}
+
+.olog-seal svg .stream-3 {
+  animation-duration: 1.0s;
+}

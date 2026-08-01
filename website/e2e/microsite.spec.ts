@@ -40,13 +40,12 @@ async function assertNoDeadInternalLinks(page: Page) {
 test.describe('Homepage', () => {
   test('hero, paths, and screenshot', async ({ page }, testInfo) => {
     await page.goto('./')
-    await expect(
-      page.getByRole('heading', { name: /Object storage as an append log/i }),
-    ).toBeVisible()
-    await expect(page.getByText(/opaque payloads/i).first()).toBeVisible()
+    await expect(page.getByRole('heading', { name: /Many writes/i })).toBeVisible()
+    await expect(page.getByText(/group-commits opaque batches/i).first()).toBeVisible()
     await expect(page.getByRole('link', { name: /Get started/i }).first()).toBeVisible()
-    await expect(page.getByRole('link', { name: /Why object-log/i }).first()).toBeVisible()
-    await expect(page.getByRole('heading', { name: /How it works/i })).toBeVisible()
+    await expect(page.getByRole('link', { name: /Why this exists/i }).first()).toBeVisible()
+    await expect(page.getByRole('heading', { name: /How a produce resolves/i })).toBeVisible()
+    await expect(page.locator('.olog-seal')).toBeVisible()
 
     await expect(page).toHaveScreenshot(`homepage-${testInfo.project.name}.png`, {
       fullPage: true,
