@@ -57,6 +57,7 @@ test.describe('Homepage', () => {
     await page.goto('./', { waitUntil: 'networkidle' })
     await expect(page.getByRole('heading', { name: /Many writes/i })).toBeVisible()
     await expect(page.getByText(/group-commits opaque batches/i).first()).toBeVisible()
+    await expect(page.getByText(/sequencer you control assigns the offsets/i).first()).toBeVisible()
     await expect(page.getByRole('link', { name: /Get started/i }).first()).toBeVisible()
     await expect(page.getByRole('link', { name: /Why this exists/i }).first()).toBeVisible()
     await expect(page.getByRole('heading', { name: /How a produce resolves/i })).toBeVisible()
