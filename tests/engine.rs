@@ -351,6 +351,10 @@ async fn put_failure_yields_no_ack_no_offset() {
     assert!(matches!(err, ObjectLogError::StorageUnavailable(_)));
     // Nothing sequenced.
     assert_eq!(seq.high_watermark(&p).unwrap(), 0);
+    assert!(
+        engine.flush().await.is_err(),
+        "settled PUT failure must remain visible to flush"
+    );
 }
 
 struct FailsPutOnce {
@@ -1111,7 +1115,10 @@ async fn reopen_does_not_overwrite_sealed_data_objects() {
             .unwrap();
         let all = engine.fetch(&p, 0, 1 << 20).await.unwrap();
         assert_eq!(all.len(), 2, "both generations must be readable");
-        assert_eq!(all[0].payload, payload_a, "first sealed object must not be overwritten");
+        assert_eq!(
+            all[0].payload, payload_a,
+            "first sealed object must not be overwritten"
+        );
         assert_eq!(all[1].payload, payload_b);
         // Distinct data keys under data/ (counter advanced past recovered max).
         let data_keys: Vec<_> = blob
@@ -1129,4 +1136,62 @@ async fn reopen_does_not_overwrite_sealed_data_objects() {
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn flush_preserves_failed_manifest_prefix_after_producer_completion() {
+    for durability in [
+        Durability::Buffered,
+        Durability::Durable,
+        Durability::Sequenced,
+    ] {
+        let blob = Arc::new(MemoryBlobStore::new());
+        let seq = Arc::new(FailCommitOnce {
+            inner: InMemorySequencer::new(),
+            failed: AtomicBool::new(false),
+        });
+        let engine = LogEngine::new(
+            blob as Arc<dyn BlobStore>,
+            seq,
+            FlushConfig::default(),
+            "log/",
+        );
+        engine.flush().await.unwrap();
+        let first = engine
+            .produce(pk("failed"), Bytes::from_static(b"lost"), 1, (), durability)
+            .await;
+        if durability == Durability::Sequenced {
+            assert!(first.is_err());
+        } else {
+            assert!(first.is_ok());
+        }
+        assert!(
+            engine.flush().await.is_err(),
+            "flush hid a failed manifest for {durability:?}"
+        );
+        assert!(
+            engine
+                .fetch(&pk("failed"), 0, 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A subsequent successful append cannot repair the failed enqueue prefix.
+        let next = engine
+            .produce(
+                pk("failed"),
+                Bytes::from_static(b"live"),
+                1,
+                (),
+                Durability::Sequenced,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.base_offset, Some(0));
+        assert!(engine.flush().await.is_err());
+        assert_eq!(
+            engine.fetch(&pk("failed"), 0, 1024).await.unwrap()[0].payload,
+            "live"
+        );
+    }
 }
