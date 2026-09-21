@@ -217,6 +217,7 @@ niflheim's **chunk tracking** (`chunk_seq`, offset bounds, `cold_durable`/`backi
 - fjord TD-005 / TD-006 — the multiplexed write/fetch path generalized here.
 - fjord ADR-008 — central-coordinator sequencing (fjord's `Sequencer` impl).
 - Adversarial review 2026-06-17 — four lenses (layer purity, dependency graph, correctness preservation, seam shape); findings folded into §"Decision" and §"Invariants".
+- [LogDrive (OSDI 2026)](../references/logdrive-osdi26.md) — reading note. Composable durability under a shared-log sequencer. Not a change to this decision.
 
 ## Review Checklist
 
