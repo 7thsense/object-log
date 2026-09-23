@@ -164,6 +164,8 @@ struct Pending<M> {
     record_count: i32,
     payload: Bytes,
     meta: M,
+    /// Fence epoch carried into [`CommitBatch::epoch`].
+    epoch: u64,
     durability: Durability,
     responder: Option<Responder>,
     /// Monotonic enqueue id for [`LogEngine::flush`] barriers.
@@ -240,8 +242,10 @@ pub struct LogEngine<S: Sequencer> {
     shared: Arc<Shared<S::Meta>>,
     blob: Arc<dyn BlobStore>,
     sequencer: Arc<S>,
-    /// Data-object key prefix (`<prefix><counter:020>`). Used by orphan reaping.
+    /// Data-object key prefix (`<prefix><counter:020>`, or
+    /// `<prefix><writer>/<epoch>/<counter>` when a writer id is set).
     key_prefix: String,
+    writer_id: String,
     flush_thread: Option<JoinHandle<()>>,
 }
 
@@ -258,6 +262,19 @@ where
         sequencer: Arc<S>,
         config: FlushConfig,
         key_prefix: impl Into<String>,
+    ) -> Self {
+        Self::new_with_writer(blob, sequencer, config, key_prefix, "")
+    }
+
+    /// Like [`new`](Self::new), but data objects are
+    /// `<key_prefix><writer_id>/<epoch>/<counter>` so two writers cannot
+    /// overwrite the same key. `writer_id` must not contain `/` or `..`.
+    pub fn new_with_writer(
+        blob: Arc<dyn BlobStore>,
+        sequencer: Arc<S>,
+        config: FlushConfig,
+        key_prefix: impl Into<String>,
+        writer_id: impl Into<String>,
     ) -> Self {
         if let Err(msg) = config.budget.validate() {
             panic!("invalid FlushConfig.budget: {msg}");
@@ -286,17 +303,20 @@ where
             flush_config: config,
         });
         let key_prefix = key_prefix.into();
+        let writer_id = writer_id.into();
         let flush_thread = {
             let shared = Arc::clone(&shared);
             let blob = Arc::clone(&blob);
             let sequencer = Arc::clone(&sequencer);
             let prefix = key_prefix.clone();
+            let writer_id = writer_id.clone();
             std::thread::Builder::new()
                 .name("object-log-flush".into())
-                .spawn(move || flush_loop(shared, blob, sequencer, config, prefix))
+                .spawn(move || flush_loop(shared, blob, sequencer, config, prefix, writer_id))
                 .expect("spawn flush thread")
         };
         Self {
+            writer_id,
             shared,
             blob,
             sequencer,
@@ -320,7 +340,15 @@ where
         &self.sequencer
     }
 
+    /// Writer id used in data-object keys. Empty when constructed with [`new`](Self::new).
+    pub fn writer_id(&self) -> &str {
+        &self.writer_id
+    }
+
     /// Buffer a batch and resolve at the requested [`Durability`].
+    ///
+    /// The batch's fence epoch is `0`. Use [`produce_at_epoch`](Self::produce_at_epoch)
+    /// when the partition index is fenced.
     pub async fn produce(
         &self,
         partition: PartitionKey,
@@ -328,6 +356,20 @@ where
         record_count: i32,
         meta: S::Meta,
         durability: Durability,
+    ) -> Result<AppendOutcome, ObjectLogError> {
+        self.produce_at_epoch(partition, payload, record_count, meta, durability, 0)
+            .await
+    }
+
+    /// [`produce`](Self::produce) at a caller-supplied fence epoch.
+    pub async fn produce_at_epoch(
+        &self,
+        partition: PartitionKey,
+        payload: Bytes,
+        record_count: i32,
+        meta: S::Meta,
+        durability: Durability,
+        epoch: u64,
     ) -> Result<AppendOutcome, ObjectLogError> {
         if record_count <= 0 {
             return Err(ObjectLogError::InvalidBatch(
@@ -340,6 +382,7 @@ where
                 record_count,
                 payload,
                 meta,
+                epoch,
                 durability,
                 responder: None,
                 seq: 0, // filled in enqueue
@@ -389,6 +432,7 @@ where
             record_count,
             payload,
             meta,
+            epoch,
             durability,
             responder: Some(tx),
             seq: 0,
@@ -661,23 +705,49 @@ impl<S: Sequencer> Drop for LogEngine<S> {
     }
 }
 
-/// Highest numeric suffix already present under `data_prefix` (keys shaped
-/// `{prefix}{counter:020}`). Used so a reopened engine never reissues object ids.
+/// Highest numeric suffix already present under `data_prefix`.
+///
+/// Empty `writer_id` reads legacy keys `{prefix}{counter:020}`. A writer id
+/// reads `{prefix}{writer}/{epoch}/{counter}` and ignores other writers, so a
+/// restarted process with a new writer id cannot overwrite their objects.
 async fn recover_data_object_counter(
     blob: &dyn BlobStore,
     prefix: &str,
+    writer_id: &str,
 ) -> Result<u64, ObjectLogError> {
     let keys = blob.list(prefix).await?;
     let mut max = 0u64;
+    let writer_prefix = format!("{prefix}{writer_id}/");
     for key in keys {
         let Some(suffix) = key.strip_prefix(prefix) else {
             continue;
         };
-        if let Ok(n) = suffix.parse::<u64>() {
+        if writer_id.is_empty() {
+            if let Ok(n) = suffix.parse::<u64>() {
+                max = max.max(n);
+            }
+            continue;
+        }
+        let Some(rest) = key.strip_prefix(&writer_prefix) else {
+            continue;
+        };
+        if let Some(n) = rest
+            .rsplit('/')
+            .next()
+            .and_then(|tail| tail.parse::<u64>().ok())
+        {
             max = max.max(n);
         }
     }
     Ok(max)
+}
+
+fn data_object_key(prefix: &str, writer_id: &str, epoch: u64, counter: u64) -> String {
+    if writer_id.is_empty() {
+        format!("{prefix}{counter:020}")
+    } else {
+        format!("{prefix}{writer_id}/{epoch:020}/{counter:020}")
+    }
 }
 
 fn flush_loop<S>(
@@ -686,6 +756,7 @@ fn flush_loop<S>(
     sequencer: Arc<S>,
     config: FlushConfig,
     prefix: String,
+    writer_id: String,
 ) where
     S: Sequencer + 'static,
     S::Meta: Send + 'static,
@@ -709,7 +780,11 @@ fn flush_loop<S>(
     // Resume the data-object counter past any keys already under `prefix`. Restarting
     // at 0 on reopen overwrites sealed objects while manifests still point at the old
     // byte ranges → RangeOutOfBounds / mid-JSON EOF on fetch (fireweed-481d3e43).
-    let mut counter = match rt.block_on(recover_data_object_counter(blob.as_ref(), &prefix)) {
+    let mut counter = match rt.block_on(recover_data_object_counter(
+        blob.as_ref(),
+        &prefix,
+        &writer_id,
+    )) {
         Ok(counter) => counter,
         Err(error) => {
             // A failed listing is not an empty prefix. Fail admission before
@@ -732,7 +807,9 @@ fn flush_loop<S>(
                 TakeBatch::Batch(batch) => {
                     counter += 1;
                     let concurrent = max_inflight > 1;
-                    let work = start_flush_work(&rt, &blob, &prefix, counter, batch, concurrent);
+                    let work = start_flush_work(
+                        &rt, &blob, &prefix, &writer_id, counter, batch, concurrent,
+                    );
                     if concurrent {
                         active_puts += 1;
                     }
@@ -1106,12 +1183,14 @@ fn send_durable_acks(responders: &mut [(Durability, Option<Responder>)]) {
 
 fn prepare_flush_work<M>(
     prefix: &str,
+    writer_id: &str,
     counter: u64,
     mut batch: Vec<Pending<M>>,
 ) -> (FlushWork<M>, String, Vec<Bytes>) {
     let mut locations: Vec<BatchLocation> = Vec::with_capacity(batch.len());
     let mut chunks: Vec<Bytes> = Vec::with_capacity(batch.len());
-    let key = format!("{prefix}{counter:020}");
+    let epoch = batch.first().map(|pending| pending.epoch).unwrap_or(0);
+    let key = data_object_key(prefix, writer_id, epoch, counter);
     let mut offset = 0usize;
     for p in &batch {
         let start = offset as u32;
@@ -1157,11 +1236,12 @@ fn start_flush_work<M>(
     rt: &tokio::runtime::Runtime,
     blob: &Arc<dyn BlobStore>,
     prefix: &str,
+    writer_id: &str,
     counter: u64,
     batch: Vec<Pending<M>>,
     concurrent: bool,
 ) -> FlushWork<M> {
-    let (mut work, key, chunks) = prepare_flush_work(prefix, counter, batch);
+    let (mut work, key, chunks) = prepare_flush_work(prefix, writer_id, counter, batch);
     let blob = Arc::clone(blob);
     let _ = blob.take_media_op_stats();
     work.put_started = Instant::now();
@@ -1236,6 +1316,7 @@ where
             record_count: p.record_count,
             location: loc.clone(),
             meta: &p.meta,
+            epoch: p.epoch,
         })
         .collect();
 
@@ -1270,6 +1351,10 @@ where
                             Some(base_offset + record_count as i64 - 1),
                         ),
                         CommitOutcome::Duplicate { base_offset } => (Some(base_offset), None),
+                        CommitOutcome::Rejected { reason } => {
+                            let _ = tx.send(Err(ObjectLogError::Sequencer(reason)));
+                            continue;
+                        }
                     };
                     let _ = tx.send(Ok(AppendOutcome {
                         base_offset: base,
@@ -1361,12 +1446,14 @@ mod ready_commit_group_tests {
         let (tx, rx) = oneshot::channel();
         let (mut work, key, chunks) = prepare_flush_work(
             "data/",
+            "",
             n,
             vec![Pending {
                 partition: PartitionKey("shared".into()),
                 record_count: 1,
                 payload: Bytes::from(format!("body-{n}")),
                 meta: (),
+                epoch: 0,
                 durability,
                 responder: Some(tx),
                 seq: n,
@@ -1584,7 +1671,7 @@ mod ready_commit_group_tests {
                 assert_eq!(sequenced_rx.await.unwrap().unwrap().base_offset, Some(0));
                 assert_eq!(third_rx.await.unwrap().unwrap().base_offset, Some(1));
                 flush_rx.await.unwrap().unwrap();
-                assert_eq!(blob.list("manifest/").await.unwrap().len(), 1);
+                assert_eq!(blob.list("manifest/").await.unwrap().len(), 3);
             }
             assert_eq!(blob.list("data/").await.unwrap().len(), 3);
             let reopened = ManifestSequencer::open(blob.clone(), "manifest/")
@@ -2366,6 +2453,7 @@ mod ready_commit_group_tests {
                         byte_len: 1,
                     },
                     meta: &(),
+                    epoch: 0,
                 }])
             })
         };
@@ -2495,6 +2583,7 @@ mod idle_batch_wait_tests {
                             record_count: 1,
                             payload,
                             meta: (),
+                            epoch: 0,
                             durability: Durability::Buffered,
                             responder: None,
                             seq: 1,

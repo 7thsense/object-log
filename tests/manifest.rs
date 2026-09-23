@@ -262,6 +262,7 @@ async fn grouped_manifest_reopen_uses_data_object_counter_not_manifest_count() {
                     byte_len: 5,
                 },
                 meta: &(),
+                epoch: 0,
             },
             CommitBatch {
                 partition: pk("p"),
@@ -272,13 +273,14 @@ async fn grouped_manifest_reopen_uses_data_object_counter_not_manifest_count() {
                     byte_len: 6,
                 },
                 meta: &(),
+                epoch: 0,
             },
         ])
     })
     .join()
     .unwrap()
     .unwrap();
-    assert_eq!(blob.list("manifest/").await.unwrap().len(), 1);
+    assert_eq!(blob.list("manifest/").await.unwrap().len(), 2);
     drop(sequencer);
     let sequencer = Arc::new(
         ManifestSequencer::open(blob.clone(), "manifest/")

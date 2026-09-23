@@ -45,6 +45,10 @@ pub struct CommitBatch<'a, M> {
     /// Sequencer-private metadata (e.g. idempotent-producer identity). Opaque to
     /// the engine.
     pub meta: &'a M,
+    /// Fence epoch the caller believes owns this partition. [`ManifestSequencer`](crate::ManifestSequencer)
+    /// rejects the batch when the stored index epoch differs. Other sequencers
+    /// ignore it.
+    pub epoch: u64,
 }
 
 /// Per-batch result of [`Sequencer::commit`].
@@ -62,6 +66,13 @@ pub enum CommitOutcome {
     Duplicate {
         /// The originally assigned first offset.
         base_offset: i64,
+    },
+    /// This batch was not indexed. Other batches in the same call may already
+    /// be durable. The caller must rewrite this batch in a new data object
+    /// rather than reuse the offsets it expected.
+    Rejected {
+        /// Why the conditional update did not land.
+        reason: String,
     },
 }
 
@@ -103,8 +114,11 @@ pub trait Sequencer: Send + Sync {
     /// Assign offsets to durably uploaded batches and persist the index.
     /// By default these belong to one object; an opted-in implementation may
     /// receive several objects in one ordered call.
-    /// Returns one [`CommitOutcome`] per input batch, in order. Atomic: on `Err`,
-    /// nothing is committed.
+    /// Returns one [`CommitOutcome`] per input batch, in order.
+    ///
+    /// On `Err`, nothing from this call was indexed. A [`CommitOutcome::Rejected`]
+    /// batch was not indexed either; earlier batches in the same call may already
+    /// be durable when the sequencer commits one partition at a time.
     fn commit(
         &self,
         batches: &[CommitBatch<'_, Self::Meta>],
@@ -131,6 +145,22 @@ pub trait Sequencer: Send + Sync {
         partition: &PartitionKey,
         offset: i64,
     ) -> Result<Vec<String>, ObjectLogError>;
+
+    /// Move the stored fence epoch for `partition` from `expected` to `new_epoch`.
+    ///
+    /// The default succeeds without storing anything. [`ManifestSequencer`](crate::ManifestSequencer)
+    /// compares `expected` with the epoch in that partition's index and fails
+    /// when they differ. A missing index is not an error: the next commit records
+    /// its epoch.
+    fn fence_epoch(
+        &self,
+        partition: &PartitionKey,
+        expected: u64,
+        new_epoch: u64,
+    ) -> Result<(), ObjectLogError> {
+        let _ = (partition, expected, new_epoch);
+        Ok(())
+    }
 }
 
 /// Per-partition in-memory index state.

@@ -211,6 +211,7 @@ impl Sequencer for RecordingSeq {
                 record_count: b.record_count,
                 location: b.location.clone(),
                 meta: &(),
+                epoch: 0,
             }];
             out.push(self.inner.commit(&clean)?.into_iter().next().unwrap());
         }
@@ -585,6 +586,7 @@ impl Sequencer for PoisonIfAny {
                 record_count: b.record_count,
                 location: b.location.clone(),
                 meta: &(),
+                epoch: 0,
             })
             .collect();
         self.inner.commit(&clean)
@@ -670,6 +672,7 @@ impl Sequencer for DedupSeq {
                 record_count: b.record_count,
                 location: b.location.clone(),
                 meta: &(),
+                epoch: 0,
             }];
             let r = self.inner.commit(&clean)?;
             if let CommitOutcome::Assigned { base_offset, .. } = r[0] {

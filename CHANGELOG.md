@@ -20,6 +20,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
 
+## [0.3.3] — 2026-09-22
+
+### Changed
+
+- `ManifestSequencer` stores one conditional index object per partition instead
+  of an append-only manifest per seal. Open reads that catalog by key and does
+  not list the manifest prefix once an index exists. A seal that loses a
+  partition's compare-and-swap fails that partition closed; it does not skip
+  an offset. Data objects created with `LogEngine::new_with_writer` include
+  the writer id and fence epoch in the key.
+
 ## [0.3.1] — 2026-08-01
 
 ### Fixed

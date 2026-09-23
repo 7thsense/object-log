@@ -5,7 +5,7 @@
 //! object is durably stored) and dispatches multipart upload above a size
 //! threshold so large coalesced objects are not a single whole-buffer PUT.
 
-use crate::{BlobStore, MediaOpStats, ObjectLogError};
+use crate::{BlobStore, CasOutcome, MediaOpStats, ObjectLogError};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{
@@ -23,6 +23,11 @@ use std::time::Duration;
 
 fn unavailable<E: std::fmt::Display>(e: E) -> ObjectLogError {
     ObjectLogError::StorageUnavailable(e.to_string())
+}
+
+fn s3_precondition_failed(err: &impl std::fmt::Display) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("precondition") || text.contains("412") || text.contains("conflict")
 }
 
 fn transient_s3(err: &impl std::fmt::Display) -> bool {
@@ -359,6 +364,34 @@ impl S3BlobStore {
             .map_err(unavailable)?;
         Ok(part_count)
     }
+
+    async fn get_with_etag(
+        &self,
+        key: &str,
+    ) -> Result<(Option<Bytes>, Option<String>), ObjectLogError> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let etag = resp.e_tag().map(str::to_string);
+                let data = resp.body.collect().await.map_err(unavailable)?;
+                Ok((Some(data.into_bytes()), etag))
+            }
+            Err(error) => {
+                let svc = error.into_service_error();
+                if svc.is_no_such_key() {
+                    Ok((None, None))
+                } else {
+                    Err(unavailable(svc))
+                }
+            }
+        }
+    }
 }
 
 fn env_flag(name: &str) -> bool {
@@ -519,6 +552,50 @@ impl BlobStore for S3BlobStore {
                     Err(unavailable(svc))
                 }
             }
+        }
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        new_value: Bytes,
+    ) -> Result<CasOutcome, ObjectLogError> {
+        let (current, etag) = self.get_with_etag(key).await?;
+        let matches = match (&expected, &current) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => expected == current,
+            _ => false,
+        };
+        if !matches {
+            return Ok(CasOutcome::Conflict { current });
+        }
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(new_value.clone()));
+        request = if let Some(etag) = etag {
+            request.if_match(etag)
+        } else {
+            request.if_none_match("*")
+        };
+        let request = if self.disable_payload_signing {
+            request.customize().disable_payload_signing().send().await
+        } else {
+            request.send().await
+        };
+        match request {
+            Ok(_) => {
+                self.record_media(1, new_value.len() as u64);
+                Ok(CasOutcome::Stored)
+            }
+            Err(error) if s3_precondition_failed(&error) => {
+                let (current, _) = self.get_with_etag(key).await?;
+                Ok(CasOutcome::Conflict { current })
+            }
+            Err(error) => Err(unavailable(error)),
         }
     }
 
