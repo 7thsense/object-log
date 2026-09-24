@@ -284,15 +284,15 @@ impl ManifestSequencer {
                 Ok(outcomes)
             }
             CasOutcome::Conflict { current } => {
-                if let Some(bytes) = current {
-                    if let Ok(found) = serde_json::from_slice::<PartitionIndexDoc>(&bytes) {
-                        let already = planned
-                            .iter()
-                            .all(|entry| found.entries.iter().any(|have| have == entry));
-                        self.install_doc(partition, &found, bytes);
-                        if already {
-                            return Ok(outcomes);
-                        }
+                if let Some(bytes) = current
+                    && let Ok(found) = serde_json::from_slice::<PartitionIndexDoc>(&bytes)
+                {
+                    let already = planned
+                        .iter()
+                        .all(|entry| found.entries.iter().any(|have| have == entry));
+                    self.install_doc(partition, &found, bytes);
+                    if already {
+                        return Ok(outcomes);
                     }
                 }
                 Ok(reject_all(
@@ -301,6 +301,20 @@ impl ManifestSequencer {
                 ))
             }
         }
+    }
+
+    /// Install `partition`'s durable index, if any, and return it.
+    fn reload_partition(
+        &self,
+        partition: &PartitionKey,
+    ) -> Result<Option<(PartitionIndexDoc, Bytes)>, ObjectLogError> {
+        let Some(bytes) = self.read_object(&self.index_key(partition))? else {
+            return Ok(None);
+        };
+        let doc: PartitionIndexDoc = serde_json::from_slice(&bytes)
+            .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?;
+        self.install_doc(partition, &doc, bytes.clone());
+        Ok(Some((doc, bytes)))
     }
 
     fn install_doc(&self, partition: &PartitionKey, doc: &PartitionIndexDoc, observed: Bytes) {
@@ -451,53 +465,63 @@ impl Sequencer for ManifestSequencer {
         if expected == new_epoch {
             return Ok(());
         }
-        let observed = {
-            let inner = self.inner.lock().expect("poisoned");
-            match inner.parts.get(partition) {
-                Some(part) => part.observed.clone(),
-                None => return Ok(()),
-            }
-        };
-        let Some(current_bytes) = observed else {
-            return Ok(());
-        };
-        let current: PartitionIndexDoc = serde_json::from_slice(&current_bytes)
-            .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?;
-        if current.epoch == new_epoch {
-            return Ok(());
-        }
-        if current.epoch != expected {
-            return Err(ObjectLogError::Sequencer(format!(
-                "partition {} epoch is {}, not {expected}",
-                partition.as_str(),
-                current.epoch
-            )));
-        }
-        let mut updated = current;
-        updated.epoch = new_epoch;
-        let new_bytes = Bytes::from(
-            serde_json::to_vec(&updated)
-                .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
-        );
-        match self.cas(
-            &self.index_key(partition),
-            Some(current_bytes),
-            new_bytes.clone(),
-        )? {
-            CasOutcome::Stored => {
-                let mut inner = self.inner.lock().expect("poisoned");
-                if let Some(part) = inner.parts.get_mut(partition) {
-                    part.epoch = new_epoch;
-                    part.observed = Some(new_bytes);
+        // Fence the durable index, not this handle's view of it: another writer
+        // may have created or advanced the index since this handle opened, and a
+        // fence that only compared cached bytes would silently store nothing.
+        self.ensure_catalog(std::slice::from_ref(partition))?;
+        for _ in 0..8 {
+            let (mut doc, observed) = match self.reload_partition(partition)? {
+                Some((current, bytes)) => {
+                    if current.epoch == new_epoch {
+                        return Ok(());
+                    }
+                    if current.epoch != expected {
+                        return Err(ObjectLogError::Sequencer(format!(
+                            "partition {} epoch is {}, not {expected}",
+                            partition.as_str(),
+                            current.epoch
+                        )));
+                    }
+                    (current, Some(bytes))
                 }
-                Ok(())
+                None => {
+                    // No index yet: create it at the new epoch, so a writer that
+                    // never saw one cannot publish under an older epoch.
+                    let inner = self.inner.lock().expect("poisoned");
+                    let part = inner.parts.get(partition);
+                    let doc = PartitionIndexDoc {
+                        epoch: new_epoch,
+                        next_offset: part.map_or(0, |part| part.next_offset),
+                        log_start: part.map_or(0, |part| part.log_start),
+                        entries: part.map(|part| part.entries.clone()).unwrap_or_default(),
+                    };
+                    (doc, None)
+                }
+            };
+            doc.epoch = new_epoch;
+            let new_bytes = Bytes::from(
+                serde_json::to_vec(&doc)
+                    .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
+            );
+            match self.cas(&self.index_key(partition), observed, new_bytes.clone())? {
+                CasOutcome::Stored => {
+                    self.install_doc(partition, &doc, new_bytes);
+                    return Ok(());
+                }
+                // A concurrent commit or fence moved the index; re-read and retry.
+                CasOutcome::Conflict { .. } => continue,
             }
-            CasOutcome::Conflict { current } => Err(ObjectLogError::Sequencer(format!(
-                "partition {} epoch fence lost the compare-and-swap ({})",
-                partition.as_str(),
-                current.is_some()
-            ))),
         }
+        Err(ObjectLogError::Sequencer(format!(
+            "partition {} epoch fence did not land",
+            partition.as_str()
+        )))
+    }
+
+    fn refresh_partition(&self, partition: &PartitionKey) -> Result<(), ObjectLogError> {
+        let _commit = self.commit_order.lock().expect("poisoned");
+        self.reload_partition(partition)?;
+        Ok(())
     }
 
     fn lookup(
@@ -685,6 +709,17 @@ mod index_tests {
         })
         .join()
         .expect("commit thread")
+    }
+
+    /// Run a blocking sequencer call off the async test thread.
+    fn on_thread<T: Send + 'static>(
+        seq: &Arc<ManifestSequencer>,
+        call: impl FnOnce(&ManifestSequencer) -> T + Send + 'static,
+    ) -> T {
+        let seq = Arc::clone(seq);
+        std::thread::spawn(move || call(&seq))
+            .join()
+            .expect("sequencer thread")
     }
 
     struct ListProbe {
@@ -877,5 +912,102 @@ mod index_tests {
             keys.iter()
                 .all(|key| key.contains("/00000000000000000003/"))
         );
+    }
+
+    #[tokio::test]
+    async fn fence_from_a_handle_that_never_saw_the_index_rejects_the_stale_writer() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let owner = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        // The standby opens before the owner's first commit, so it holds no index.
+        let standby = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        run_commit(Arc::clone(&owner), vec![("p", "obj-a", 1)]).unwrap();
+        let partition = PartitionKey("p".into());
+        let fence_partition = partition.clone();
+        on_thread(&standby, move |seq| seq.fence_epoch(&fence_partition, 1, 2)).unwrap();
+
+        let stale = run_commit(Arc::clone(&owner), vec![("p", "obj-stale", 1)]).unwrap();
+        assert!(
+            matches!(stale[0], CommitOutcome::Rejected { .. }),
+            "a commit at the fenced epoch must fail closed, got {stale:?}"
+        );
+        let fresh = run_commit(standby, vec![("p", "obj-b", 2)]).unwrap();
+        assert!(matches!(
+            fresh[0],
+            CommitOutcome::Assigned { base_offset: 1, .. }
+        ));
+        let reopened = ManifestSequencer::open(blob, "manifest/").await.unwrap();
+        let objects: Vec<_> = reopened
+            .lookup(&partition, 0)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.location.object_id)
+            .collect();
+        assert_eq!(objects, ["obj-a", "obj-b"]);
+    }
+
+    #[tokio::test]
+    async fn fence_before_any_commit_creates_the_index_at_the_new_epoch() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let stale = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        let fencer = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        on_thread(&fencer, |seq| {
+            seq.fence_epoch(&PartitionKey("p".into()), 0, 2)
+        })
+        .unwrap();
+        let lost = run_commit(stale, vec![("p", "obj-stale", 1)]).unwrap();
+        assert!(
+            matches!(lost[0], CommitOutcome::Rejected { .. }),
+            "a writer that never saw the fenced index must not commit, got {lost:?}"
+        );
+        let won = run_commit(fencer, vec![("p", "obj-b", 2)]).unwrap();
+        assert!(matches!(
+            won[0],
+            CommitOutcome::Assigned { base_offset: 0, .. }
+        ));
+        let reopened = ManifestSequencer::open(blob, "manifest/").await.unwrap();
+        assert_eq!(
+            reopened.snapshot().partitions[0].entries[0]
+                .location
+                .object_id,
+            "obj-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_partition_reveals_another_writers_commits() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let writer = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        let reader = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        run_commit(writer, vec![("p", "obj-a", 1), ("p", "obj-b", 1)]).unwrap();
+        let partition = PartitionKey("p".into());
+        assert_eq!(reader.high_watermark(&partition).unwrap(), 0);
+        let refreshed = partition.clone();
+        on_thread(&reader, move |seq| seq.refresh_partition(&refreshed)).unwrap();
+        assert_eq!(reader.high_watermark(&partition).unwrap(), 2);
+        assert_eq!(reader.lookup(&partition, 0).unwrap().len(), 2);
     }
 }

@@ -20,6 +20,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
 
+## [0.3.4] — 2026-09-24
+
+### Fixed
+
+- `ManifestSequencer::fence_epoch` fenced only the handle's cached view of a
+  partition index. A handle that had not seen the index (for example a standby
+  opened before the owner's first commit) stored nothing, so the old owner could
+  still commit after the takeover. The fence now reads the durable index, creates
+  it at the new epoch when it is missing, and retries a lost compare-and-swap.
+
+### Added
+
+- `Sequencer::refresh_partition`, implemented by `ManifestSequencer`, reloads one
+  partition's durable index so a handle sees other writers' commits since it
+  opened. The default does nothing.
+
 ## [0.3.3] — 2026-09-22
 
 ### Changed

@@ -149,9 +149,10 @@ pub trait Sequencer: Send + Sync {
     /// Move the stored fence epoch for `partition` from `expected` to `new_epoch`.
     ///
     /// The default succeeds without storing anything. [`ManifestSequencer`](crate::ManifestSequencer)
-    /// compares `expected` with the epoch in that partition's index and fails
-    /// when they differ. A missing index is not an error: the next commit records
-    /// its epoch.
+    /// reads that partition's durable index, fails when its epoch is neither
+    /// `expected` nor `new_epoch`, and otherwise stores `new_epoch`, creating the
+    /// index when it is missing. Once this returns, a writer that has not seen
+    /// the new epoch cannot commit to the partition.
     fn fence_epoch(
         &self,
         partition: &PartitionKey,
@@ -159,6 +160,16 @@ pub trait Sequencer: Send + Sync {
         new_epoch: u64,
     ) -> Result<(), ObjectLogError> {
         let _ = (partition, expected, new_epoch);
+        Ok(())
+    }
+
+    /// Reload `partition`'s index from durable storage, so this handle sees
+    /// commits made by other writers since it opened.
+    ///
+    /// The default does nothing: a sequencer with a single writer is already
+    /// current.
+    fn refresh_partition(&self, partition: &PartitionKey) -> Result<(), ObjectLogError> {
+        let _ = partition;
         Ok(())
     }
 }
