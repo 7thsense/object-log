@@ -25,6 +25,10 @@ pub enum ObjectLogError {
 
     /// The partition's fence epoch moved past the write's epoch, so the write was
     /// not committed. Retrying at the same epoch cannot succeed.
+    ///
+    /// Produced by a sequencer's [`rejection_error`](crate::Sequencer::rejection_error)
+    /// (for example [`ManifestSequencer`](crate::ManifestSequencer)); the engine
+    /// never constructs it.
     #[error(
         "partition {partition} is fenced at epoch {current}; the write at epoch {epoch} was not committed"
     )]

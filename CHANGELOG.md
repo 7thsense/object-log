@@ -20,6 +20,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
 
+## [0.3.6] — 2026-09-24
+
+### Changed
+
+- Rejection classification moves behind the `Sequencer` seam, as ADR-002
+  intends: the engine reports whatever `Sequencer::rejection_error` returns for
+  a `Rejected` batch (default: `ObjectLogError::Sequencer`), and
+  `ManifestSequencer` returns `ObjectLogError::Fenced` when the partition was
+  fenced past the batch's epoch. 0.3.5 compared epochs in the engine.
+
+### Deprecated
+
+- `Sequencer::partition_epoch`; the engine no longer reads it.
+
+### Docs
+
+- ADR-002, the PRD, CONTRACT-001 and the feature registry record the fence epoch
+  the seam has carried since 0.3.3 and keep fencing policy in the sequencer.
+
 ## [0.3.5] — 2026-09-24
 
 ### Added

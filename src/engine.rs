@@ -1356,18 +1356,12 @@ where
                         ),
                         CommitOutcome::Duplicate { base_offset } => (Some(base_offset), None),
                         CommitOutcome::Rejected { reason } => {
-                            // A partition fenced past this batch's epoch will never accept it:
-                            // report that as a definite rejection, not a generic sequencer error.
-                            let error = match sequencer.partition_epoch(&pending.partition) {
-                                Some(current) if current > pending.epoch => {
-                                    ObjectLogError::Fenced {
-                                        partition: pending.partition.as_str().to_owned(),
-                                        epoch: pending.epoch,
-                                        current,
-                                    }
-                                }
-                                _ => ObjectLogError::Sequencer(reason),
-                            };
+                            // The sequencer owns what a rejection means.
+                            let error = sequencer.rejection_error(
+                                &pending.partition,
+                                pending.epoch,
+                                reason,
+                            );
                             let _ = tx.send(Err(error));
                             continue;
                         }

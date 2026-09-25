@@ -22,7 +22,7 @@ ddx:
 | FEAT-011 | Diagnostics CLI | Operations | P2 | implemented | `object-log` bin: produce/consume/roundtrip + list/inspect/orphans |
 | FEAT-012 | Public microsite | Docs / site | P1 | implemented | Hugo+Hextra product IA; Pages deploy; Playwright screenshots + link check |
 | FEAT-009 | Kafka Types in Core | — | — | rejected | Superseded by ADR-002; was ADR-001 FEAT-001 Kafka-shaped core |
-| FEAT-010 | CAS ObjectStore / EpochGuard | — | — | rejected | Removed in 0.2.0; fencing/dedupe live in Sequencer Meta |
+| FEAT-010 | CAS ObjectStore / EpochGuard | — | — | rejected | Removed in 0.2.0; fencing/dedupe live behind the Sequencer (Meta, or the fence epoch the engine forwards since 0.3.3) |
 
 ## Dependency Notes
 

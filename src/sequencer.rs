@@ -165,12 +165,31 @@ pub trait Sequencer: Send + Sync {
 
     /// The fence epoch this handle last read for `partition`, if it tracks one.
     ///
-    /// After a [`CommitOutcome::Rejected`] batch the engine reports
-    /// [`ObjectLogError::Fenced`] when this epoch is past the batch's epoch. The
-    /// default returns `None`, which leaves rejections as sequencer errors.
+    /// The default returns `None`.
+    #[deprecated(
+        since = "0.3.6",
+        note = "the engine no longer reads fence epochs; implement `rejection_error` instead"
+    )]
     fn partition_epoch(&self, partition: &PartitionKey) -> Option<u64> {
         let _ = partition;
         None
+    }
+
+    /// The error the engine reports for a batch this sequencer answered with
+    /// [`CommitOutcome::Rejected`]. `epoch` is the fence epoch the batch was
+    /// produced at.
+    ///
+    /// Classifying a rejection is the sequencer's policy; the engine only
+    /// forwards the result. The default reports
+    /// [`ObjectLogError::Sequencer`] with the rejection reason.
+    fn rejection_error(
+        &self,
+        partition: &PartitionKey,
+        epoch: u64,
+        reason: String,
+    ) -> ObjectLogError {
+        let _ = (partition, epoch);
+        ObjectLogError::Sequencer(reason)
     }
 
     /// Reload `partition`'s index from durable storage, so this handle sees

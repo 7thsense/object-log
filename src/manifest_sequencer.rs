@@ -527,6 +527,27 @@ impl Sequencer for ManifestSequencer {
             .map(|part| part.epoch)
     }
 
+    /// A batch rejected because this partition's index was fenced past its epoch
+    /// can never commit: report [`ObjectLogError::Fenced`]. Other rejections stay
+    /// [`ObjectLogError::Sequencer`]. The index read during the rejected commit
+    /// is the one consulted.
+    fn rejection_error(
+        &self,
+        partition: &PartitionKey,
+        epoch: u64,
+        reason: String,
+    ) -> ObjectLogError {
+        #[allow(deprecated)]
+        match self.partition_epoch(partition) {
+            Some(current) if current > epoch => ObjectLogError::Fenced {
+                partition: partition.as_str().to_owned(),
+                epoch,
+                current,
+            },
+            _ => ObjectLogError::Sequencer(reason),
+        }
+    }
+
     fn refresh_partition(&self, partition: &PartitionKey) -> Result<(), ObjectLogError> {
         let _commit = self.commit_order.lock().expect("poisoned");
         self.reload_partition(partition)?;
@@ -1077,5 +1098,12 @@ mod index_tests {
             }) => assert_eq!(name, "p"),
             other => panic!("a write behind the fence must be Fenced, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn default_rejection_error_is_a_sequencer_error() {
+        let seq = crate::InMemorySequencer::new();
+        let error = seq.rejection_error(&PartitionKey("p".into()), 1, "tail moved".into());
+        assert!(matches!(error, ObjectLogError::Sequencer(reason) if reason == "tail moved"));
     }
 }
