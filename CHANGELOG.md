@@ -20,6 +20,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
 
+## [0.3.5] — 2026-09-24
+
+### Added
+
+- `ObjectLogError::Fenced { partition, epoch, current }`: a write whose
+  partition was fenced past its epoch now fails with this definite rejection
+  instead of a generic `Sequencer` error. The write was not committed.
+- `Sequencer::partition_epoch` (default `None`), implemented by
+  `ManifestSequencer`, reports the fence epoch a handle last read. The engine
+  uses it to classify rejected commits.
+
 ## [0.3.4] — 2026-09-24
 
 ### Fixed

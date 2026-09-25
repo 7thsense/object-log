@@ -518,6 +518,15 @@ impl Sequencer for ManifestSequencer {
         )))
     }
 
+    fn partition_epoch(&self, partition: &PartitionKey) -> Option<u64> {
+        let inner = self.inner.lock().expect("poisoned");
+        inner
+            .parts
+            .get(partition)
+            .filter(|part| part.observed.is_some())
+            .map(|part| part.epoch)
+    }
+
     fn refresh_partition(&self, partition: &PartitionKey) -> Result<(), ObjectLogError> {
         let _commit = self.commit_order.lock().expect("poisoned");
         self.reload_partition(partition)?;
@@ -1009,5 +1018,64 @@ mod index_tests {
         on_thread(&reader, move |seq| seq.refresh_partition(&refreshed)).unwrap();
         assert_eq!(reader.high_watermark(&partition).unwrap(), 2);
         assert_eq!(reader.lookup(&partition, 0).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fenced_writer_gets_a_typed_fenced_error() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let config = FlushConfig {
+            linger: std::time::Duration::ZERO,
+            ..FlushConfig::default()
+        };
+        let owner_sequencer = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        let standby = Arc::new(
+            ManifestSequencer::open(Arc::clone(&blob), "manifest/")
+                .await
+                .unwrap(),
+        );
+        let owner = LogEngine::new_with_writer(
+            Arc::clone(&blob),
+            owner_sequencer,
+            config,
+            "data/",
+            "writer-a",
+        );
+        let partition = PartitionKey("p".into());
+        owner
+            .produce_at_epoch(
+                partition.clone(),
+                Bytes::from_static(b"before"),
+                1,
+                (),
+                Durability::Sequenced,
+                1,
+            )
+            .await
+            .unwrap();
+        let fenced = partition.clone();
+        on_thread(&standby, move |seq| seq.fence_epoch(&fenced, 1, 2)).unwrap();
+
+        let stale = owner
+            .produce_at_epoch(
+                partition.clone(),
+                Bytes::from_static(b"stale"),
+                1,
+                (),
+                Durability::Sequenced,
+                1,
+            )
+            .await;
+        match stale {
+            Err(ObjectLogError::Fenced {
+                partition: name,
+                epoch: 1,
+                current: 2,
+            }) => assert_eq!(name, "p"),
+            other => panic!("a write behind the fence must be Fenced, got {other:?}"),
+        }
     }
 }

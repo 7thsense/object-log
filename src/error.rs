@@ -22,6 +22,20 @@ pub enum ObjectLogError {
     /// The sequencer rejected or failed to process a commit/lookup.
     #[error("sequencer error: {0}")]
     Sequencer(String),
+
+    /// The partition's fence epoch moved past the write's epoch, so the write was
+    /// not committed. Retrying at the same epoch cannot succeed.
+    #[error(
+        "partition {partition} is fenced at epoch {current}; the write at epoch {epoch} was not committed"
+    )]
+    Fenced {
+        /// Partition whose fence rejected the write.
+        partition: String,
+        /// Epoch the write was produced at.
+        epoch: u64,
+        /// Fence epoch the partition's index holds.
+        current: u64,
+    },
     /// Durable-ops budget admission failed (`BudgetMode::FailClosed` or timed out).
     #[error("durable-ops budget exceeded: {0}")]
     BudgetExceeded(String),
