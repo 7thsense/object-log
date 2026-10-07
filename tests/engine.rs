@@ -1111,7 +1111,10 @@ async fn reopen_does_not_overwrite_sealed_data_objects() {
             .unwrap();
         let all = engine.fetch(&p, 0, 1 << 20).await.unwrap();
         assert_eq!(all.len(), 2, "both generations must be readable");
-        assert_eq!(all[0].payload, payload_a, "first sealed object must not be overwritten");
+        assert_eq!(
+            all[0].payload, payload_a,
+            "first sealed object must not be overwritten"
+        );
         assert_eq!(all[1].payload, payload_b);
         // Distinct data keys under data/ (counter advanced past recovered max).
         let data_keys: Vec<_> = blob

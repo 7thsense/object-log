@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-perf
@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Start MinIO
         run: |
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Doc (deny warnings)
         run: cargo doc --no-deps
@@ -94,8 +94,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install MSRV toolchain (1.88)
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install MSRV toolchain (1.99.0)
+        uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Build on MSRV
         run: cargo build --all-targets --all-features
