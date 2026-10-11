@@ -78,6 +78,32 @@ impl BlobStore for ControlledCas {
             .and_then(|doc| doc.get("next_offset"))
             .and_then(serde_json::Value::as_i64)
             .is_some_and(|head| head > 0);
+        if self.mode.load(Ordering::SeqCst) == 9
+            && doc.as_ref().is_some_and(|doc| doc.get("epoch").is_some())
+        {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < 2 {
+                self.barrier.wait();
+            }
+        }
+        if matches!(self.mode.load(Ordering::SeqCst), 10..=12)
+            && doc.as_ref().is_some_and(|doc| doc.get("epoch").is_some())
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .compare_and_swap(key, expected, new.clone())
+                .await?;
+            self.inner.delete(key).await?;
+            return Ok(CasOutcome::Conflict {
+                current: if self.mode.load(Ordering::SeqCst) == 10 {
+                    Some(new)
+                } else if self.mode.load(Ordering::SeqCst) == 12 {
+                    Some(Bytes::from_static(b"{broken"))
+                } else {
+                    None
+                },
+            });
+        }
         if is_append {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             match self.mode.load(Ordering::SeqCst) {
@@ -541,4 +567,128 @@ fn authoritative_state_is_fresh_and_missing_or_corrupt_history_fails_closed() {
         InMemorySequencer::new().authoritative_partition_state(&key),
         Err(ObjectLogError::InvalidConfig(_))
     ));
+}
+
+#[test]
+fn native_epoch_acquisitions_are_distinct_and_return_matching_replay_bounds() {
+    let blob = ControlledCas::new();
+    let first = open(blob.clone());
+    let second = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    blob.mode.store(9, Ordering::SeqCst);
+    let a = std::thread::spawn(move || {
+        first
+            .acquire_authoritative_epoch(&PartitionKey("queue".into()))
+            .unwrap()
+    });
+    let b = std::thread::spawn(move || {
+        second
+            .acquire_authoritative_epoch(&PartitionKey("queue".into()))
+            .unwrap()
+    });
+    let mut epochs = [a.join().unwrap(), b.join().unwrap()];
+    epochs.sort_by_key(|state| state.epoch);
+    assert_eq!((epochs[0].epoch, epochs[1].epoch), (1, 2));
+    assert!(
+        epochs
+            .iter()
+            .all(|state| state.next_offset == 0 && state.log_start == 0)
+    );
+    blob.mode.store(0, Ordering::SeqCst);
+    let seq = open(blob.clone());
+    seq.commit_conditionally(&[batch("first", 2)], &[Some(0)])
+        .unwrap();
+    let acquired = seq.acquire_authoritative_epoch(&key).unwrap();
+    assert_eq!(
+        acquired,
+        object_log::AuthoritativePartitionState {
+            epoch: 3,
+            log_start: 0,
+            next_offset: 1
+        }
+    );
+    assert_eq!(seq.lookup(&key, 0).unwrap()[0].location.object_id, "first");
+    assert!(matches!(
+        seq.commit_conditionally(&[batch("stale", 2)], &[Some(1)])
+            .unwrap()[0],
+        ConditionalCommitOutcome::Committed(CommitOutcome::Rejected { .. })
+    ));
+    assert!(matches!(
+        InMemorySequencer::new().acquire_authoritative_epoch(&key),
+        Err(ObjectLogError::InvalidConfig(_))
+    ));
+}
+
+#[test]
+fn native_epoch_lost_reply_exhaustion_overflow_and_disappearance_fail_closed() {
+    let blob = ControlledCas::new();
+    let seq = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    seq.acquire_authoritative_epoch(&key).unwrap();
+    seq.commit_conditionally(&[batch("first", 1)], &[Some(0)])
+        .unwrap();
+    blob.mode.store(3, Ordering::SeqCst);
+    assert!(seq.acquire_authoritative_epoch(&key).is_err());
+    blob.mode.store(0, Ordering::SeqCst);
+    assert_eq!(seq.authoritative_partition_state(&key).unwrap().epoch, 2);
+    assert_eq!(seq.acquire_authoritative_epoch(&key).unwrap().epoch, 3);
+    blob.calls.store(0, Ordering::SeqCst);
+    blob.mode.store(4, Ordering::SeqCst);
+    assert!(matches!(
+        seq.acquire_authoritative_epoch(&key),
+        Err(ObjectLogError::StorageUnavailable(_))
+    ));
+    assert_eq!(blob.calls.load(Ordering::SeqCst), 8);
+    blob.mode.store(0, Ordering::SeqCst);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let index = runtime
+        .block_on(blob.list("meta/"))
+        .unwrap()
+        .into_iter()
+        .find(|key| key != "meta/catalog")
+        .unwrap();
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&runtime.block_on(blob.get(&index)).unwrap().unwrap()).unwrap();
+    doc["epoch"] = serde_json::json!(u64::MAX);
+    let exhausted = Bytes::from(serde_json::to_vec(&doc).unwrap());
+    runtime
+        .block_on(blob.put(&index, exhausted.clone()))
+        .unwrap();
+    assert!(seq.acquire_authoritative_epoch(&key).is_err());
+    assert_eq!(
+        runtime.block_on(blob.get(&index)).unwrap().unwrap(),
+        exhausted
+    );
+    runtime.block_on(blob.delete(&index)).unwrap();
+    assert!(seq.acquire_authoritative_epoch(&key).is_err());
+    assert!(runtime.block_on(blob.get(&index)).unwrap().is_none());
+}
+
+#[test]
+fn epoch_conflict_then_disappearance_never_recreates_unseen_index() {
+    for mode in [10, 11, 12] {
+        let blob = ControlledCas::new();
+        let seq = open(blob.clone());
+        let key = PartitionKey("queue".into());
+        blob.mode.store(mode, Ordering::SeqCst);
+        assert!(seq.acquire_authoritative_epoch(&key).is_err());
+        assert_eq!(blob.calls.load(Ordering::SeqCst), 1);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            runtime.block_on(blob.list("meta/")).unwrap(),
+            vec!["meta/catalog".to_string()]
+        );
+        assert!(seq.authoritative_partition_state(&key).is_err());
+        assert!(matches!(
+            seq.commit_conditionally(&[batch("later", 1)], &[Some(0)])
+                .unwrap()[0],
+            ConditionalCommitOutcome::Unknown(_)
+        ));
+        blob.mode.store(0, Ordering::SeqCst);
+        assert!(seq.acquire_authoritative_epoch(&key).is_err());
+        assert_eq!(
+            runtime.block_on(blob.list("meta/")).unwrap(),
+            vec!["meta/catalog".to_string()]
+        );
+    }
 }

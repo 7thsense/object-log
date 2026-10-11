@@ -253,6 +253,20 @@ pub trait Sequencer: Send + Sync {
         ObjectLogError::Sequencer(reason)
     }
 
+    /// Acquire a fresh durable writer epoch and the matching bounds from this
+    /// call's successful CAS. This grants no ongoing writer exclusivity.
+    /// An error may follow a durable epoch advance; never infer no effect.
+    /// Unsupported implementations fail without legacy fence fallback.
+    fn acquire_authoritative_epoch(
+        &self,
+        partition: &PartitionKey,
+    ) -> Result<AuthoritativePartitionState, ObjectLogError> {
+        let _ = partition;
+        Err(ObjectLogError::InvalidConfig(
+            "native epoch acquisition is unsupported".into(),
+        ))
+    }
+
     /// Read validated durable state directly; unsupported implementations fail
     /// without invoking legacy refresh or cached getters.
     fn authoritative_partition_state(

@@ -45,6 +45,7 @@ struct Part {
 }
 
 struct Inner {
+    uncertain_epochs: HashSet<PartitionKey>,
     parts: HashMap<PartitionKey, Part>,
     counter: u64,
     catalog: Option<Bytes>,
@@ -135,6 +136,7 @@ impl ManifestSequencer {
             rt: Some(rt),
             commit_order: Mutex::new(()),
             inner: Mutex::new(Inner {
+                uncertain_epochs: HashSet::new(),
                 parts,
                 counter,
                 catalog,
@@ -490,12 +492,9 @@ impl ManifestSequencer {
 
     /// Cached durable observation or legacy history forbids treating absence as new.
     fn has_known_history(&self, partition: &PartitionKey) -> bool {
-        self.inner
-            .lock()
-            .expect("poisoned")
-            .parts
-            .get(partition)
-            .is_some_and(|part| {
+        let inner = self.inner.lock().expect("poisoned");
+        inner.uncertain_epochs.contains(partition)
+            || inner.parts.get(partition).is_some_and(|part| {
                 part.observed.is_some()
                     || part.next_offset != 0
                     || part.log_start != 0
@@ -835,6 +834,85 @@ impl Sequencer for ManifestSequencer {
             },
             _ => ObjectLogError::Sequencer(reason),
         }
+    }
+
+    fn acquire_authoritative_epoch(
+        &self,
+        partition: &PartitionKey,
+    ) -> Result<AuthoritativePartitionState, ObjectLogError> {
+        let _commit = self.commit_order.lock().expect("poisoned");
+        for _ in 0..8 {
+            let (mut doc, observed) = match self.reload_partition(partition)? {
+                Some((doc, bytes)) => (doc, Some(bytes)),
+                None if self.has_known_history(partition) => {
+                    return Err(ObjectLogError::Sequencer(
+                        "previously observed epoch index vanished or requires legacy migration"
+                            .into(),
+                    ));
+                }
+                None => (
+                    PartitionIndexDoc {
+                        epoch: 0,
+                        next_offset: 0,
+                        log_start: 0,
+                        entries: Vec::new(),
+                    },
+                    None,
+                ),
+            };
+            doc.epoch = doc
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| ObjectLogError::Sequencer("writer epoch exhausted".into()))?;
+            self.ensure_catalog(std::slice::from_ref(partition))?;
+            let bytes = Bytes::from(
+                serde_json::to_vec(&doc)
+                    .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
+            );
+            match self
+                .cas(&self.index_key(partition), observed, bytes.clone())
+                .inspect_err(|_error| {
+                    self.inner
+                        .lock()
+                        .expect("poisoned")
+                        .uncertain_epochs
+                        .insert(partition.clone());
+                })? {
+                CasOutcome::Stored => {
+                    self.install_doc(partition, &doc, bytes)?;
+                    return Ok(AuthoritativePartitionState {
+                        epoch: doc.epoch,
+                        log_start: doc.log_start,
+                        next_offset: doc.next_offset,
+                    });
+                }
+                CasOutcome::Conflict {
+                    current: Some(bytes),
+                } => {
+                    self.inner
+                        .lock()
+                        .expect("poisoned")
+                        .uncertain_epochs
+                        .insert(partition.clone());
+                    let current: PartitionIndexDoc = serde_json::from_slice(&bytes)
+                        .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?;
+                    self.install_doc(partition, &current, bytes)?;
+                }
+                CasOutcome::Conflict { current: None } => {
+                    self.inner
+                        .lock()
+                        .expect("poisoned")
+                        .uncertain_epochs
+                        .insert(partition.clone());
+                    return Err(ObjectLogError::StorageUnavailable(
+                        "epoch acquisition conflicted without surviving authority".into(),
+                    ));
+                }
+            }
+        }
+        Err(ObjectLogError::StorageUnavailable(
+            "authoritative epoch CAS retry exhausted".into(),
+        ))
     }
 
     fn authoritative_partition_state(

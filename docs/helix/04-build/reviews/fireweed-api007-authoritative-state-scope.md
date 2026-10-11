@@ -18,7 +18,7 @@ ownership or a pinned read session. Consumers still need prefix validation and
 conditional publication. Full manifest residency, metadata admission and rewrite
 scaling remain qualification gates. No Fireweed factory is activated here.
 
-Validation: 83 non-provider tests, one doctest, three strict S3 HTTP tests,
+Validation: the selected non-provider regression suite, one doctest, three strict S3 HTTP tests,
 strict all-target/all-feature Clippy and formatting passed.
 
 Astra Ultra final actual-source review: APPROVE iteration 76. Corrected source,
