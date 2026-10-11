@@ -6,9 +6,24 @@ use bytes::{Bytes, BytesMut};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Result of [`BlobStore::compare_and_swap`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CasOutcome {
+    /// `new_value` is now the object's contents.
+    Stored,
+    /// The object did not match `expected`. `current` is the value observed
+    /// after the failed update (`None` if the key is absent).
+    Conflict {
+        /// Bytes present after the rejected update.
+        current: Option<Bytes>,
+    },
+}
 
 /// Durable-media accounting for the flush budget controller (TD-004).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,11 +38,55 @@ pub struct MediaOpStats {
 /// it are skipped by [`list`](BlobStore::list).
 const TMP_SUFFIX: &str = ".olog-tmp";
 
+fn diagnostic_unix_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+}
+
+fn object_class(key: &str) -> &'static str {
+    if key.starts_with("fwlog/") {
+        "segment"
+    } else if key.starts_with("fwmeta/manifest/") {
+        "manifest"
+    } else {
+        "metadata"
+    }
+}
+
+/// Physical store join id for opt-in publication traces.
+///
+/// Workload stores live at `shard-N/{log,projection.db}`. Object keys and
+/// queue ids are shared across those physical stores.
+fn diagnostic_store_tag(path: &Path) -> String {
+    let mut fallback = None;
+    for component in path.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if let Some(rest) = name.strip_prefix("shard-")
+            && !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_digit())
+        {
+            return name.into_owned();
+        }
+        if !matches!(
+            name.as_ref(),
+            "log" | "fwlog" | "fwmeta" | "manifest" | "projection.db" | "/" | "."
+        ) {
+            fallback = Some(name.into_owned());
+        }
+    }
+    fallback
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// A minimal async object store over immutable, string-keyed blobs.
 ///
 /// This is the storage *port* the log engine is built on. Implement it for your
-/// backend (e.g. S3) to store the log there. The engine writes each flushed
-/// object under a unique key, so no conditional writes are needed.
+/// backend (e.g. S3) to store the log there. Data objects are written once under
+/// a unique key. Partition index objects use
+/// [`compare_and_swap`](BlobStore::compare_and_swap).
 ///
 /// Durability: [`put`](BlobStore::put) is **durable-on-return** for crash-durable
 /// adapters ([`LocalBlobStore`], an S3 adapter) — once it resolves `Ok`, the bytes
@@ -78,6 +137,31 @@ pub trait BlobStore: Send + Sync {
 
     /// Delete an object; deleting a missing key is a no-op success.
     async fn delete(&self, key: &str) -> Result<(), ObjectLogError>;
+
+    /// Replace `key` only when its current bytes equal `expected`.
+    ///
+    /// `expected == None` succeeds only when the key is absent (create-only).
+    /// The default reads and then [`put`](BlobStore::put)s, which is not atomic
+    /// across processes. [`MemoryBlobStore`], [`LocalBlobStore`], and the S3
+    /// adapter override it with a real conditional update.
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        new_value: Bytes,
+    ) -> Result<CasOutcome, ObjectLogError> {
+        let current = self.get(key).await?;
+        let matches = match (&expected, &current) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => expected == current,
+            _ => false,
+        };
+        if !matches {
+            return Ok(CasOutcome::Conflict { current });
+        }
+        self.put(key, new_value).await?;
+        Ok(CasOutcome::Stored)
+    }
 
     /// Snapshot and reset media-op counters since the previous take.
     ///
@@ -148,6 +232,28 @@ impl BlobStore for MemoryBlobStore {
             .expect("poisoned")
             .insert(key.to_string(), value);
         Ok(())
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        new_value: Bytes,
+    ) -> Result<CasOutcome, ObjectLogError> {
+        let mut objects = self.objects.lock().expect("poisoned");
+        let current = objects.get(key).cloned();
+        let matches = match (&expected, &current) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => expected == current,
+            _ => false,
+        };
+        if !matches {
+            return Ok(CasOutcome::Conflict { current });
+        }
+        self.bytes_written
+            .fetch_add(new_value.len() as u64, Ordering::Relaxed);
+        objects.insert(key.to_string(), new_value);
+        Ok(CasOutcome::Stored)
     }
 
     async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {
@@ -227,24 +333,61 @@ impl LocalBlobStore {
 
     /// Durable publish: temp → sync_data → rename → dir fsync. No full pre-merge
     /// of `chunks` (streams them to the temp file).
-    fn durable_publish_chunks(path: PathBuf, chunks: Vec<Bytes>) -> std::io::Result<u64> {
+    fn durable_publish_chunks(
+        path: PathBuf,
+        chunks: Vec<Bytes>,
+        key: &str,
+    ) -> std::io::Result<u64> {
+        // Opt-in diagnostic only: preserve the exact publication operations and
+        // ordering. No paths or payloads are emitted. Failed puts remain errors;
+        // phase records below describe successful publications only.
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        let trace =
+            *TRACE.get_or_init(|| std::env::var_os("OBJECT_LOG_LOCAL_PUBLISH_TRACE").is_some());
+        let started = trace.then(Instant::now);
+        let started_unix_us = trace.then(diagnostic_unix_us);
+        let mut phase = started;
+        let mut elapsed = || {
+            phase.map_or(0, |before| {
+                let now = Instant::now();
+                phase = Some(now);
+                now.duration_since(before).as_micros()
+            })
+        };
         let parent = path.parent().expect("object path has a parent");
         std::fs::create_dir_all(parent)?;
+        let mkdir_us = elapsed();
         let mut tmp = path.clone().into_os_string();
         tmp.push(TMP_SUFFIX);
         let tmp = PathBuf::from(tmp);
         let mut byte_len = 0u64;
+        let (create_us, write_us, data_sync_us);
         {
             let mut f = std::fs::File::create(&tmp)?;
+            create_us = elapsed();
             for chunk in &chunks {
                 f.write_all(chunk)?;
                 byte_len += chunk.len() as u64;
             }
+            write_us = elapsed();
             // fdatasync on Unix: data durable; dir fsync below covers the name.
             f.sync_data()?;
+            data_sync_us = elapsed();
         }
         std::fs::rename(&tmp, &path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        let rename_us = elapsed(); // Includes closing the data file.
+        let directory = std::fs::File::open(parent)?;
+        let dir_open_us = elapsed();
+        directory.sync_all()?;
+        let dir_sync_us = elapsed();
+        if let (Some(started), Some(started_unix_us)) = (started, started_unix_us) {
+            eprintln!(
+                "local_publish bytes={byte_len} mkdir_us={mkdir_us} create_us={create_us} write_us={write_us} data_sync_us={data_sync_us} rename_us={rename_us} dir_open_us={dir_open_us} dir_sync_us={dir_sync_us} total_us={} class={} store={} started_unix_us={started_unix_us}",
+                started.elapsed().as_micros(),
+                object_class(key),
+                diagnostic_store_tag(&path),
+            );
+        }
         Ok(byte_len)
     }
 
@@ -258,9 +401,10 @@ impl LocalBlobStore {
         &self,
         path: PathBuf,
         chunks: Vec<Bytes>,
+        key: String,
     ) -> Result<u64, ObjectLogError> {
         let run = move || {
-            Self::durable_publish_chunks(path, chunks)
+            Self::durable_publish_chunks(path, chunks, &key)
                 .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))
         };
         match tokio::runtime::Handle::try_current() {
@@ -281,7 +425,9 @@ impl LocalBlobStore {
 impl BlobStore for LocalBlobStore {
     async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
         let path = self.path_for(key)?;
-        let byte_len = self.publish_async(path, vec![value]).await?;
+        let byte_len = self
+            .publish_async(path, vec![value], key.to_string())
+            .await?;
         self.record_put(byte_len);
         Ok(())
     }
@@ -292,7 +438,7 @@ impl BlobStore for LocalBlobStore {
             1 => self.put(key, chunks.into_iter().next().unwrap()).await,
             _ => {
                 let path = self.path_for(key)?;
-                let byte_len = self.publish_async(path, chunks).await?;
+                let byte_len = self.publish_async(path, chunks, key.to_string()).await?;
                 self.record_put(byte_len);
                 Ok(())
             }
@@ -368,12 +514,96 @@ impl BlobStore for LocalBlobStore {
         }
     }
 
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        new_value: Bytes,
+    ) -> Result<CasOutcome, ObjectLogError> {
+        let path = self.path_for(key)?;
+        let key = key.to_string();
+        let byte_len = new_value.len() as u64;
+        let outcome = tokio::task::spawn_blocking(move || {
+            local_compare_and_swap(&path, &key, expected, new_value)
+        })
+        .await
+        .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))??;
+        if matches!(outcome, CasOutcome::Stored) {
+            self.record_put(byte_len);
+        }
+        Ok(outcome)
+    }
+
     fn take_media_op_stats(&self) -> Option<MediaOpStats> {
         Some(MediaOpStats {
             media_ops: self.media_ops.swap(0, Ordering::Relaxed),
             bytes: self.bytes_written.swap(0, Ordering::Relaxed),
         })
     }
+}
+
+fn local_compare_and_swap(
+    path: &Path,
+    key: &str,
+    expected: Option<Bytes>,
+    new_value: Bytes,
+) -> Result<CasOutcome, ObjectLogError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".caslock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_name)?;
+    flock_exclusive(&lock)?;
+    let current = match std::fs::read(path) {
+        Ok(bytes) => Some(Bytes::from(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            let _ = flock_unlock(&lock);
+            return Err(error.into());
+        }
+    };
+    let matches = match (&expected, &current) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => expected == current,
+        _ => false,
+    };
+    if !matches {
+        let _ = flock_unlock(&lock);
+        return Ok(CasOutcome::Conflict { current });
+    }
+    let published =
+        LocalBlobStore::durable_publish_chunks(path.to_path_buf(), vec![new_value], key);
+    let _ = flock_unlock(&lock);
+    published?;
+    Ok(CasOutcome::Stored)
+}
+
+fn flock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    let rc = unsafe { flock(file.as_raw_fd(), 2) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn flock_unlock(file: &std::fs::File) -> std::io::Result<()> {
+    let rc = unsafe { flock(file.as_raw_fd(), 8) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
@@ -386,10 +616,33 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Res
         if path.is_dir() {
             collect_files(root, &path, out)?;
         } else if !path.to_string_lossy().ends_with(TMP_SUFFIX)
+            && !path.to_string_lossy().ends_with(".caslock")
             && let Ok(rel) = path.strip_prefix(root)
         {
             out.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_store_tag_prefers_workload_shard_directory() {
+        assert_eq!(
+            diagnostic_store_tag(Path::new(
+                "/tmp/run/shard-12/log/fwlog/00000000000000000001"
+            )),
+            "shard-12"
+        );
+        assert_eq!(
+            diagnostic_store_tag(Path::new("/data/shard-0/projection.db")),
+            "shard-0"
+        );
+        assert_eq!(object_class("fwlog/1"), "segment");
+        assert_eq!(object_class("fwmeta/manifest/1"), "manifest");
+        assert_eq!(object_class("fwmeta/high-water/1"), "metadata");
+    }
 }

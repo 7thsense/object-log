@@ -39,6 +39,7 @@ This contract defines object-log’s normative **engine and sequencer** surface.
 | `FetchedBatch` | `{ base_offset, record_count, payload }` | yes | Payload bytes MUST match what was produced | |
 | `FlushConfig` | linger, max_bytes, max_batches, max_inflight_flushes, max_buffered_bytes, budget | yes | linger is packing control; max_bytes is high safety ceiling | See TD-004 |
 | `LogEngine::produce` | async | yes | Enqueues batch; resolves at requested durability | Empty batch → `InvalidBatch` |
+| `LogEngine::produce_at_epoch` | async | yes | As `produce`, carrying an opaque fence epoch to `CommitBatch::epoch` | Engine never compares epochs |
 | `LogEngine::flush` | async | yes | Barrier for all work enqueued at or before the call | |
 | `LogEngine::fetch` | async | yes | lookup → get_range slices → ordered batches | Size-bounded by max_bytes |
 | `LogEngine::fetch_stream` | async visitor | yes (P2) | Same order as fetch; no full `Vec` materialization | Bounded-RAM replay |
@@ -47,14 +48,18 @@ This contract defines object-log’s normative **engine and sequencer** surface.
 | `live_object_ids` (default sequencers) | sync | yes for shipped sequencers | Set of object ids in the index | Feeds reaper |
 | `Sequencer::Meta` | associated type | yes | Engine forwards uninterpreted; `Send + Sync` | Default sequencers use `()` |
 | `BatchLocation` | `{ object_id, byte_start, byte_len }` | yes | **Authored by engine** after layout | Sequencer stores in index |
-| `CommitBatch` | `{ partition, record_count, location, meta }` | yes | Engine fills all but interprets only partition/count/location | |
+| `CommitBatch` | `{ partition, record_count, location, meta, epoch }` | yes | Engine fills all but interprets only partition/count/location | `epoch` is forwarded for the sequencer's fencing policy |
 | `CommitOutcome::Assigned` | `{ base_offset, record_count }` | yes | Fresh contiguous range | |
 | `CommitOutcome::Duplicate` | `{ base_offset }` | yes | Idempotent retry recognized by sequencer | Visibility unchanged |
+| `CommitOutcome::Rejected` | `{ reason }` | yes | Batch not indexed; others in the call may be | Engine reports `Sequencer::rejection_error` |
 | `Sequencer::commit` | sync | yes | Atomic across entire slice; one outcome per batch in order; `Err` commits nothing | Lin-point |
 | `Sequencer::lookup` | sync | yes | Entries covering `fetch_offset` onward | |
 | `Sequencer::high_watermark` | sync | yes | Next offset to assign (index-only) | |
 | `Sequencer::log_start_offset` | sync | yes | First readable offset | Advances on truncate |
 | `Sequencer::truncate_before` | sync | yes | Drop entries below offset; return object ids with **no** live refs from **any** partition | Mechanism, not policy |
+| `Sequencer::fence_epoch` | sync | no (default no-op) | Once it returns, no batch below `new_epoch` commits to the partition | `ManifestSequencer` fences the durable index |
+| `Sequencer::refresh_partition` | sync | no (default no-op) | Reload the partition's durable index to see other writers' commits | For multi-writer sequencers |
+| `Sequencer::rejection_error` | sync | no (default `Sequencer(reason)`) | Map a `Rejected` batch to the error the engine reports | Rejection policy is the sequencer's |
 
 ### Engine invariants (normative)
 
@@ -80,6 +85,7 @@ This contract defines object-log’s normative **engine and sequencer** surface.
 | Range bounds on get_range | `RangeOutOfBounds` | no | Fix range or object length assumption |
 | Missing object at fetch | `MissingObject` | no | Repair storage or index |
 | Sequencer commit/lookup failure | `Sequencer` | depends | Refresh consumer state; retry with same Meta if idempotent |
+| Batch behind a moved fence (from a sequencer's `rejection_error`) | `Fenced` | no | Not committed; stop writing at that epoch |
 | Budget admission failure | `BudgetExceeded` | yes later | Back off or raise budget / change mode |
 | Commit `Duplicate` | success with original offset | yes | Treat as prior success |
 

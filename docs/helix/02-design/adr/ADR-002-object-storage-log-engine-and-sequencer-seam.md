@@ -139,7 +139,7 @@ pub trait Sequencer: Send + Sync {
 }
 ```
 
-`BatchLocation`, `CommitOutcome { Assigned { base_offset, record_count } | Duplicate { base_offset } }`, `IndexEntry { location, base_offset, record_count }`, and `PartitionKey` are **generic** and live in object-log. **`Meta` is an associated type — Kafka's `producer_id`/`producer_epoch`/`base_sequence` live only in fjord's `Meta`, never in object-log.**
+`BatchLocation`, `CommitOutcome { Assigned { base_offset, record_count } | Duplicate { base_offset } | Rejected { reason } }` (Rejected since 0.3.3), `IndexEntry { location, base_offset, record_count }`, and `PartitionKey` are **generic** and live in object-log. **`Meta` is an associated type — Kafka's `producer_id`/`producer_epoch`/`base_sequence` live only in fjord's `Meta`, never in object-log.**
 
 **5. Sync seam, async engine.** The `Sequencer` is sync because a linearization point is a critical section, not async I/O — and fjord's sequencer does blocking Postgres I/O. The engine owns the flush worker (a dedicated thread / blocking task, per fjord's proven `Flusher`) and resolves async produce futures via waker. No `async_trait`/`spawn_blocking` tax on the lin-point.
 
@@ -164,6 +164,27 @@ A full in-object-log **n-tier** (hot + cold + migration) model was formally prop
 niflheim's WAL was evaluated as a second consumer to test genericity (object-log's own vision names it). Result: **its cold tier maps ~1:1 onto this design** — immutable, checksummed, offset-indexed segments coalesced onto an object store — which validates that the design is genuinely generic and not fjord-shaped. Three of our decisions are confirmed by the exercise: payloads are **opaque** (niflheim serializes its tenant/offset/event-id structure into the payload; object-log never learns those fields), epoch fencing lives **behind the Sequencer** (not in core), and record framing is **not** a core concern. The dual-consumer requirement is exactly what motivated the generic primitives above — `truncate_before` (Kafka retention *and* WAL retirement), index-only offset bounds, and the optional streaming read — none of which leak Kafka or WAL concepts. Two niflheim concerns are correctly **excluded**: its hot/fsync tier (above) and its record codec (a niflheim-side concern over opaque payloads).
 
 niflheim's **chunk tracking** (`chunk_seq`, offset bounds, `cold_durable`/`backing_store_flushed` state) and **durable-commit** (epoch-leased "publish only after durable") live in its control plane + segment index — *above* the storage port — so they are unaffected by swapping the cold backend to object-log; niflheim keeps them. They depend on object-log only via the generic `BlobStore` guarantees folded into the port above: **durable-on-return `put`** (mark `cold_durable` once the PUT resolves), **large-object/multipart `put`** (100 MiB+ coalesced segments are not a single whole-buffer PUT), and **`get_range`** (load one chunk from a coalesced cold object by byte range), with `list` paginating internally for the boot-recovery scan. Everything else in niflheim's richer cold port is **adapter-local** over those primitives — `FileRef` = a key plus the written length; the SHA-256 sidecar = a second object; `state`/`sync_to_cold`/`stage_to_hot`/`prefetch_hint`/`refresh` = trivial cold-only bookkeeping (verified: no HEAD, no CopyObject in niflheim's cold path). So the thin-adapter claim holds: object-log is the cold blob backend, niflheim owns everything above it.
+
+## Amendment: the fence epoch in the seam (0.3.3–0.3.6)
+
+Fireweed runs several processes against one shared log, each owning a queue for a lease epoch. To keep a
+superseded owner from committing, 0.3.3 added a generic **fence epoch** to the seam:
+`LogEngine::produce_at_epoch`, `CommitBatch::epoch`, `Sequencer::fence_epoch`, and
+`CommitOutcome::Rejected`. `ManifestSequencer` stores the epoch in each partition's compare-and-swap index
+and rejects batches below it.
+
+The epoch is an opaque, monotonic ownership token, not Kafka's producer epoch. Producer identity,
+idempotency and exactly-once fencing still live in fjord's `Meta`. This knowingly bends the Validation gate
+below ("zero … epoch identifiers"): carrying the token in `Meta` would force every sequencer's `Meta` to model
+ownership, while `ManifestSequencer` uses `()`.
+
+The layering rule still holds: **the engine carries the epoch and never interprets it; fencing policy lives
+in the sequencer.**
+- 0.3.4 makes `ManifestSequencer::fence_epoch` fence the durable index instead of the handle's cached copy,
+  and adds `Sequencer::refresh_partition` so a handle can see other writers' commits.
+- 0.3.6 adds `Sequencer::rejection_error`, which classifies a `Rejected` batch; `ManifestSequencer` returns
+  `ObjectLogError::Fenced` when the partition was fenced past the batch's epoch. 0.3.5 briefly made that
+  comparison in the engine; 0.3.6 moves it behind the seam and deprecates `Sequencer::partition_epoch`.
 
 ## Alternatives
 

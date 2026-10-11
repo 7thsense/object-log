@@ -39,18 +39,21 @@ fn suite_unit_meta(seq: &impl Sequencer<Meta = ()>) {
             record_count: 2,
             location: loc("obj-a", 0, 10),
             meta: &meta,
+            epoch: 0,
         },
         CommitBatch {
             partition: p1.clone(),
             record_count: 1,
             location: loc("obj-a", 10, 5),
             meta: &meta,
+            epoch: 0,
         },
         CommitBatch {
             partition: p0.clone(),
             record_count: 3,
             location: loc("obj-a", 15, 7),
             meta: &meta,
+            epoch: 0,
         },
     ];
     let outcomes = seq.commit(&batches).unwrap();
@@ -96,6 +99,7 @@ fn suite_unit_meta(seq: &impl Sequencer<Meta = ()>) {
         record_count: 1,
         location: loc("obj-b", 0, 4),
         meta: &meta,
+        epoch: 0,
     }];
     let r = seq.commit(&more).unwrap();
     assert_eq!(
@@ -183,6 +187,7 @@ fn sequencer_err_commits_nothing_template() {
         record_count: 1,
         location: loc("o", 0, 1),
         meta: &meta,
+        epoch: 0,
     }]);
     assert!(r.is_err());
     assert_eq!(seq.high_watermark(&pk("x")).unwrap(), 0);

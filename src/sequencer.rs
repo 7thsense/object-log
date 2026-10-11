@@ -45,6 +45,10 @@ pub struct CommitBatch<'a, M> {
     /// Sequencer-private metadata (e.g. idempotent-producer identity). Opaque to
     /// the engine.
     pub meta: &'a M,
+    /// Fence epoch the caller believes owns this partition. [`ManifestSequencer`](crate::ManifestSequencer)
+    /// rejects the batch when the stored index epoch differs. Other sequencers
+    /// ignore it.
+    pub epoch: u64,
 }
 
 /// Per-batch result of [`Sequencer::commit`].
@@ -62,6 +66,13 @@ pub enum CommitOutcome {
     Duplicate {
         /// The originally assigned first offset.
         base_offset: i64,
+    },
+    /// This batch was not indexed. Other batches in the same call may already
+    /// be durable. The caller must rewrite this batch in a new data object
+    /// rather than reuse the offsets it expected.
+    Rejected {
+        /// Why the conditional update did not land.
+        reason: String,
     },
 }
 
@@ -84,7 +95,7 @@ pub struct IndexEntry {
 /// task), so a blocking implementation (a `Mutex`, a SQL transaction) is fine.
 ///
 /// Contract: [`commit`](Sequencer::commit) is **atomic across the whole slice**
-/// (all batches in one object commit together or not at all), and the engine
+/// (all supplied batches commit together or not at all), and the engine
 /// presents batches for any single [`PartitionKey`] in arrival order and never
 /// splits one partition across concurrent `commit` calls.
 pub trait Sequencer: Send + Sync {
@@ -93,9 +104,21 @@ pub trait Sequencer: Send + Sync {
     /// its producer-identity fields.
     type Meta: Send + Sync;
 
-    /// Assign offsets to a just-PUT object's batches and persist the index.
-    /// Returns one [`CommitOutcome`] per input batch, in order. Atomic: on `Err`,
-    /// nothing is committed.
+    /// Opt in to atomic commits containing already-durable batches from several
+    /// data objects, in creation order. Default preserves one-object calls for
+    /// custom sequencers that rely on that boundary.
+    fn supports_multi_object_commit(&self) -> bool {
+        false
+    }
+
+    /// Assign offsets to durably uploaded batches and persist the index.
+    /// By default these belong to one object; an opted-in implementation may
+    /// receive several objects in one ordered call.
+    /// Returns one [`CommitOutcome`] per input batch, in order.
+    ///
+    /// On `Err`, nothing from this call was indexed. A [`CommitOutcome::Rejected`]
+    /// batch was not indexed either; earlier batches in the same call may already
+    /// be durable when the sequencer commits one partition at a time.
     fn commit(
         &self,
         batches: &[CommitBatch<'_, Self::Meta>],
@@ -122,6 +145,62 @@ pub trait Sequencer: Send + Sync {
         partition: &PartitionKey,
         offset: i64,
     ) -> Result<Vec<String>, ObjectLogError>;
+
+    /// Move the stored fence epoch for `partition` from `expected` to `new_epoch`.
+    ///
+    /// The default succeeds without storing anything. [`ManifestSequencer`](crate::ManifestSequencer)
+    /// reads that partition's durable index, fails when its epoch is neither
+    /// `expected` nor `new_epoch`, and otherwise stores `new_epoch`, creating the
+    /// index when it is missing. Once this returns, a writer that has not seen
+    /// the new epoch cannot commit to the partition.
+    fn fence_epoch(
+        &self,
+        partition: &PartitionKey,
+        expected: u64,
+        new_epoch: u64,
+    ) -> Result<(), ObjectLogError> {
+        let _ = (partition, expected, new_epoch);
+        Ok(())
+    }
+
+    /// The fence epoch this handle last read for `partition`, if it tracks one.
+    ///
+    /// The default returns `None`.
+    #[deprecated(
+        since = "0.3.6",
+        note = "the engine no longer reads fence epochs; implement `rejection_error` instead"
+    )]
+    fn partition_epoch(&self, partition: &PartitionKey) -> Option<u64> {
+        let _ = partition;
+        None
+    }
+
+    /// The error the engine reports for a batch this sequencer answered with
+    /// [`CommitOutcome::Rejected`]. `epoch` is the fence epoch the batch was
+    /// produced at.
+    ///
+    /// Classifying a rejection is the sequencer's policy; the engine only
+    /// forwards the result. The default reports
+    /// [`ObjectLogError::Sequencer`] with the rejection reason.
+    fn rejection_error(
+        &self,
+        partition: &PartitionKey,
+        epoch: u64,
+        reason: String,
+    ) -> ObjectLogError {
+        let _ = (partition, epoch);
+        ObjectLogError::Sequencer(reason)
+    }
+
+    /// Reload `partition`'s index from durable storage, so this handle sees
+    /// commits made by other writers since it opened.
+    ///
+    /// The default does nothing: a sequencer with a single writer is already
+    /// current.
+    fn refresh_partition(&self, partition: &PartitionKey) -> Result<(), ObjectLogError> {
+        let _ = partition;
+        Ok(())
+    }
 }
 
 /// Per-partition in-memory index state.
@@ -164,6 +243,10 @@ impl InMemorySequencer {
 
 impl Sequencer for InMemorySequencer {
     type Meta = ();
+
+    fn supports_multi_object_commit(&self) -> bool {
+        true
+    }
 
     fn commit(
         &self,

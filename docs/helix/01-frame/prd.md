@@ -18,7 +18,7 @@ object-log is a Rust embeddable **buffered, multiplexing append log** over plugg
 - a pluggable sync `Sequencer` seam that owns offset assignment and the offset→location index (`InMemorySequencer`, `ManifestSequencer`, or consumer-supplied);
 - retention **mechanism** via `truncate_before` (policy stays with the consumer).
 
-The library **does not** implement Kafka wire protocol, record framing, producer identity, epoch fencing, or broker coordination. Consumers (e.g. fjord/heimq, Niflheim cold tier, pqueue projections) map their semantics onto partition keys, opaque bytes, durability levels, and `Sequencer::Meta`.
+The library **does not** implement Kafka wire protocol, record framing, producer identity, ownership or leader election, or broker coordination. The engine carries an opaque fence epoch to the `Sequencer` without interpreting it; fencing policy belongs to the sequencer (ADR-002 amendment). Consumers (e.g. fjord/heimq, Niflheim cold tier, pqueue projections) map their semantics onto partition keys, opaque bytes, durability levels, and `Sequencer::Meta`.
 
 This PRD supersedes the ADR-001-era Kafka-shaped core requirements. Governing architecture: **ADR-002**.
 
@@ -51,7 +51,7 @@ Brokers and ingestion systems need amortized durable appends on object storage. 
 
 - Kafka wire protocol, consumer groups, transactions, broker metadata, ACLs, quotas.
 - Kafka record batch codec or offset stamping inside payload bytes (heimq/consumer concern).
-- Epoch fencing, leader election, or cluster consensus inside object-log.
+- Leader election, ownership decisions, or cluster consensus inside object-log. Fencing policy lives in the `Sequencer`; `ManifestSequencer` enforces a per-partition fence epoch on its index.
 - Product-specific pqueue command envelopes or Niflheim row/WAL codecs.
 - Local hot-tier fsync latency tiers (consumers that need sub-PUT local durability front their own buffer).
 - Automatic background orphan reaping while writers are active (manual quiescent `reap_orphans` is in scope).

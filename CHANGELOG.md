@@ -20,6 +20,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
 
+## [0.3.6] — 2026-09-24
+
+### Changed
+
+- Rejection classification moves behind the `Sequencer` seam, as ADR-002
+  intends: the engine reports whatever `Sequencer::rejection_error` returns for
+  a `Rejected` batch (default: `ObjectLogError::Sequencer`), and
+  `ManifestSequencer` returns `ObjectLogError::Fenced` when the partition was
+  fenced past the batch's epoch. 0.3.5 compared epochs in the engine.
+
+### Deprecated
+
+- `Sequencer::partition_epoch`; the engine no longer reads it.
+
+### Docs
+
+- ADR-002, the PRD, CONTRACT-001 and the feature registry record the fence epoch
+  the seam has carried since 0.3.3 and keep fencing policy in the sequencer.
+
+## [0.3.5] — 2026-09-24
+
+### Added
+
+- `ObjectLogError::Fenced { partition, epoch, current }`: a write whose
+  partition was fenced past its epoch now fails with this definite rejection
+  instead of a generic `Sequencer` error. The write was not committed.
+- `Sequencer::partition_epoch` (default `None`), implemented by
+  `ManifestSequencer`, reports the fence epoch a handle last read. The engine
+  uses it to classify rejected commits.
+
+## [0.3.4] — 2026-09-24
+
+### Fixed
+
+- `ManifestSequencer::fence_epoch` fenced only the handle's cached view of a
+  partition index. A handle that had not seen the index (for example a standby
+  opened before the owner's first commit) stored nothing, so the old owner could
+  still commit after the takeover. The fence now reads the durable index, creates
+  it at the new epoch when it is missing, and retries a lost compare-and-swap.
+
+### Added
+
+- `Sequencer::refresh_partition`, implemented by `ManifestSequencer`, reloads one
+  partition's durable index so a handle sees other writers' commits since it
+  opened. The default does nothing.
+
+## [0.3.3] — 2026-09-22
+
+### Changed
+
+- `ManifestSequencer` stores one conditional index object per partition instead
+  of an append-only manifest per seal. Open reads that catalog by key and does
+  not list the manifest prefix once an index exists. A seal that loses a
+  partition's compare-and-swap fails that partition closed; it does not skip
+  an offset. Data objects created with `LogEngine::new_with_writer` include
+  the writer id and fence epoch in the key.
+
 ## [0.3.1] — 2026-08-01
 
 ### Fixed
