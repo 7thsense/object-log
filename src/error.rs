@@ -40,6 +40,14 @@ pub enum ObjectLogError {
         /// Fence epoch the partition's index holds.
         current: u64,
     },
+    /// A conditional batch was definitely not indexed at its expected log head.
+    #[error("conditional log head moved from {expected} to {current}")]
+    HeadRejected {
+        /// Original required next offset.
+        expected: i64,
+        /// Authoritative next offset that did not match.
+        current: i64,
+    },
     /// Durable-ops budget admission failed (`BudgetMode::FailClosed` or timed out).
     #[error("durable-ops budget exceeded: {0}")]
     BudgetExceeded(String),

@@ -7,8 +7,8 @@
 //! manifest objects in order.
 
 use crate::{
-    BlobStore, CasOutcome, CommitBatch, CommitOutcome, IndexEntry, ObjectLogError, PartitionKey,
-    Sequencer,
+    BlobStore, CasOutcome, CommitBatch, CommitOutcome, ConditionalCommitOutcome, IndexEntry,
+    ObjectLogError, PartitionKey, Sequencer,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -315,6 +315,185 @@ impl ManifestSequencer {
         }
     }
 
+    fn publish_partition_conditionally(
+        &self,
+        partition: &PartitionKey,
+        batches: &[CommitBatch<'_, ()>],
+        indexes: &[usize],
+        heads: &[Option<i64>],
+    ) -> Result<Vec<ConditionalCommitOutcome>, ObjectLogError> {
+        for _ in 0..8 {
+            let (mut doc, observed) = match self.reload_partition(partition)? {
+                Some((doc, bytes)) => (doc, Some(bytes)),
+                None => {
+                    let inner = self.inner.lock().expect("poisoned");
+                    if inner.parts.get(partition).is_some_and(|part| {
+                        part.observed.is_some()
+                            || part.next_offset != 0
+                            || part.log_start != 0
+                            || !part.entries.is_empty()
+                    }) {
+                        return Err(ObjectLogError::Sequencer("previously observed conditional index vanished or requires legacy migration".into()));
+                    }
+                    (
+                        PartitionIndexDoc {
+                            epoch: batches[indexes[0]].epoch,
+                            next_offset: 0,
+                            log_start: 0,
+                            entries: Vec::new(),
+                        },
+                        None,
+                    )
+                }
+            };
+            let mut outcomes = Vec::with_capacity(indexes.len());
+            let mut planned = Vec::with_capacity(indexes.len());
+            for index in indexes {
+                let batch = &batches[*index];
+                let mut matching = doc
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.location == batch.location);
+                if let Some(entry) = matching.next() {
+                    if matching.next().is_some()
+                        || entry.record_count != batch.record_count
+                        || heads[*index].is_some_and(|head| head != entry.base_offset)
+                    {
+                        return Err(ObjectLogError::Sequencer(
+                            "conditional location identity mismatch".into(),
+                        ));
+                    }
+                    outcomes.push(ConditionalCommitOutcome::Committed(
+                        CommitOutcome::Duplicate {
+                            base_offset: entry.base_offset,
+                        },
+                    ));
+                    continue;
+                }
+                if heads[*index].is_some_and(|head| head < doc.log_start) {
+                    return Err(ObjectLogError::Sequencer(
+                        "conditional expected range is no longer inspectable".into(),
+                    ));
+                }
+                if doc.epoch != batch.epoch {
+                    outcomes.push(ConditionalCommitOutcome::Committed(
+                        CommitOutcome::Rejected {
+                            reason: format!(
+                                "partition {} epoch is {}, not {}",
+                                partition.as_str(),
+                                doc.epoch,
+                                batch.epoch
+                            ),
+                        },
+                    ));
+                    continue;
+                }
+                if let Some(expected) = heads[*index]
+                    && expected != doc.next_offset
+                {
+                    outcomes.push(ConditionalCommitOutcome::HeadRejected {
+                        expected,
+                        current: doc.next_offset,
+                    });
+                    continue;
+                }
+                let entry = IndexEntry {
+                    location: batch.location.clone(),
+                    base_offset: doc.next_offset,
+                    record_count: batch.record_count,
+                };
+                doc.next_offset = doc
+                    .next_offset
+                    .checked_add(i64::from(batch.record_count))
+                    .ok_or_else(|| {
+                        ObjectLogError::Sequencer("conditional offset overflow".into())
+                    })?;
+                outcomes.push(ConditionalCommitOutcome::Committed(
+                    CommitOutcome::Assigned {
+                        base_offset: entry.base_offset,
+                        record_count: entry.record_count,
+                    },
+                ));
+                planned.push(entry.clone());
+                doc.entries.push(entry);
+            }
+            if planned.is_empty() {
+                return Ok(outcomes);
+            }
+            crate::bounded_lookup::validate_index(&doc.entries, doc.log_start, doc.next_offset)?;
+            let bytes = Bytes::from(
+                serde_json::to_vec(&doc)
+                    .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
+            );
+            match self.cas(&self.index_key(partition), observed.clone(), bytes.clone())? {
+                CasOutcome::Stored => {
+                    self.install_doc(partition, &doc, bytes)?;
+                    return Ok(outcomes);
+                }
+                CasOutcome::Conflict { current } => {
+                    let (found, current) = match current {
+                        Some(bytes) => {
+                            let found: PartitionIndexDoc = serde_json::from_slice(&bytes)
+                                .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?;
+                            self.install_doc(partition, &found, bytes.clone())?;
+                            (found, bytes)
+                        }
+                        None => self.reload_partition(partition)?.ok_or_else(|| {
+                            ObjectLogError::Sequencer(
+                                "conditional conflict lost durable index".into(),
+                            )
+                        })?,
+                    };
+                    let _ = current;
+                    let present = planned
+                        .iter()
+                        .filter(|entry| found.entries.iter().any(|have| have == *entry))
+                        .count();
+                    if present == planned.len() {
+                        // Also prove that rows rejected in this attempt were not
+                        // independently indexed under the same physical location.
+                        for (index, outcome) in indexes.iter().zip(&outcomes) {
+                            if matches!(
+                                outcome,
+                                ConditionalCommitOutcome::HeadRejected { .. }
+                                    | ConditionalCommitOutcome::Committed(
+                                        CommitOutcome::Rejected { .. }
+                                    )
+                            ) && found
+                                .entries
+                                .iter()
+                                .any(|entry| entry.location == batches[*index].location)
+                            {
+                                return Err(ObjectLogError::Sequencer(
+                                    "rejected conditional location already indexed".into(),
+                                ));
+                            }
+                        }
+                        return Ok(outcomes);
+                    }
+                    if planned.iter().any(|entry| {
+                        entry.base_offset < found.log_start
+                            && !found.entries.iter().any(|have| have == entry)
+                    }) {
+                        return Err(ObjectLogError::Sequencer(
+                            "conditional planned range is no longer inspectable".into(),
+                        ));
+                    }
+                    if present != 0 {
+                        return Err(ObjectLogError::Sequencer(
+                            "partial conditional publication reconciliation".into(),
+                        ));
+                    }
+                    // Re-read and re-evaluate original conditions, never a new
+                    // expected head inferred from this conflicting snapshot.
+                }
+            }
+        }
+        Err(ObjectLogError::StorageUnavailable(
+            "conditional index CAS retry exhausted".into(),
+        ))
+    }
+
     /// Install `partition`'s durable index, if any, and return it.
     fn reload_partition(
         &self,
@@ -417,6 +596,82 @@ impl Sequencer for ManifestSequencer {
 
     fn supports_multi_object_commit(&self) -> bool {
         true
+    }
+
+    fn supports_conditional_commit(&self) -> bool {
+        true
+    }
+
+    fn commit_conditionally(
+        &self,
+        batches: &[CommitBatch<'_, ()>],
+        expected_heads: &[Option<i64>],
+    ) -> Result<Vec<ConditionalCommitOutcome>, ObjectLogError> {
+        if batches.len() != expected_heads.len()
+            || expected_heads.iter().flatten().any(|head| *head < 0)
+            || batches
+                .iter()
+                .any(|batch| batch.record_count <= 0 || batch.location.object_id.is_empty())
+        {
+            return Err(ObjectLogError::InvalidBatch(
+                "invalid conditional commit inputs".into(),
+            ));
+        }
+        if expected_heads.iter().all(Option::is_none) {
+            return self.commit(batches).map(|outcomes| {
+                outcomes
+                    .into_iter()
+                    .map(ConditionalCommitOutcome::Committed)
+                    .collect()
+            });
+        }
+        let _commit = self.commit_order.lock().expect("poisoned");
+        let mut order = Vec::new();
+        let mut groups: HashMap<PartitionKey, Vec<usize>> = HashMap::new();
+        for (index, batch) in batches.iter().enumerate() {
+            if !groups.contains_key(&batch.partition) {
+                order.push(batch.partition.clone());
+            }
+            groups
+                .entry(batch.partition.clone())
+                .or_default()
+                .push(index);
+        }
+        self.ensure_catalog(&order)?;
+        let mut outcomes = vec![None; batches.len()];
+        let mut published = false;
+        for partition in order {
+            let indexes = &groups[&partition];
+            match self.publish_partition_conditionally(&partition, batches, indexes, expected_heads)
+            {
+                Ok(rows) => {
+                    for (index, outcome) in indexes.iter().zip(rows) {
+                        if matches!(
+                            outcome,
+                            ConditionalCommitOutcome::Committed(
+                                CommitOutcome::Assigned { .. } | CommitOutcome::Duplicate { .. }
+                            )
+                        ) {
+                            published = true;
+                        }
+                        outcomes[*index] = Some(outcome);
+                    }
+                }
+                Err(error) => {
+                    for index in indexes {
+                        outcomes[*index] = Some(ConditionalCommitOutcome::Unknown(error.clone()));
+                    }
+                }
+            }
+        }
+        if published {
+            let mut inner = self.inner.lock().expect("poisoned");
+            inner.counter = inner.counter.saturating_add(1);
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every conditional batch has an outcome"))
+            .collect())
     }
 
     fn commit(

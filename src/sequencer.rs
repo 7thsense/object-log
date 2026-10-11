@@ -76,6 +76,22 @@ pub enum CommitOutcome {
     },
 }
 
+/// Opt-in conditional results; existing CommitOutcome encoding stays unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConditionalCommitOutcome {
+    /// An ordinary assigned/duplicate/rejected sequencing outcome.
+    Committed(CommitOutcome),
+    /// No entry for this batch was indexed; the original condition did not hold.
+    HeadRejected {
+        /// Original required next offset.
+        expected: i64,
+        /// Authoritative next offset that did not match.
+        current: i64,
+    },
+    /// Publication may be ambiguous. Never interpret this as a head rejection.
+    Unknown(ObjectLogError),
+}
+
 /// An index entry resolving an offset range to its bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
@@ -123,6 +139,40 @@ pub trait Sequencer: Send + Sync {
         &self,
         batches: &[CommitBatch<'_, Self::Meta>],
     ) -> Result<Vec<CommitOutcome>, ObjectLogError>;
+
+    /// Whether this sequencer implements native durable head conditions.
+    fn supports_conditional_commit(&self) -> bool {
+        false
+    }
+
+    /// Opt-in head compare-and-append. Conditions are next log offsets, not
+    /// record insertion counters or sparse hints. Partition publication remains
+    /// independent; this is not a cross-partition transaction. The default
+    /// rejects any condition before calling the legacy commit implementation.
+    fn commit_conditionally(
+        &self,
+        batches: &[CommitBatch<'_, Self::Meta>],
+        expected_heads: &[Option<i64>],
+    ) -> Result<Vec<ConditionalCommitOutcome>, ObjectLogError> {
+        if batches.len() != expected_heads.len()
+            || expected_heads.iter().flatten().any(|head| *head < 0)
+        {
+            return Err(ObjectLogError::InvalidBatch(
+                "invalid head conditions".into(),
+            ));
+        }
+        if expected_heads.iter().any(Option::is_some) {
+            return Err(ObjectLogError::InvalidConfig(
+                "conditional commit unsupported".into(),
+            ));
+        }
+        self.commit(batches).map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(ConditionalCommitOutcome::Committed)
+                .collect()
+        })
+    }
 
     /// Resolve `fetch_offset` to the ordered index entries covering it onward.
     fn lookup(

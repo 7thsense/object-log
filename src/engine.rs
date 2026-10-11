@@ -5,7 +5,8 @@ use crate::budget::{
 };
 use crate::sequencer::BatchLocation;
 use crate::{
-    BlobStore, CommitBatch, CommitOutcome, IndexEntry, ObjectLogError, PartitionKey, Sequencer,
+    BlobStore, CommitBatch, CommitOutcome, ConditionalCommitOutcome, IndexEntry, ObjectLogError,
+    PartitionKey, Sequencer,
 };
 use bytes::Bytes;
 use std::collections::{HashSet, VecDeque};
@@ -185,6 +186,7 @@ struct Pending<M> {
     /// Monotonic enqueue id for [`LogEngine::flush`] barriers.
     seq: u64,
     owner: Option<AppendOwner>,
+    expected_head: Option<i64>,
 }
 
 struct FlushWork<M> {
@@ -394,6 +396,7 @@ where
             durability,
             epoch,
             None,
+            None,
         )
         .await
     }
@@ -420,6 +423,32 @@ where
             durability,
             epoch,
             Some(owner),
+            None,
+        )
+        .await
+    }
+
+    /// Owned compare-and-append; acknowledgement requires a sequencing decision.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn produce_conditional_at_epoch(
+        &self,
+        partition: PartitionKey,
+        payload: Bytes,
+        record_count: i32,
+        meta: S::Meta,
+        epoch: u64,
+        expected_head: i64,
+        owner: AppendOwner,
+    ) -> Result<AppendOutcome, ObjectLogError> {
+        self.produce_at_epoch_with_owner(
+            partition,
+            payload,
+            record_count,
+            meta,
+            Durability::Sequenced,
+            epoch,
+            Some(owner),
+            Some(expected_head),
         )
         .await
     }
@@ -434,7 +463,20 @@ where
         durability: Durability,
         epoch: u64,
         owner: Option<AppendOwner>,
+        expected_head: Option<i64>,
     ) -> Result<AppendOutcome, ObjectLogError> {
+        if let Some(head) = expected_head {
+            if head < 0 {
+                return Err(ObjectLogError::InvalidBatch(
+                    "negative expected head".into(),
+                ));
+            }
+            if !self.sequencer.supports_conditional_commit() {
+                return Err(ObjectLogError::InvalidConfig(
+                    "conditional commit unsupported".into(),
+                ));
+            }
+        }
         if record_count <= 0 {
             return Err(ObjectLogError::InvalidBatch(
                 "record_count must be > 0".into(),
@@ -450,6 +492,7 @@ where
                 durability,
                 responder: None,
                 owner,
+                expected_head,
                 seq: 0, // filled in enqueue
             })?;
             return Ok(AppendOutcome {
@@ -501,6 +544,7 @@ where
             durability,
             responder: Some(tx),
             owner,
+            expected_head,
             seq: 0,
         })?;
         rx.await
@@ -1360,6 +1404,38 @@ impl OwnedUpload {
     }
 }
 
+enum CommitResults {
+    Legacy(Vec<CommitOutcome>),
+    Conditional(Vec<ConditionalCommitOutcome>),
+}
+impl CommitResults {
+    fn len(&self) -> usize {
+        match self {
+            Self::Legacy(rows) => rows.len(),
+            Self::Conditional(rows) => rows.len(),
+        }
+    }
+    fn into_iter(self) -> CommitResultIter {
+        match self {
+            Self::Legacy(rows) => CommitResultIter::Legacy(rows.into_iter()),
+            Self::Conditional(rows) => CommitResultIter::Conditional(rows.into_iter()),
+        }
+    }
+}
+enum CommitResultIter {
+    Legacy(std::vec::IntoIter<CommitOutcome>),
+    Conditional(std::vec::IntoIter<ConditionalCommitOutcome>),
+}
+impl Iterator for CommitResultIter {
+    type Item = ConditionalCommitOutcome;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Legacy(rows) => rows.next().map(ConditionalCommitOutcome::Committed),
+            Self::Conditional(rows) => rows.next(),
+        }
+    }
+}
+
 fn finish_flush_work<S, M>(
     shared: &Arc<Shared<M>>,
     blob: &Arc<dyn BlobStore>,
@@ -1426,7 +1502,31 @@ where
     // on the shared store is counted into the same budget.
     let _ = blob.take_media_op_stats();
     let mut commit_error = None;
-    match sequencer.commit(&commit_batches) {
+    let committed = if work
+        .batch
+        .iter()
+        .any(|pending| pending.expected_head.is_some())
+    {
+        let heads: Vec<_> = work
+            .batch
+            .iter()
+            .map(|pending| pending.expected_head)
+            .collect();
+        sequencer
+            .commit_conditionally(&commit_batches, &heads)
+            .map(CommitResults::Conditional)
+    } else {
+        sequencer.commit(&commit_batches).map(CommitResults::Legacy)
+    }
+    .and_then(|outcomes| {
+        if outcomes.len() != commit_batches.len() {
+            return Err(ObjectLogError::Sequencer(
+                "wrong commit outcome count".into(),
+            ));
+        }
+        Ok(outcomes)
+    });
+    match committed {
         Ok(outcomes) => {
             if let Some(commit_started) = commit_started {
                 eprintln!(
@@ -1447,6 +1547,20 @@ where
                 .zip(work.batch.iter())
             {
                 if let Some(tx) = tx.take() {
+                    let outcome = match outcome {
+                        ConditionalCommitOutcome::Committed(outcome) => outcome,
+                        ConditionalCommitOutcome::HeadRejected { expected, current } => {
+                            let _ =
+                                tx.send(Err(ObjectLogError::HeadRejected { expected, current }));
+                            continue;
+                        }
+                        ConditionalCommitOutcome::Unknown(error) => {
+                            let _ = tx.send(Err(ObjectLogError::StorageUnavailable(format!(
+                                "conditional publication outcome unknown: {error}"
+                            ))));
+                            continue;
+                        }
+                    };
                     let (base, last) = match outcome {
                         CommitOutcome::Assigned {
                             base_offset,
@@ -1567,6 +1681,7 @@ mod ready_commit_group_tests {
                 responder: Some(tx),
                 seq: n,
                 owner: None,
+                expected_head: None,
             }],
         );
         work.put_result = Some(Ok(Duration::from_millis(n)));
@@ -2742,6 +2857,7 @@ mod idle_batch_wait_tests {
                             responder: None,
                             seq: 1,
                             owner: None,
+                            expected_head: None,
                         });
                     }
                     shared.cv.notify_all();
@@ -2873,6 +2989,7 @@ mod append_owner_tests {
             responder: None,
             seq: 1,
             owner: Some(owner),
+            expected_head: None,
         });
         let uploads = fail_engine_and_take_pending_uploads(
             &shared,
@@ -2912,6 +3029,7 @@ mod append_owner_tests {
                 responder: Some(tx),
                 seq: 1,
                 owner: Some(Arc::new(Lifetime(drops.clone()))),
+                expected_head: None,
             },
             Pending {
                 partition: PartitionKey("p".into()),
@@ -2923,6 +3041,7 @@ mod append_owner_tests {
                 responder: None,
                 seq: 2,
                 owner: None,
+                expected_head: None,
             },
         ];
         let work = start_flush_work(&runtime, &erased, "data/", "", 1, batch, true);

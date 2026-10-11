@@ -68,6 +68,6 @@ pub use manifest_sequencer::{IndexSnapshot, ManifestSequencer, PartitionSnapshot
 #[cfg(feature = "s3")]
 pub use s3::S3BlobStore;
 pub use sequencer::{
-    BatchLocation, CommitBatch, CommitOutcome, InMemorySequencer, IndexEntry, PartitionKey,
-    Sequencer,
+    BatchLocation, CommitBatch, CommitOutcome, ConditionalCommitOutcome, InMemorySequencer,
+    IndexEntry, PartitionKey, Sequencer,
 };

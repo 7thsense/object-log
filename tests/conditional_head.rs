@@ -1,0 +1,481 @@
+use async_trait::async_trait;
+use bytes::Bytes;
+use object_log::{
+    AppendOwner, BatchLocation, BlobStore, CasOutcome, CommitBatch, CommitOutcome,
+    ConditionalCommitOutcome, Durability, FlushConfig, InMemorySequencer, IndexEntry, LogEngine,
+    ManifestSequencer, MemoryBlobStore, ObjectLogError, PartitionKey, Sequencer,
+};
+use std::{
+    ops::Range,
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+    },
+};
+fn batch(name: &str, epoch: u64) -> CommitBatch<'static, ()> {
+    CommitBatch {
+        partition: PartitionKey("queue".into()),
+        location: BatchLocation {
+            object_id: name.into(),
+            byte_start: 0,
+            byte_len: 1,
+        },
+        record_count: 1,
+        meta: &(),
+        epoch,
+    }
+}
+struct ControlledCas {
+    inner: MemoryBlobStore,
+    mode: AtomicU8,
+    calls: AtomicUsize,
+    barrier: Barrier,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::watch::Sender<bool>,
+}
+impl ControlledCas {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryBlobStore::new(),
+            mode: AtomicU8::new(0),
+            calls: AtomicUsize::new(0),
+            barrier: Barrier::new(2),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::watch::channel(false).0,
+        })
+    }
+}
+#[async_trait]
+impl BlobStore for ControlledCas {
+    async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
+        self.inner.put(key, value).await
+    }
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Bytes>, ObjectLogError> {
+        self.inner.get_range(key, range).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), ObjectLogError> {
+        self.inner.delete(key).await
+    }
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        new: Bytes,
+    ) -> Result<CasOutcome, ObjectLogError> {
+        let doc = serde_json::from_slice::<serde_json::Value>(&new).ok();
+        let is_append = doc
+            .as_ref()
+            .and_then(|doc| doc.get("next_offset"))
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|head| head > 0);
+        if is_append {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode.load(Ordering::SeqCst) {
+                1 if call < 2 => {
+                    self.barrier.wait();
+                }
+                2 => {
+                    self.inner
+                        .compare_and_swap(key, expected, new.clone())
+                        .await?;
+                    return Ok(CasOutcome::Conflict { current: Some(new) });
+                }
+                3 => {
+                    self.inner.compare_and_swap(key, expected, new).await?;
+                    return Err(ObjectLogError::StorageUnavailable(
+                        "lost publication reply".into(),
+                    ));
+                }
+                4 => {
+                    return Ok(CasOutcome::Conflict {
+                        current: self.inner.get(key).await?,
+                    });
+                }
+                5 => {
+                    return Ok(CasOutcome::Conflict {
+                        current: Some(Bytes::from_static(b"{broken")),
+                    });
+                }
+                7 => {
+                    let mut doc = doc.unwrap();
+                    let next = doc["next_offset"].clone();
+                    doc["entries"] = serde_json::json!([]);
+                    doc["log_start"] = next;
+                    let changed = Bytes::from(serde_json::to_vec(&doc).unwrap());
+                    self.inner
+                        .compare_and_swap(key, expected, changed.clone())
+                        .await?;
+                    return Ok(CasOutcome::Conflict {
+                        current: Some(changed),
+                    });
+                }
+                8 => {
+                    let mut release = self.release.subscribe();
+                    self.entered.notify_one();
+                    release.wait_for(|ready| *ready).await.unwrap();
+                }
+                6 => {
+                    let mut doc = doc.unwrap();
+                    doc["entries"].as_array_mut().unwrap().remove(0);
+                    doc["log_start"] = serde_json::json!(1);
+                    let changed = Bytes::from(serde_json::to_vec(&doc).unwrap());
+                    self.inner
+                        .compare_and_swap(key, expected, changed.clone())
+                        .await?;
+                    return Ok(CasOutcome::Conflict {
+                        current: Some(changed),
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.inner.compare_and_swap(key, expected, new).await
+    }
+}
+fn open(blob: Arc<dyn BlobStore>) -> Arc<ManifestSequencer> {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    Arc::new(
+        runtime
+            .block_on(ManifestSequencer::open(blob, "meta/"))
+            .unwrap(),
+    )
+}
+#[test]
+fn same_epoch_independent_writers_have_one_head_zero_winner() {
+    let blob = ControlledCas::new();
+    let first = open(blob.clone());
+    let second = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    first.fence_epoch(&key, 0, 1).unwrap();
+    second.fence_epoch(&key, 0, 1).unwrap();
+    blob.mode.store(1, Ordering::SeqCst);
+    let a = std::thread::spawn(move || {
+        first
+            .commit_conditionally(&[batch("a", 1)], &[Some(0)])
+            .unwrap()
+    });
+    let b = std::thread::spawn(move || {
+        second
+            .commit_conditionally(&[batch("b", 1)], &[Some(0)])
+            .unwrap()
+    });
+    let outcomes = [a.join().unwrap().remove(0), b.join().unwrap().remove(0)];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|row| matches!(
+                row,
+                ConditionalCommitOutcome::Committed(CommitOutcome::Assigned { base_offset: 0, .. })
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|row| matches!(
+                row,
+                ConditionalCommitOutcome::HeadRejected {
+                    expected: 0,
+                    current: 1
+                }
+            ))
+            .count(),
+        1
+    );
+    let reopened = open(blob);
+    assert_eq!(reopened.high_watermark(&key).unwrap(), 1);
+    assert_eq!(reopened.lookup(&key, 0).unwrap().len(), 1);
+}
+#[test]
+fn stale_handle_refresh_and_ordered_siblings_use_original_heads() {
+    let blob = ControlledCas::new();
+    let first = open(blob.clone());
+    let stale = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    first.fence_epoch(&key, 0, 1).unwrap();
+    first
+        .commit_conditionally(&[batch("a", 1)], &[Some(0)])
+        .unwrap();
+    let rows = stale
+        .commit_conditionally(
+            &[batch("b", 1), batch("c", 1), batch("d", 1)],
+            &[Some(1), Some(1), Some(2)],
+        )
+        .unwrap();
+    assert!(matches!(
+        rows[0],
+        ConditionalCommitOutcome::Committed(CommitOutcome::Assigned { base_offset: 1, .. })
+    ));
+    assert_eq!(
+        rows[1],
+        ConditionalCommitOutcome::HeadRejected {
+            expected: 1,
+            current: 2
+        }
+    );
+    assert!(matches!(
+        rows[2],
+        ConditionalCommitOutcome::Committed(CommitOutcome::Assigned { base_offset: 2, .. })
+    ));
+    let writes = blob.calls.load(Ordering::SeqCst);
+    let rejected = stale
+        .commit_conditionally(&[batch("e", 1)], &[Some(0)])
+        .unwrap();
+    assert_eq!(
+        rejected[0],
+        ConditionalCommitOutcome::HeadRejected {
+            expected: 0,
+            current: 3
+        }
+    );
+    assert_eq!(blob.calls.load(Ordering::SeqCst), writes);
+    assert_eq!(stale.high_watermark(&key).unwrap(), 3);
+    assert!(stale.commit_conditionally(&[batch("x", 1)], &[]).is_err());
+    assert!(
+        stale
+            .commit_conditionally(&[batch("x", 1)], &[Some(-1)])
+            .is_err()
+    );
+    assert_eq!(blob.calls.load(Ordering::SeqCst), writes);
+}
+#[test]
+fn exact_conflict_reconciliation_and_unknown_publication_remain_distinct() {
+    for mode in [2, 3, 4, 5, 6, 7] {
+        let blob = ControlledCas::new();
+        let seq = open(blob.clone());
+        let key = PartitionKey("queue".into());
+        seq.fence_epoch(&key, 0, 1).unwrap();
+        blob.mode.store(mode, Ordering::SeqCst);
+        let rows = if mode == 6 {
+            seq.commit_conditionally(&[batch("a", 1), batch("b", 1)], &[Some(0), Some(1)])
+                .unwrap()
+        } else {
+            seq.commit_conditionally(&[batch("a", 1)], &[Some(0)])
+                .unwrap()
+        };
+        if mode == 2 {
+            assert!(matches!(
+                rows[0],
+                ConditionalCommitOutcome::Committed(CommitOutcome::Assigned { base_offset: 0, .. })
+            ));
+        } else {
+            assert!(
+                rows.iter()
+                    .all(|row| matches!(row, ConditionalCommitOutcome::Unknown(_)))
+            );
+        }
+        if mode == 4 {
+            assert_eq!(blob.calls.load(Ordering::SeqCst), 8);
+        }
+        if mode == 3 {
+            blob.mode.store(0, Ordering::SeqCst);
+            let duplicate = seq
+                .commit_conditionally(&[batch("a", 1)], &[Some(0)])
+                .unwrap();
+            assert_eq!(
+                duplicate[0],
+                ConditionalCommitOutcome::Committed(CommitOutcome::Duplicate { base_offset: 0 })
+            );
+        }
+    }
+}
+struct LegacyCounting {
+    inner: InMemorySequencer,
+    commits: AtomicUsize,
+}
+impl Sequencer for LegacyCounting {
+    type Meta = ();
+    fn commit(
+        &self,
+        batches: &[CommitBatch<'_, ()>],
+    ) -> Result<Vec<CommitOutcome>, ObjectLogError> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        self.inner.commit(batches)
+    }
+    fn lookup(&self, key: &PartitionKey, offset: i64) -> Result<Vec<IndexEntry>, ObjectLogError> {
+        self.inner.lookup(key, offset)
+    }
+    fn high_watermark(&self, key: &PartitionKey) -> Result<i64, ObjectLogError> {
+        self.inner.high_watermark(key)
+    }
+    fn log_start_offset(&self, key: &PartitionKey) -> Result<i64, ObjectLogError> {
+        self.inner.log_start_offset(key)
+    }
+    fn truncate_before(
+        &self,
+        key: &PartitionKey,
+        offset: i64,
+    ) -> Result<Vec<String>, ObjectLogError> {
+        self.inner.truncate_before(key, offset)
+    }
+}
+#[tokio::test]
+async fn unsupported_condition_never_calls_legacy_or_uploads() {
+    let seq = Arc::new(LegacyCounting {
+        inner: InMemorySequencer::new(),
+        commits: AtomicUsize::new(0),
+    });
+    assert!(
+        seq.commit_conditionally(&[batch("a", 0)], &[Some(0)])
+            .is_err()
+    );
+    assert_eq!(seq.commits.load(Ordering::SeqCst), 0);
+    let blob = Arc::new(MemoryBlobStore::new());
+    let engine = LogEngine::new(blob.clone(), seq.clone(), FlushConfig::default(), "data/");
+    let owner: AppendOwner = Arc::new(());
+    assert!(
+        engine
+            .produce_conditional_at_epoch(
+                PartitionKey("queue".into()),
+                Bytes::from_static(b"body"),
+                1,
+                (),
+                0,
+                0,
+                owner
+            )
+            .await
+            .is_err()
+    );
+    assert!(blob.list("data/").await.unwrap().is_empty());
+    assert_eq!(seq.commits.load(Ordering::SeqCst), 0);
+    // Legacy behavior remains available unchanged.
+    engine
+        .produce(
+            PartitionKey("queue".into()),
+            Bytes::from_static(b"legacy"),
+            1,
+            (),
+            Durability::Sequenced,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq.commits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn engine_waits_for_head_decision_and_returns_typed_rejection() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let blob = ControlledCas::new();
+    let seq = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    seq.fence_epoch(&key, 0, 1).unwrap();
+    blob.mode.store(8, Ordering::SeqCst);
+    let engine = Arc::new(LogEngine::new(
+        blob.clone(),
+        seq.clone(),
+        FlushConfig {
+            linger: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+        "data/",
+    ));
+    runtime.block_on(async {
+        let writer = engine.clone();
+        let first = tokio::spawn(async move {
+            writer
+                .produce_conditional_at_epoch(
+                    PartitionKey("queue".into()),
+                    Bytes::from_static(b"genesis"),
+                    1,
+                    (),
+                    1,
+                    0,
+                    Arc::new(()),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), blob.entered.notified())
+            .await
+            .unwrap();
+        assert!(!blob.list("data/").await.unwrap().is_empty());
+        assert!(!first.is_finished());
+        blob.release.send_replace(true);
+        let accepted = first.await.unwrap().unwrap();
+        assert_eq!(accepted.base_offset, Some(0));
+        assert!(accepted.durable && accepted.sequenced);
+        let second = engine
+            .produce_conditional_at_epoch(
+                key.clone(),
+                Bytes::from_static(b"loser"),
+                1,
+                (),
+                1,
+                0,
+                Arc::new(()),
+            )
+            .await;
+        assert_eq!(
+            second,
+            Err(ObjectLogError::HeadRejected {
+                expected: 0,
+                current: 1
+            })
+        );
+    });
+    assert_eq!(seq.high_watermark(&key).unwrap(), 1);
+    assert_eq!(seq.lookup(&key, 0).unwrap().len(), 1);
+}
+
+#[test]
+fn vanished_known_index_is_unknown_and_never_recreated() {
+    let blob = ControlledCas::new();
+    let seq = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    seq.fence_epoch(&key, 0, 1).unwrap();
+    seq.commit_conditionally(&[batch("a", 1)], &[Some(0)])
+        .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let index = runtime
+        .block_on(blob.list("meta/"))
+        .unwrap()
+        .into_iter()
+        .find(|key| key != "meta/catalog")
+        .unwrap();
+    runtime.block_on(blob.delete(&index)).unwrap();
+    let rows = seq
+        .commit_conditionally(&[batch("b", 1)], &[Some(0)])
+        .unwrap();
+    assert!(matches!(rows[0], ConditionalCommitOutcome::Unknown(_)));
+    assert!(runtime.block_on(blob.get(&index)).unwrap().is_none());
+    // Genuinely never-observed creation remains supported.
+    let fresh = open(ControlledCas::new());
+    let rows = fresh
+        .commit_conditionally(&[batch("fresh", 0)], &[Some(0)])
+        .unwrap();
+    assert!(matches!(
+        rows[0],
+        ConditionalCommitOutcome::Committed(CommitOutcome::Assigned { base_offset: 0, .. })
+    ));
+}
+#[test]
+fn ambiguous_candidate_retained_away_cannot_become_definite_rejection() {
+    let blob = ControlledCas::new();
+    let seq = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    seq.fence_epoch(&key, 0, 1).unwrap();
+    blob.mode.store(3, Ordering::SeqCst);
+    let first = seq
+        .commit_conditionally(&[batch("a", 1)], &[Some(0)])
+        .unwrap();
+    assert!(matches!(first[0], ConditionalCommitOutcome::Unknown(_)));
+    blob.mode.store(0, Ordering::SeqCst);
+    // Refresh the ambiguous commit, then retain its whole indexed range.
+    let observer = open(blob.clone());
+    observer.truncate_before(&key, 1).unwrap();
+    let retried = seq
+        .commit_conditionally(&[batch("a", 1)], &[Some(0)])
+        .unwrap();
+    assert!(matches!(retried[0], ConditionalCommitOutcome::Unknown(_)));
+}
