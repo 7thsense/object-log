@@ -111,6 +111,11 @@ pub struct BufferStats {
     pub max_buffered_bytes: usize,
 }
 
+/// An embedding operation lifetime, retained through queued work and started
+/// upload completion, including copied upload buffers and failure draining.
+/// It must not depend on the caller waiting for its acknowledgement.
+pub type AppendOwner = Arc<dyn std::any::Any + Send + Sync>;
+
 type Responder = oneshot::Sender<Result<AppendOutcome, ObjectLogError>>;
 
 fn retryable_storage_error(err: &ObjectLogError) -> bool {
@@ -179,6 +184,7 @@ struct Pending<M> {
     responder: Option<Responder>,
     /// Monotonic enqueue id for [`LogEngine::flush`] barriers.
     seq: u64,
+    owner: Option<AppendOwner>,
 }
 
 struct FlushWork<M> {
@@ -380,6 +386,55 @@ where
         durability: Durability,
         epoch: u64,
     ) -> Result<AppendOutcome, ObjectLogError> {
+        self.produce_at_epoch_with_owner(
+            partition,
+            payload,
+            record_count,
+            meta,
+            durability,
+            epoch,
+            None,
+        )
+        .await
+    }
+
+    /// Append with an operation lifetime independent of caller cancellation.
+    /// Acknowledgement is not a terminal-owner notification: use the owner's
+    /// final Drop/callback to observe release of all physical work.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn produce_owned_at_epoch(
+        &self,
+        partition: PartitionKey,
+        payload: Bytes,
+        record_count: i32,
+        meta: S::Meta,
+        durability: Durability,
+        epoch: u64,
+        owner: AppendOwner,
+    ) -> Result<AppendOutcome, ObjectLogError> {
+        self.produce_at_epoch_with_owner(
+            partition,
+            payload,
+            record_count,
+            meta,
+            durability,
+            epoch,
+            Some(owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn produce_at_epoch_with_owner(
+        &self,
+        partition: PartitionKey,
+        payload: Bytes,
+        record_count: i32,
+        meta: S::Meta,
+        durability: Durability,
+        epoch: u64,
+        owner: Option<AppendOwner>,
+    ) -> Result<AppendOutcome, ObjectLogError> {
         if record_count <= 0 {
             return Err(ObjectLogError::InvalidBatch(
                 "record_count must be > 0".into(),
@@ -394,6 +449,7 @@ where
                 epoch,
                 durability,
                 responder: None,
+                owner,
                 seq: 0, // filled in enqueue
             })?;
             return Ok(AppendOutcome {
@@ -444,6 +500,7 @@ where
             epoch,
             durability,
             responder: Some(tx),
+            owner,
             seq: 0,
         })?;
         rx.await
@@ -967,11 +1024,7 @@ fn fail_engine_and_take_pending_uploads<M>(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     q.shutdown = true;
     q.first_failed.get_or_insert((first_seq, error.clone()));
-    for mut item in q.items.drain(..) {
-        if let Some(tx) = item.responder.take() {
-            let _ = tx.send(Err(error.clone()));
-        }
-    }
+    let rejected = std::mem::take(&mut q.items);
     q.bytes = 0;
     // Keep outstanding bytes conservatively charged until the failed engine
     // and its accepted uploads have completed.
@@ -980,6 +1033,14 @@ fn fail_engine_and_take_pending_uploads<M>(
     }
     q.force_flush = false;
     shared.cv.notify_all();
+    drop(q);
+    // Embedding lifetime owners may run terminal callbacks. Never drop those
+    // (or admission-carrying payload owners) while holding the engine lock.
+    for mut item in rejected {
+        if let Some(tx) = item.responder.take() {
+            let _ = tx.send(Err(error.clone()));
+        }
+    }
     uploads
 }
 
@@ -1256,14 +1317,23 @@ fn start_flush_work<M>(
     concurrent: bool,
 ) -> FlushWork<M> {
     let (mut work, key, chunks) = prepare_flush_work(prefix, writer_id, counter, batch);
-    let blob = Arc::clone(blob);
+    let owners = work
+        .batch
+        .iter()
+        .filter_map(|pending| pending.owner.clone())
+        .collect();
+    let upload = OwnedUpload {
+        blob: Arc::clone(blob),
+        key,
+        chunks,
+        _owners: owners,
+    };
     let _ = blob.take_media_op_stats();
     work.put_started = Instant::now();
     if concurrent {
-        work.put =
-            Some(rt.spawn(async move { put_chunks_with_retries(&blob, &key, chunks).await }));
+        work.put = Some(rt.spawn(upload.execute()));
     } else {
-        let put_result = rt.block_on(put_chunks_with_retries(&blob, &key, chunks));
+        let put_result = rt.block_on(upload.execute());
         let elapsed = work.put_started.elapsed();
         work.put_result = Some(match put_result {
             Ok(()) => Ok(elapsed),
@@ -1271,6 +1341,23 @@ fn start_flush_work<M>(
         });
     }
     work
+}
+
+// Retain embedding owners independently of FlushWork, including after engine
+// failure drops pending batches while separately started uploads are drained.
+struct OwnedUpload {
+    blob: Arc<dyn BlobStore>,
+    key: String,
+    chunks: Vec<Bytes>,
+    _owners: Vec<AppendOwner>,
+}
+impl OwnedUpload {
+    async fn execute(mut self) -> Result<(), ObjectLogError> {
+        let chunks = std::mem::take(&mut self.chunks);
+        let result = put_chunks_with_retries(&self.blob, &self.key, chunks).await;
+        drop(self);
+        result
+    }
 }
 
 fn finish_flush_work<S, M>(
@@ -1479,6 +1566,7 @@ mod ready_commit_group_tests {
                 durability,
                 responder: Some(tx),
                 seq: n,
+                owner: None,
             }],
         );
         work.put_result = Some(Ok(Duration::from_millis(n)));
@@ -2653,6 +2741,7 @@ mod idle_batch_wait_tests {
                             durability: Durability::Buffered,
                             responder: None,
                             seq: 1,
+                            owner: None,
                         });
                     }
                     shared.cv.notify_all();
@@ -2677,5 +2766,239 @@ mod idle_batch_wait_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod append_owner_tests {
+    use super::*;
+    use crate::{InMemorySequencer, MemoryBlobStore};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Lifetime(Arc<AtomicUsize>);
+    impl Drop for Lifetime {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct CopiedPausedPut {
+        inner: MemoryBlobStore,
+        entered: std::sync::mpsc::Sender<usize>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+    #[async_trait]
+    impl BlobStore for CopiedPausedPut {
+        async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
+            self.put_chunks(key, vec![value]).await
+        }
+        async fn put_chunks(&self, key: &str, chunks: Vec<Bytes>) -> Result<(), ObjectLogError> {
+            let copied = Bytes::from(
+                chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.iter().copied())
+                    .collect::<Vec<_>>(),
+            );
+            drop(chunks);
+            let mut release = self.release.subscribe();
+            self.entered.send(copied.len()).unwrap();
+            release.wait_for(|ready| *ready).await.unwrap();
+            self.inner.put(key, copied).await
+        }
+        async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {
+            self.inner.get(key).await
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Option<Bytes>, ObjectLogError> {
+            self.inner.get_range(key, range).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectLogError> {
+            self.inner.delete(key).await
+        }
+    }
+    struct ReentrantLifetime {
+        shared: std::sync::Weak<Shared<()>>,
+        unlocked: Arc<AtomicUsize>,
+    }
+    impl Drop for ReentrantLifetime {
+        fn drop(&mut self) {
+            let shared = self.shared.upgrade().unwrap();
+            let available = !matches!(
+                shared.queue.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.unlocked
+                .store(usize::from(available), Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn rejected_queued_owner_drops_outside_engine_lock() {
+        let config = FlushConfig::default();
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                items: VecDeque::new(),
+                bytes: 0,
+                bytes_in_use: 0,
+                shutdown: false,
+                next_seq: 1,
+                completed_through: 0,
+                first_failed: None,
+                force_flush: false,
+                flush_waiters: Vec::new(),
+                last_enqueue: None,
+                oldest_enqueue: None,
+            }),
+            cv: Condvar::new(),
+            max_buffered_bytes: config.max_buffered_bytes,
+            budget: Mutex::new(BudgetRuntime::new(config.budget)),
+            flush_config: config,
+        });
+        let unlocked = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(ReentrantLifetime {
+            shared: Arc::downgrade(&shared),
+            unlocked: unlocked.clone(),
+        });
+        shared.queue.lock().unwrap().items.push_back(Pending {
+            partition: PartitionKey("p".into()),
+            record_count: 1,
+            payload: Bytes::from_static(b"queued"),
+            meta: (),
+            epoch: 0,
+            durability: Durability::Sequenced,
+            responder: None,
+            seq: 1,
+            owner: Some(owner),
+        });
+        let uploads = fail_engine_and_take_pending_uploads(
+            &shared,
+            &mut VecDeque::new(),
+            1,
+            ObjectLogError::Sequencer("failure".into()),
+        );
+        assert!(uploads.is_empty());
+        assert_eq!(unlocked.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn failed_engine_keeps_owner_until_copied_pending_upload_finishes() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let blob = Arc::new(CopiedPausedPut {
+            inner: MemoryBlobStore::new(),
+            entered,
+            release: tokio::sync::watch::channel(false).0,
+        });
+        let erased: Arc<dyn BlobStore> = blob.clone();
+        let engine = LogEngine::new(
+            erased.clone(),
+            Arc::new(InMemorySequencer::new()),
+            FlushConfig::default(),
+            "idle/",
+        );
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = oneshot::channel();
+        let batch = vec![
+            Pending {
+                partition: PartitionKey("p".into()),
+                record_count: 1,
+                payload: Bytes::from_static(b"first"),
+                meta: (),
+                epoch: 0,
+                durability: Durability::Sequenced,
+                responder: Some(tx),
+                seq: 1,
+                owner: Some(Arc::new(Lifetime(drops.clone()))),
+            },
+            Pending {
+                partition: PartitionKey("p".into()),
+                record_count: 1,
+                payload: Bytes::from_static(b"second"),
+                meta: (),
+                epoch: 0,
+                durability: Durability::Sequenced,
+                responder: None,
+                seq: 2,
+                owner: None,
+            },
+        ];
+        let work = start_flush_work(&runtime, &erased, "data/", "", 1, batch, true);
+        assert_eq!(started.recv_timeout(Duration::from_secs(5)).unwrap(), 11);
+        let mut pending = VecDeque::from([work]);
+        let uploads = fail_engine_and_take_pending_uploads(
+            &engine.shared,
+            &mut pending,
+            1,
+            ObjectLogError::Sequencer("injected committer failure".into()),
+        );
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(pending.is_empty());
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        blob.release.send_replace(true);
+        runtime.block_on(async {
+            for upload in uploads {
+                upload.await.unwrap().unwrap();
+            }
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime
+                .block_on(blob.inner.get("data/00000000000000000001"))
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"firstsecond")
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_producer_keeps_owner_until_copied_upload_and_flush_finish() {
+        let (entered, started) = std::sync::mpsc::channel();
+        let blob = Arc::new(CopiedPausedPut {
+            inner: MemoryBlobStore::new(),
+            entered,
+            release: tokio::sync::watch::channel(false).0,
+        });
+        let engine = Arc::new(LogEngine::new(
+            blob.clone(),
+            Arc::new(InMemorySequencer::new()),
+            FlushConfig {
+                linger: Duration::ZERO,
+                ..Default::default()
+            },
+            "data/",
+        ));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner: AppendOwner = Arc::new(Lifetime(drops.clone()));
+        let writer = engine.clone();
+        let caller = tokio::spawn(async move {
+            writer
+                .produce_owned_at_epoch(
+                    PartitionKey("p".into()),
+                    Bytes::from_static(b"payload"),
+                    1,
+                    (),
+                    Durability::Sequenced,
+                    0,
+                    owner,
+                )
+                .await
+        });
+        assert_eq!(started.recv_timeout(Duration::from_secs(5)).unwrap(), 7);
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        blob.release.send_replace(true);
+        engine.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while drops.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

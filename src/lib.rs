@@ -56,7 +56,8 @@ mod sequencer;
 pub use blob::{BlobStore, CasOutcome, LocalBlobStore, MediaOpStats, MemoryBlobStore};
 pub use budget::{BudgetConfig, BudgetMode, EffectiveKnob, EffectiveReason, PipelineSnapshot};
 pub use engine::{
-    AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine, reap_orphans,
+    AppendOutcome, AppendOwner, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine,
+    reap_orphans,
 };
 mod bounded_fetch;
 mod bounded_lookup;
