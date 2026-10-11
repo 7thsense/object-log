@@ -7,8 +7,8 @@
 //! manifest objects in order.
 
 use crate::{
-    BlobStore, CasOutcome, CommitBatch, CommitOutcome, ConditionalCommitOutcome, IndexEntry,
-    ObjectLogError, PartitionKey, Sequencer,
+    AuthoritativePartitionState, BlobStore, CasOutcome, CommitBatch, CommitOutcome,
+    ConditionalCommitOutcome, IndexEntry, ObjectLogError, PartitionKey, Sequencer,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -326,13 +326,7 @@ impl ManifestSequencer {
             let (mut doc, observed) = match self.reload_partition(partition)? {
                 Some((doc, bytes)) => (doc, Some(bytes)),
                 None => {
-                    let inner = self.inner.lock().expect("poisoned");
-                    if inner.parts.get(partition).is_some_and(|part| {
-                        part.observed.is_some()
-                            || part.next_offset != 0
-                            || part.log_start != 0
-                            || !part.entries.is_empty()
-                    }) {
+                    if self.has_known_history(partition) {
                         return Err(ObjectLogError::Sequencer("previously observed conditional index vanished or requires legacy migration".into()));
                     }
                     (
@@ -494,7 +488,22 @@ impl ManifestSequencer {
         ))
     }
 
-    /// Install `partition`'s durable index, if any, and return it.
+    /// Cached durable observation or legacy history forbids treating absence as new.
+    fn has_known_history(&self, partition: &PartitionKey) -> bool {
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .parts
+            .get(partition)
+            .is_some_and(|part| {
+                part.observed.is_some()
+                    || part.next_offset != 0
+                    || part.log_start != 0
+                    || !part.entries.is_empty()
+            })
+    }
+
+    /// Install `partition`'s validated durable index, if any, and return it.
     fn reload_partition(
         &self,
         partition: &PartitionKey,
@@ -825,6 +834,29 @@ impl Sequencer for ManifestSequencer {
                 current,
             },
             _ => ObjectLogError::Sequencer(reason),
+        }
+    }
+
+    fn authoritative_partition_state(
+        &self,
+        partition: &PartitionKey,
+    ) -> Result<AuthoritativePartitionState, ObjectLogError> {
+        let _commit = self.commit_order.lock().expect("poisoned");
+        match self.reload_partition(partition)? {
+            Some((doc, _)) => Ok(AuthoritativePartitionState {
+                epoch: doc.epoch,
+                log_start: doc.log_start,
+                next_offset: doc.next_offset,
+            }),
+            None if self.has_known_history(partition) => Err(ObjectLogError::Sequencer(
+                "previously observed authoritative index vanished or requires legacy migration"
+                    .into(),
+            )),
+            None => Ok(AuthoritativePartitionState {
+                epoch: 0,
+                log_start: 0,
+                next_offset: 0,
+            }),
         }
     }
 

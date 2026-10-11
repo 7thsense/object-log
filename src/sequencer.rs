@@ -19,6 +19,17 @@ impl PartitionKey {
     }
 }
 
+/// Point-in-time durable bounds; grants no exclusivity or pinned history view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthoritativePartitionState {
+    /// Durable writer fence, or zero for genuinely unseen state.
+    pub epoch: u64,
+    /// First readable logical offset.
+    pub log_start: i64,
+    /// Next logical offset to assign.
+    pub next_offset: i64,
+}
+
 /// Where a batch's bytes live inside its object. **Authored by the engine** (it
 /// owns object layout); the sequencer stores it in the index and returns it from
 /// [`Sequencer::lookup`].
@@ -240,6 +251,18 @@ pub trait Sequencer: Send + Sync {
     ) -> ObjectLogError {
         let _ = (partition, epoch);
         ObjectLogError::Sequencer(reason)
+    }
+
+    /// Read validated durable state directly; unsupported implementations fail
+    /// without invoking legacy refresh or cached getters.
+    fn authoritative_partition_state(
+        &self,
+        partition: &PartitionKey,
+    ) -> Result<AuthoritativePartitionState, ObjectLogError> {
+        let _ = partition;
+        Err(ObjectLogError::InvalidConfig(
+            "native authoritative partition state is unsupported".into(),
+        ))
     }
 
     /// Reload `partition`'s index from durable storage, so this handle sees

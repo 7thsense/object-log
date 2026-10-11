@@ -479,3 +479,66 @@ fn ambiguous_candidate_retained_away_cannot_become_definite_rejection() {
         .unwrap();
     assert!(matches!(retried[0], ConditionalCommitOutcome::Unknown(_)));
 }
+
+#[test]
+fn authoritative_state_is_fresh_and_missing_or_corrupt_history_fails_closed() {
+    let blob = ControlledCas::new();
+    let first = open(blob.clone());
+    let stale = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    let zero = object_log::AuthoritativePartitionState {
+        epoch: 0,
+        log_start: 0,
+        next_offset: 0,
+    };
+    assert_eq!(stale.authoritative_partition_state(&key).unwrap(), zero);
+    first.fence_epoch(&key, 0, 1).unwrap();
+    assert_eq!(stale.authoritative_partition_state(&key).unwrap().epoch, 1);
+    first
+        .commit_conditionally(&[batch("first", 1)], &[Some(0)])
+        .unwrap();
+    assert_eq!(
+        stale
+            .authoritative_partition_state(&key)
+            .unwrap()
+            .next_offset,
+        1
+    );
+    assert_eq!(stale.high_watermark(&key).unwrap(), 1);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let index = runtime
+        .block_on(blob.list("meta/"))
+        .unwrap()
+        .into_iter()
+        .find(|key| key != "meta/catalog")
+        .unwrap();
+    let valid = runtime.block_on(blob.get(&index)).unwrap().unwrap();
+    let mut malformed: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+    malformed["next_offset"] = serde_json::json!(99);
+    runtime
+        .block_on(blob.put(&index, Bytes::from(serde_json::to_vec(&malformed).unwrap())))
+        .unwrap();
+    assert!(stale.authoritative_partition_state(&key).is_err());
+    assert_eq!(stale.high_watermark(&key).unwrap(), 1);
+    runtime.block_on(blob.delete(&index)).unwrap();
+    assert!(stale.authoritative_partition_state(&key).is_err());
+    assert_eq!(stale.high_watermark(&key).unwrap(), 1);
+    assert!(runtime.block_on(blob.get(&index)).unwrap().is_none());
+
+    let empty_blob = ControlledCas::new();
+    let empty = open(empty_blob.clone());
+    empty.fence_epoch(&key, 0, 7).unwrap();
+    let index = runtime
+        .block_on(empty_blob.list("meta/"))
+        .unwrap()
+        .into_iter()
+        .find(|key| key != "meta/catalog")
+        .unwrap();
+    runtime.block_on(empty_blob.delete(&index)).unwrap();
+    assert!(empty.authoritative_partition_state(&key).is_err());
+    assert!(runtime.block_on(empty_blob.get(&index)).unwrap().is_none());
+    assert!(matches!(
+        InMemorySequencer::new().authoritative_partition_state(&key),
+        Err(ObjectLogError::InvalidConfig(_))
+    ));
+}
