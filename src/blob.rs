@@ -132,6 +132,22 @@ pub trait BlobStore: Send + Sync {
         range: Range<u64>,
     ) -> Result<Option<Bytes>, ObjectLogError>;
 
+    /// Strict physical range allocation contract. Caller pre-admits requested
+    /// bytes. Must never fetch a whole object or buffer more than this range.
+    /// Bounds accumulated payload; transport chunks/headers require extra scratch.
+    /// Local blocking reads can outlive cancellation: the operation owner must
+    /// retain admission until physical completion. Unknown adapters fail closed;
+    /// legacy get_range remains compatible.
+    async fn get_range_exact(
+        &self,
+        _key: &str,
+        _range: Range<u64>,
+    ) -> Result<Option<Bytes>, ObjectLogError> {
+        Err(ObjectLogError::InvalidConfig(
+            "strict bounded range reads are not implemented by this adapter".into(),
+        ))
+    }
+
     /// List keys beginning with `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError>;
 
@@ -270,6 +286,14 @@ impl BlobStore for MemoryBlobStore {
             Some(bytes) => Ok(Some(slice_range(&bytes, range)?)),
             None => Ok(None),
         }
+    }
+
+    async fn get_range_exact(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Bytes>, ObjectLogError> {
+        self.get_range(key, range).await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError> {
@@ -479,7 +503,9 @@ impl BlobStore for LocalBlobStore {
                     range.end
                 )));
             }
-            let count = (range.end - range.start) as usize;
+            let count = usize::try_from(range.end - range.start).map_err(|_| {
+                ObjectLogError::RangeOutOfBounds("range exceeds address space".into())
+            })?;
             let mut buf = vec![0u8; count];
             f.seek(SeekFrom::Start(range.start))?;
             f.read_exact(&mut buf)?;
@@ -487,6 +513,14 @@ impl BlobStore for LocalBlobStore {
         })
         .await
         .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))?
+    }
+
+    async fn get_range_exact(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Bytes>, ObjectLogError> {
+        self.get_range(key, range).await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError> {

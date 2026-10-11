@@ -157,11 +157,16 @@ async fn concurrent_object_uploads_preserve_acknowledged_offsets_on_reopen() {
             .await
             .unwrap(),
     );
-    let mut config = FlushConfig::default();
-    config.max_batches = 1;
-    config.max_inflight_flushes = 4;
-    config.linger = Duration::ZERO;
-    config.budget.enabled = false;
+    let config = FlushConfig {
+        max_batches: 1,
+        max_inflight_flushes: 4,
+        linger: Duration::ZERO,
+        budget: object_log::BudgetConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..FlushConfig::default()
+    };
     let engine = Arc::new(LogEngine::new(
         blob.clone(),
         sequencer.clone(),

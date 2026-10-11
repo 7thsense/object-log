@@ -253,6 +253,21 @@ impl Sequencer for InMemorySequencer {
         batches: &[CommitBatch<'_, Self::Meta>],
     ) -> Result<Vec<CommitOutcome>, ObjectLogError> {
         let mut state = self.state.lock().expect("poisoned");
+        // Validate the entire input before changing any partition.
+        let mut nexts: HashMap<&PartitionKey, i64> = HashMap::new();
+        for batch in batches {
+            let next = nexts.entry(&batch.partition).or_insert_with(|| {
+                state
+                    .get(&batch.partition)
+                    .map_or(0, |part| part.next_offset)
+            });
+            if batch.record_count <= 0 || batch.location.object_id.is_empty() {
+                return Err(ObjectLogError::InvalidBatch("invalid index batch".into()));
+            }
+            *next = next
+                .checked_add(i64::from(batch.record_count))
+                .ok_or_else(|| ObjectLogError::Sequencer("index offset overflow".into()))?;
+        }
         let mut outcomes = Vec::with_capacity(batches.len());
         for cb in batches {
             let ps = state.entry(cb.partition.clone()).or_default();
@@ -343,5 +358,26 @@ impl Sequencer for InMemorySequencer {
             }
         }
         Ok(dead)
+    }
+}
+
+impl crate::BoundedSequencer for InMemorySequencer {
+    fn lookup_page(
+        &self,
+        partition: &PartitionKey,
+        offset: i64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<IndexEntry>, ObjectLogError> {
+        let state = self.state.lock().expect("poisoned");
+        if offset < state.get(partition).map_or(0, |part| part.log_start) {
+            return Err(ObjectLogError::RangeOutOfBounds(
+                "lookup precedes retained history".into(),
+            ));
+        }
+        let entries = state
+            .get(partition)
+            .map_or(&[][..], |part| part.entries.as_slice());
+        crate::bounded_lookup::page(entries, offset, max_entries, max_bytes)
     }
 }

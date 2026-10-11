@@ -21,6 +21,74 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+#[derive(Debug)]
+struct ResponseStatus {
+    status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    range: Range<u64>,
+}
+impl aws_sdk_s3::config::Intercept for ResponseStatus {
+    fn name(&self) -> &'static str {
+        "StrictRangeStatus"
+    }
+    fn read_before_transmit(
+        &self,
+        _context: &aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+        _runtime: &aws_sdk_s3::config::RuntimeComponents,
+        _config: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.status.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+    fn read_before_deserialization(
+        &self,
+        context: &aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime: &aws_sdk_s3::config::RuntimeComponents,
+        _config: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let response = context.response();
+        let status = response.status().as_u16();
+        self.status.store(status, Ordering::Relaxed);
+        // Fail before SDK error deserialization can collect an unbounded body.
+        if status != 206 {
+            return Err(Box::new(unavailable(
+                "strict range response status is not 206",
+            )));
+        }
+        let length = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.parse::<u64>().ok());
+        if length != Some(self.range.end - self.range.start) {
+            return Err(Box::new(unavailable(
+                "strict range response length differs from request",
+            )));
+        }
+        validate_content_range(response.headers().get("content-range"), &self.range)?;
+        Ok(())
+    }
+}
+fn validate_content_range(header: Option<&str>, range: &Range<u64>) -> Result<(), ObjectLogError> {
+    let invalid = || ObjectLogError::RangeOutOfBounds("invalid strict Content-Range".into());
+    let raw = header
+        .and_then(|header| header.strip_prefix("bytes "))
+        .ok_or_else(invalid)?;
+    let (bounds, total) = raw.split_once('/').ok_or_else(invalid)?;
+    let (start, end) = bounds.split_once('-').ok_or_else(invalid)?;
+    let number = |raw: &str| -> Result<u64, ObjectLogError> {
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        raw.parse().map_err(|_| invalid())
+    };
+    if number(start)? != range.start
+        || number(end)?.checked_add(1) != Some(range.end)
+        || number(total)? < range.end
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn unavailable<E: std::fmt::Display>(e: E) -> ObjectLogError {
     ObjectLogError::StorageUnavailable(e.to_string())
 }
@@ -553,6 +621,97 @@ impl BlobStore for S3BlobStore {
                 }
             }
         }
+    }
+
+    async fn get_range_exact(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Bytes>, ObjectLogError> {
+        if range.start > range.end {
+            return Err(ObjectLogError::RangeOutOfBounds(
+                "inverted strict range".into(),
+            ));
+        }
+        let count = usize::try_from(range.end - range.start).map_err(|_| {
+            ObjectLogError::RangeOutOfBounds("strict range exceeds address space".into())
+        })?;
+        if count == 0 {
+            return match self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(output) => {
+                    let len = output
+                        .content_length()
+                        .and_then(|n| u64::try_from(n).ok())
+                        .ok_or_else(|| unavailable("HEAD omitted object length"))?;
+                    if range.end > len {
+                        return Err(ObjectLogError::RangeOutOfBounds(
+                            "empty range beyond EOF".into(),
+                        ));
+                    }
+                    Ok(Some(Bytes::new()))
+                }
+                Err(error)
+                    if error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 404) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(unavailable(error)),
+            };
+        }
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let result = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes={}-{}", range.start, range.end - 1))
+            .customize()
+            .interceptor(ResponseStatus {
+                status: std::sync::Arc::clone(&status),
+                range: range.clone(),
+            })
+            .send()
+            .await;
+        let mut output = match result {
+            Ok(output) => output,
+            Err(_) if status.load(Ordering::Relaxed) == 404 => return Ok(None),
+            Err(error) => return Err(unavailable(error)),
+        };
+        if status.load(Ordering::Relaxed) != 206
+            || output
+                .content_length()
+                .and_then(|n| usize::try_from(n).ok())
+                != Some(count)
+        {
+            return Err(unavailable(
+                "strict range response must be 206 with exact length",
+            ));
+        }
+        validate_content_range(output.content_range(), &range)?;
+        let mut bytes = Vec::with_capacity(count);
+        while let Some(chunk) = output.body.try_next().await.map_err(unavailable)? {
+            if bytes
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|n| n > count)
+            {
+                return Err(unavailable("strict range body exceeds admitted length"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != count {
+            return Err(unavailable("strict range body is truncated"));
+        }
+        Ok(Some(Bytes::from(bytes)))
     }
 
     async fn compare_and_swap(

@@ -58,6 +58,10 @@ pub use budget::{BudgetConfig, BudgetMode, EffectiveKnob, EffectiveReason, Pipel
 pub use engine::{
     AppendOutcome, BufferStats, Durability, FetchedBatch, FlushConfig, LogEngine, reap_orphans,
 };
+mod bounded_fetch;
+mod bounded_lookup;
+pub use bounded_fetch::FetchPlan;
+pub use bounded_lookup::BoundedSequencer;
 pub use error::ObjectLogError;
 pub use manifest_sequencer::{IndexSnapshot, ManifestSequencer, PartitionSnapshot};
 #[cfg(feature = "s3")]

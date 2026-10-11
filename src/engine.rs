@@ -141,14 +141,23 @@ async fn put_chunks_with_retries(
     }
 }
 
-async fn get_range_with_retries(
+pub(crate) enum RangeRead {
+    Legacy,
+    Exact,
+}
+pub(crate) async fn get_range_with_retries(
     blob: &Arc<dyn BlobStore>,
     key: &str,
     range: std::ops::Range<u64>,
+    mode: RangeRead,
 ) -> Result<Option<Bytes>, ObjectLogError> {
     let mut attempt = 0usize;
     loop {
-        match blob.get_range(key, range.clone()).await {
+        let result = match mode {
+            RangeRead::Legacy => blob.get_range(key, range.clone()).await,
+            RangeRead::Exact => blob.get_range_exact(key, range.clone()).await,
+        };
+        match result {
             Ok(bytes) => return Ok(bytes),
             Err(err) if retryable_storage_error(&err) && attempt < STORAGE_RETRY_ATTEMPTS => {
                 retry_delay(attempt).await;
@@ -460,10 +469,10 @@ where
                 return Ok(());
             }
             let barrier = q.next_seq - 1;
-            if let Some((sequence, error)) = &q.first_failed {
-                if *sequence <= barrier {
-                    return Err(error.clone());
-                }
+            if let Some((sequence, error)) = &q.first_failed
+                && *sequence <= barrier
+            {
+                return Err(error.clone());
             }
             if q.completed_through >= barrier && q.items.is_empty() && q.bytes_in_use == 0 {
                 return Ok(());
@@ -552,9 +561,14 @@ where
     async fn load_entry(&self, e: &IndexEntry) -> Result<FetchedBatch, ObjectLogError> {
         let start = e.location.byte_start as u64;
         let end = start + e.location.byte_len as u64;
-        let bytes = get_range_with_retries(&self.blob, &e.location.object_id, start..end)
-            .await?
-            .ok_or_else(|| ObjectLogError::MissingObject(e.location.object_id.clone()))?;
+        let bytes = get_range_with_retries(
+            &self.blob,
+            &e.location.object_id,
+            start..end,
+            RangeRead::Legacy,
+        )
+        .await?
+        .ok_or_else(|| ObjectLogError::MissingObject(e.location.object_id.clone()))?;
         Ok(FetchedBatch {
             base_offset: e.base_offset,
             record_count: e.record_count,
@@ -871,35 +885,35 @@ fn flush_loop<S>(
             made_progress = true;
         }
 
-        if committing.is_none() {
-            if let Some(work) = take_ready_commit_group(&mut pending, commit_group_limit) {
-                if max_inflight == 1 {
-                    // Preserve the low-overhead single-flight path.
-                    let released = finish_flush_work(&shared, &blob, &sequencer, work);
-                    let mut q = shared.queue.lock().expect("poisoned");
-                    q.bytes_in_use = q.bytes_in_use.saturating_sub(released);
-                    shared.cv.notify_all();
-                } else {
-                    // One ordered committer; uploads can progress during its
-                    // durable manifest I/O. Bytes remain charged until completion.
-                    let first_seq = work
-                        .batch
-                        .iter()
-                        .map(|p| p.seq)
-                        .min()
-                        .unwrap_or(work.max_seq);
-                    let shared = shared.clone();
-                    let blob = blob.clone();
-                    let sequencer = sequencer.clone();
-                    committing = Some(CommitJob {
-                        task: rt.spawn_blocking(move || {
-                            finish_flush_work(&shared, &blob, &sequencer, work)
-                        }),
-                        first_seq,
-                    });
-                }
-                made_progress = true;
+        if committing.is_none()
+            && let Some(work) = take_ready_commit_group(&mut pending, commit_group_limit)
+        {
+            if max_inflight == 1 {
+                // Preserve the low-overhead single-flight path.
+                let released = finish_flush_work(&shared, &blob, &sequencer, work);
+                let mut q = shared.queue.lock().expect("poisoned");
+                q.bytes_in_use = q.bytes_in_use.saturating_sub(released);
+                shared.cv.notify_all();
+            } else {
+                // One ordered committer; uploads can progress during its
+                // durable manifest I/O. Bytes remain charged until completion.
+                let first_seq = work
+                    .batch
+                    .iter()
+                    .map(|p| p.seq)
+                    .min()
+                    .unwrap_or(work.max_seq);
+                let shared = shared.clone();
+                let blob = blob.clone();
+                let sequencer = sequencer.clone();
+                committing = Some(CommitJob {
+                    task: rt.spawn_blocking(move || {
+                        finish_flush_work(&shared, &blob, &sequencer, work)
+                    }),
+                    first_seq,
+                });
             }
+            made_progress = true;
         }
 
         if pending.is_empty() && committing.is_none() {
@@ -1444,15 +1458,13 @@ mod ready_commit_group_tests {
     use async_trait::async_trait;
     use std::ops::Range;
 
-    fn work(
-        n: u64,
-        durability: Durability,
-    ) -> (
+    type WorkFixture = (
         FlushWork<()>,
         String,
         Vec<Bytes>,
         oneshot::Receiver<Result<AppendOutcome, ObjectLogError>>,
-    ) {
+    );
+    fn work(n: u64, durability: Durability) -> WorkFixture {
         let (tx, rx) = oneshot::channel();
         let (mut work, key, chunks) = prepare_flush_work(
             "data/",
@@ -1622,8 +1634,13 @@ mod ready_commit_group_tests {
             let bytes = group.bytes;
             assert_eq!(group.data_objects, 3);
             let (flush_tx, mut flush_rx) = oneshot::channel();
-            let mut config = FlushConfig::default();
-            config.budget.enabled = false;
+            let config = FlushConfig {
+                budget: BudgetConfig {
+                    enabled: false,
+                    ..BudgetConfig::default()
+                },
+                ..FlushConfig::default()
+            };
             let shared: Arc<Shared<()>> = Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     items: VecDeque::new(),
@@ -1724,11 +1741,16 @@ mod ready_commit_group_tests {
                 .await
                 .unwrap(),
         );
-        let mut config = FlushConfig::default();
-        config.max_batches = 1;
-        config.max_inflight_flushes = 4;
-        config.linger = Duration::ZERO;
-        config.budget.enabled = false;
+        let config = FlushConfig {
+            max_batches: 1,
+            max_inflight_flushes: 4,
+            linger: Duration::ZERO,
+            budget: BudgetConfig {
+                enabled: false,
+                ..BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        };
         let engine = Arc::new(LogEngine::new(blob.clone(), sequencer, config, "data/"));
         let first = {
             let engine = engine.clone();
@@ -1799,13 +1821,17 @@ mod ready_commit_group_tests {
                 .await
                 .unwrap(),
         );
-        let mut config = FlushConfig::default();
-        config.max_bytes = 4;
-        config.max_buffered_bytes = 4;
-        config.max_batches = 1;
-        config.max_inflight_flushes = 4;
-        config.linger = Duration::ZERO;
-        config.budget.enabled = false;
+        let config = FlushConfig {
+            max_bytes: 4,
+            max_buffered_bytes: 4,
+            max_batches: 1,
+            max_inflight_flushes: 4,
+            linger: Duration::ZERO,
+            budget: BudgetConfig {
+                enabled: false,
+                ..BudgetConfig::default()
+            },
+        };
         let engine = LogEngine::new(blob, sequencer, config, "data/");
         engine
             .produce(
@@ -1920,11 +1946,16 @@ mod ready_commit_group_tests {
         store
             .fail_data_listing
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut config = FlushConfig::default();
-        config.max_batches = 1;
-        config.max_inflight_flushes = 4;
-        config.linger = Duration::ZERO;
-        config.budget.enabled = false;
+        let config = FlushConfig {
+            max_batches: 1,
+            max_inflight_flushes: 4,
+            linger: Duration::ZERO,
+            budget: BudgetConfig {
+                enabled: false,
+                ..BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        };
         let engine = LogEngine::new(
             store,
             Arc::new(crate::InMemorySequencer::new()),
@@ -1975,11 +2006,16 @@ mod ready_commit_group_tests {
             panic_on_commit: false,
         })));
         let b_blob = Arc::new(FailureInjectingStore::new(Arc::new(MemoryBlobStore::new())));
-        let mut config = FlushConfig::default();
-        config.max_batches = 1;
-        config.max_inflight_flushes = 4;
-        config.linger = Duration::ZERO;
-        config.budget.enabled = false;
+        let config = FlushConfig {
+            max_batches: 1,
+            max_inflight_flushes: 4,
+            linger: Duration::ZERO,
+            budget: BudgetConfig {
+                enabled: false,
+                ..BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        };
         let a_seq = Arc::new(
             ManifestSequencer::open(a_blob.clone(), "manifest/")
                 .await
@@ -2064,11 +2100,16 @@ mod ready_commit_group_tests {
             panic_on_commit: true,
         })));
         *store.second_upload_gate.lock().unwrap() = Some((upload_entered_tx, upload_release_rx));
-        let mut config = FlushConfig::default();
-        config.max_batches = 1;
-        config.max_inflight_flushes = 4;
-        config.linger = Duration::ZERO;
-        config.budget.enabled = false;
+        let config = FlushConfig {
+            max_batches: 1,
+            max_inflight_flushes: 4,
+            linger: Duration::ZERO,
+            budget: BudgetConfig {
+                enabled: false,
+                ..BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        };
         let sequencer = Arc::new(
             ManifestSequencer::open(store.clone(), "manifest/")
                 .await
@@ -2183,11 +2224,16 @@ mod ready_commit_group_tests {
                 .await
                 .unwrap(),
         );
-        let mut config = FlushConfig::default();
-        config.max_batches = 1;
-        config.max_inflight_flushes = 4;
-        config.linger = Duration::ZERO;
-        config.budget.enabled = false;
+        let config = FlushConfig {
+            max_batches: 1,
+            max_inflight_flushes: 4,
+            linger: Duration::ZERO,
+            budget: BudgetConfig {
+                enabled: false,
+                ..BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        };
         let engine = LogEngine::new(blob.clone(), sequencer, config, "data/");
         engine
             .produce(
@@ -2258,11 +2304,16 @@ mod ready_commit_group_tests {
                 .await
                 .unwrap(),
         );
-        let mut config = FlushConfig::default();
-        config.max_batches = 1;
-        config.max_inflight_flushes = 4;
-        config.linger = Duration::ZERO;
-        config.budget.enabled = false;
+        let config = FlushConfig {
+            max_batches: 1,
+            max_inflight_flushes: 4,
+            linger: Duration::ZERO,
+            budget: BudgetConfig {
+                enabled: false,
+                ..BudgetConfig::default()
+            },
+            ..FlushConfig::default()
+        };
         let engine = Arc::new(LogEngine::new(blob, sequencer, config, "data/"));
         let first = {
             let engine = engine.clone();
@@ -2339,11 +2390,16 @@ mod ready_commit_group_tests {
                     .await
                     .unwrap(),
             );
-            let mut config = FlushConfig::default();
-            config.max_batches = 1;
-            config.max_inflight_flushes = 4;
-            config.linger = Duration::ZERO;
-            config.budget.enabled = false;
+            let config = FlushConfig {
+                max_batches: 1,
+                max_inflight_flushes: 4,
+                linger: Duration::ZERO,
+                budget: BudgetConfig {
+                    enabled: false,
+                    ..BudgetConfig::default()
+                },
+                ..FlushConfig::default()
+            };
             let seed = LogEngine::new(seed_blob, seed_sequencer, config, "data/");
             seed.produce(
                 PartitionKey("p".into()),

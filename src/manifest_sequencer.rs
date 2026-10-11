@@ -93,7 +93,7 @@ impl ManifestSequencer {
                 let doc: PartitionIndexDoc = serde_json::from_slice(&doc_bytes).map_err(|e| {
                     ObjectLogError::Sequencer(format!("partition index {name}: {e}"))
                 })?;
-                parts.insert(PartitionKey(name.clone()), Part::from_doc(doc, doc_bytes));
+                parts.insert(PartitionKey(name.clone()), Part::from_doc(doc, doc_bytes)?);
             }
             let counter = parts.len() as u64;
             (parts, Some(catalog_bytes), counter)
@@ -113,7 +113,7 @@ impl ManifestSequencer {
                 };
                 for (pkey, entry) in rec.entries {
                     let p = parts.entry(pkey).or_default();
-                    let end = entry.base_offset + entry.record_count as i64;
+                    let end = crate::bounded_lookup::entry_end(&entry)?;
                     if end > p.next_offset {
                         p.next_offset = end;
                     }
@@ -122,6 +122,9 @@ impl ManifestSequencer {
             }
             (parts, None, keys.len() as u64)
         };
+        for part in parts.values() {
+            crate::bounded_lookup::validate_index(&part.entries, part.log_start, part.next_offset)?;
+        }
         let rt = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -270,17 +273,26 @@ impl ManifestSequencer {
                 base_offset: entry.base_offset,
                 record_count: entry.record_count,
             });
-            doc.next_offset += i64::from(batch.record_count);
+            if batch.record_count <= 0 {
+                return Err(ObjectLogError::InvalidBatch(
+                    "invalid index record count".into(),
+                ));
+            }
+            doc.next_offset = doc
+                .next_offset
+                .checked_add(i64::from(batch.record_count))
+                .ok_or_else(|| ObjectLogError::Sequencer("index offset overflow".into()))?;
             planned.push(entry.clone());
             doc.entries.push(entry);
         }
+        crate::bounded_lookup::validate_index(&doc.entries, doc.log_start, doc.next_offset)?;
         let new_bytes = Bytes::from(
             serde_json::to_vec(&doc)
                 .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
         );
         match self.cas(&self.index_key(partition), observed, new_bytes.clone())? {
             CasOutcome::Stored => {
-                self.install_doc(partition, &doc, new_bytes);
+                self.install_doc(partition, &doc, new_bytes)?;
                 Ok(outcomes)
             }
             CasOutcome::Conflict { current } => {
@@ -290,7 +302,7 @@ impl ManifestSequencer {
                     let already = planned
                         .iter()
                         .all(|entry| found.entries.iter().any(|have| have == entry));
-                    self.install_doc(partition, &found, bytes);
+                    self.install_doc(partition, &found, bytes)?;
                     if already {
                         return Ok(outcomes);
                     }
@@ -313,11 +325,17 @@ impl ManifestSequencer {
         };
         let doc: PartitionIndexDoc = serde_json::from_slice(&bytes)
             .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?;
-        self.install_doc(partition, &doc, bytes.clone());
+        self.install_doc(partition, &doc, bytes.clone())?;
         Ok(Some((doc, bytes)))
     }
 
-    fn install_doc(&self, partition: &PartitionKey, doc: &PartitionIndexDoc, observed: Bytes) {
+    fn install_doc(
+        &self,
+        partition: &PartitionKey,
+        doc: &PartitionIndexDoc,
+        observed: Bytes,
+    ) -> Result<(), ObjectLogError> {
+        crate::bounded_lookup::validate_index(&doc.entries, doc.log_start, doc.next_offset)?;
         let mut inner = self.inner.lock().expect("poisoned");
         inner.parts.insert(
             partition.clone(),
@@ -329,6 +347,7 @@ impl ManifestSequencer {
                 observed: Some(observed),
             },
         );
+        Ok(())
     }
 
     /// Object ids referenced by any live index entry (for orphan reaping).
@@ -407,6 +426,12 @@ impl Sequencer for ManifestSequencer {
         let _commit = self.commit_order.lock().expect("poisoned");
         if batches.is_empty() {
             return Ok(Vec::new());
+        }
+        if batches
+            .iter()
+            .any(|batch| batch.record_count <= 0 || batch.location.object_id.is_empty())
+        {
+            return Err(ObjectLogError::InvalidBatch("invalid index batch".into()));
         }
         let mut order: Vec<PartitionKey> = Vec::new();
         let mut groups: HashMap<PartitionKey, Vec<usize>> = HashMap::new();
@@ -505,7 +530,7 @@ impl Sequencer for ManifestSequencer {
             );
             match self.cas(&self.index_key(partition), observed, new_bytes.clone())? {
                 CasOutcome::Stored => {
-                    self.install_doc(partition, &doc, new_bytes);
+                    self.install_doc(partition, &doc, new_bytes)?;
                     return Ok(());
                 }
                 // A concurrent commit or fence moved the index; re-read and retry.
@@ -634,7 +659,7 @@ impl Sequencer for ManifestSequencer {
                     .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
             );
             match self.cas(&self.index_key(partition), observed, new_bytes.clone())? {
-                CasOutcome::Stored => self.install_doc(partition, &doc, new_bytes),
+                CasOutcome::Stored => self.install_doc(partition, &doc, new_bytes)?,
                 CasOutcome::Conflict { .. } => {
                     return Err(ObjectLogError::Sequencer(format!(
                         "partition {} truncate lost the compare-and-swap",
@@ -671,14 +696,15 @@ impl Sequencer for ManifestSequencer {
 }
 
 impl Part {
-    fn from_doc(doc: PartitionIndexDoc, observed: Bytes) -> Self {
-        Self {
+    fn from_doc(doc: PartitionIndexDoc, observed: Bytes) -> Result<Self, ObjectLogError> {
+        crate::bounded_lookup::validate_index(&doc.entries, doc.log_start, doc.next_offset)?;
+        Ok(Self {
             next_offset: doc.next_offset,
             log_start: doc.log_start,
             epoch: doc.epoch,
             entries: doc.entries,
             observed: Some(observed),
-        }
+        })
     }
 }
 
@@ -693,6 +719,28 @@ fn index_object_key(prefix: &str, partition: &str) -> String {
 fn reject_all(count: usize, reason: impl Into<String>) -> Vec<CommitOutcome> {
     let reason = reason.into();
     vec![CommitOutcome::Rejected { reason }; count]
+}
+
+impl crate::BoundedSequencer for ManifestSequencer {
+    fn lookup_page(
+        &self,
+        partition: &PartitionKey,
+        offset: i64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<IndexEntry>, ObjectLogError> {
+        let state = self.inner.lock().expect("poisoned");
+        if offset < state.parts.get(partition).map_or(0, |part| part.log_start) {
+            return Err(ObjectLogError::RangeOutOfBounds(
+                "lookup precedes retained history".into(),
+            ));
+        }
+        let entries = state
+            .parts
+            .get(partition)
+            .map_or(&[][..], |part| part.entries.as_slice());
+        crate::bounded_lookup::page(entries, offset, max_entries, max_bytes)
+    }
 }
 
 #[cfg(test)]
