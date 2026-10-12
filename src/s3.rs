@@ -12,6 +12,8 @@ use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
     timeout::TimeoutConfig,
 };
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::{Bytes, BytesMut};
@@ -93,9 +95,15 @@ fn unavailable<E: std::fmt::Display>(e: E) -> ObjectLogError {
     ObjectLogError::StorageUnavailable(e.to_string())
 }
 
-fn s3_precondition_failed(err: &impl std::fmt::Display) -> bool {
-    let text = err.to_string().to_ascii_lowercase();
-    text.contains("precondition") || text.contains("412") || text.contains("conflict")
+fn s3_precondition_failed(err: &SdkError<PutObjectError>) -> bool {
+    err.raw_response()
+        .is_some_and(|response| response.status().as_u16() == 412)
+        || err.as_service_error().is_some_and(|service| {
+            matches!(
+                service.meta().code(),
+                Some("PreconditionFailed" | "ConditionalRequestConflict")
+            )
+        })
 }
 
 fn transient_s3(err: &impl std::fmt::Display) -> bool {
@@ -740,8 +748,17 @@ impl BlobStore for S3BlobStore {
         } else {
             request.if_none_match("*")
         };
+        // A lost conditional-write reply is ambiguous. SDK retry could turn a
+        // stored first attempt into a rejected second attempt; it must not be
+        // exposed as definite Conflict. The native sequencer reconciles errors.
+        let request =
+            request
+                .customize()
+                .config_override(aws_sdk_s3::config::Builder::new().retry_config(
+                    aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+                ));
         let request = if self.disable_payload_signing {
-            request.customize().disable_payload_signing().send().await
+            request.disable_payload_signing().send().await
         } else {
             request.send().await
         };
