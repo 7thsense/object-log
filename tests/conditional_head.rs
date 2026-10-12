@@ -51,7 +51,15 @@ impl BlobStore for ControlledCas {
         self.inner.put(key, value).await
     }
     async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {
-        self.inner.get(key).await
+        let value = self.inner.get(key).await?;
+        if key == "meta/catalog" && self.mode.load(Ordering::SeqCst) == 13 && value.is_none() {
+            // Another creator registers then loses its index after this
+            // handle's absence snapshot, before its registration CAS.
+            self.inner
+                .put(key, Bytes::from_static(br#"{"partitions":["queue"]}"#))
+                .await?;
+        }
+        Ok(value)
     }
     async fn get_range(
         &self,
@@ -85,6 +93,32 @@ impl BlobStore for ControlledCas {
             if call < 2 {
                 self.barrier.wait();
             }
+        }
+        if self.mode.load(Ordering::SeqCst) == 14
+            && doc.as_ref().is_some_and(|doc| doc.get("epoch").is_some())
+        {
+            return Err(ObjectLogError::StorageUnavailable(
+                "index publication failed".into(),
+            ));
+        }
+        if matches!(self.mode.load(Ordering::SeqCst), 16..=18) && key == "meta/catalog" {
+            self.inner
+                .compare_and_swap(key, expected, new.clone())
+                .await?;
+            self.inner.delete(key).await?;
+            return Ok(CasOutcome::Conflict {
+                current: match self.mode.load(Ordering::SeqCst) {
+                    16 => Some(new),
+                    17 => None,
+                    _ => Some(Bytes::from_static(b"{broken")),
+                },
+            });
+        }
+        if self.mode.load(Ordering::SeqCst) == 15 && key == "meta/catalog" {
+            self.inner.compare_and_swap(key, expected, new).await?;
+            return Err(ObjectLogError::StorageUnavailable(
+                "catalog reply lost".into(),
+            ));
         }
         if matches!(self.mode.load(Ordering::SeqCst), 10..=12)
             && doc.as_ref().is_some_and(|doc| doc.get("epoch").is_some())
@@ -575,6 +609,7 @@ fn native_epoch_acquisitions_are_distinct_and_return_matching_replay_bounds() {
     let first = open(blob.clone());
     let second = open(blob.clone());
     let key = PartitionKey("queue".into());
+    first.acquire_authoritative_epoch(&key).unwrap();
     blob.mode.store(9, Ordering::SeqCst);
     let a = std::thread::spawn(move || {
         first
@@ -588,7 +623,7 @@ fn native_epoch_acquisitions_are_distinct_and_return_matching_replay_bounds() {
     });
     let mut epochs = [a.join().unwrap(), b.join().unwrap()];
     epochs.sort_by_key(|state| state.epoch);
-    assert_eq!((epochs[0].epoch, epochs[1].epoch), (1, 2));
+    assert_eq!((epochs[0].epoch, epochs[1].epoch), (2, 3));
     assert!(
         epochs
             .iter()
@@ -596,20 +631,20 @@ fn native_epoch_acquisitions_are_distinct_and_return_matching_replay_bounds() {
     );
     blob.mode.store(0, Ordering::SeqCst);
     let seq = open(blob.clone());
-    seq.commit_conditionally(&[batch("first", 2)], &[Some(0)])
+    seq.commit_conditionally(&[batch("first", 3)], &[Some(0)])
         .unwrap();
     let acquired = seq.acquire_authoritative_epoch(&key).unwrap();
     assert_eq!(
         acquired,
         object_log::AuthoritativePartitionState {
-            epoch: 3,
+            epoch: 4,
             log_start: 0,
             next_offset: 1
         }
     );
     assert_eq!(seq.lookup(&key, 0).unwrap()[0].location.object_id, "first");
     assert!(matches!(
-        seq.commit_conditionally(&[batch("stale", 2)], &[Some(1)])
+        seq.commit_conditionally(&[batch("stale", 3)], &[Some(1)])
             .unwrap()[0],
         ConditionalCommitOutcome::Committed(CommitOutcome::Rejected { .. })
     ));
@@ -691,4 +726,170 @@ fn epoch_conflict_then_disappearance_never_recreates_unseen_index() {
             vec!["meta/catalog".to_string()]
         );
     }
+}
+
+#[test]
+fn catalog_known_missing_authority_fails_for_cold_and_long_lived_handles() {
+    let blob = ControlledCas::new();
+    let stale = open(blob.clone());
+    let writer = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    writer.acquire_authoritative_epoch(&key).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let index = runtime
+        .block_on(blob.list("meta/"))
+        .unwrap()
+        .into_iter()
+        .find(|key| key != "meta/catalog")
+        .unwrap();
+    runtime.block_on(blob.delete(&index)).unwrap();
+    let cold = open(blob.clone());
+    for reader in [&stale, &cold] {
+        assert!(reader.authoritative_partition_state(&key).is_err());
+        assert!(reader.acquire_authoritative_epoch(&key).is_err());
+        assert!(matches!(
+            reader
+                .commit_conditionally(&[batch("later", 1)], &[Some(0)])
+                .unwrap()[0],
+            ConditionalCommitOutcome::Unknown(_)
+        ));
+        assert!(runtime.block_on(blob.get(&index)).unwrap().is_none());
+    }
+    runtime.block_on(blob.delete("meta/catalog")).unwrap();
+    cold.acquire_authoritative_epoch(&PartitionKey("unrelated".into()))
+        .unwrap();
+    for reader in [&stale, &cold] {
+        assert!(reader.authoritative_partition_state(&key).is_err());
+        assert!(reader.acquire_authoritative_epoch(&key).is_err());
+        assert!(runtime.block_on(blob.get(&index)).unwrap().is_none());
+    }
+}
+
+#[test]
+fn raced_catalog_registration_never_recreates_missing_authority() {
+    for conditional in [false, true] {
+        let blob = ControlledCas::new();
+        let seq = open(blob.clone());
+        let key = PartitionKey("queue".into());
+        blob.mode.store(13, Ordering::SeqCst);
+        if conditional {
+            assert!(matches!(
+                seq.commit_conditionally(&[batch("new", 1)], &[Some(0)])
+                    .unwrap()[0],
+                ConditionalCommitOutcome::Unknown(_)
+            ));
+        } else {
+            assert!(seq.acquire_authoritative_epoch(&key).is_err());
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            runtime.block_on(blob.list("meta/")).unwrap(),
+            vec!["meta/catalog".to_string()]
+        );
+    }
+}
+
+#[test]
+fn rejected_first_condition_does_not_register_or_poison_new_partition() {
+    let blob = ControlledCas::new();
+    let seq = open(blob.clone());
+    assert!(matches!(
+        seq.commit_conditionally(&[batch("rejected", 1)], &[Some(1)])
+            .unwrap()[0],
+        ConditionalCommitOutcome::HeadRejected { current: 0, .. }
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    assert!(runtime.block_on(blob.list("meta/")).unwrap().is_empty());
+    assert!(matches!(
+        seq.commit_conditionally(&[batch("accepted", 1)], &[Some(0)])
+            .unwrap()[0],
+        ConditionalCommitOutcome::Committed(CommitOutcome::Assigned { base_offset: 0, .. })
+    ));
+    let cold = open(blob);
+    assert_eq!(
+        cold.authoritative_partition_state(&PartitionKey("queue".into()))
+            .unwrap()
+            .next_offset,
+        1
+    );
+}
+
+#[test]
+fn attempted_native_catalog_publication_retains_evidence_after_deletion() {
+    for mode in [14, 15] {
+        let blob = ControlledCas::new();
+        let seq = open(blob.clone());
+        let key = PartitionKey("queue".into());
+        blob.mode.store(mode, Ordering::SeqCst);
+        assert!(matches!(
+            seq.commit_conditionally(&[batch("first", 1)], &[Some(0)])
+                .unwrap()[0],
+            ConditionalCommitOutcome::Unknown(_)
+        ));
+        blob.mode.store(0, Ordering::SeqCst);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(blob.delete("meta/catalog")).unwrap();
+        assert!(seq.authoritative_partition_state(&key).is_err());
+        assert!(seq.acquire_authoritative_epoch(&key).is_err());
+        assert!(matches!(
+            seq.commit_conditionally(&[batch("retry", 1)], &[Some(0)])
+                .unwrap()[0],
+            ConditionalCommitOutcome::Unknown(_)
+        ));
+        assert!(runtime.block_on(blob.list("meta/")).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn catalog_conflict_then_disappearance_never_recreates_authority() {
+    for mode in [16, 17, 18] {
+        for conditional in [false, true] {
+            let blob = ControlledCas::new();
+            let seq = open(blob.clone());
+            let key = PartitionKey("queue".into());
+            blob.mode.store(mode, Ordering::SeqCst);
+            if conditional {
+                assert!(matches!(
+                    seq.commit_conditionally(&[batch("first", 1)], &[Some(0)])
+                        .unwrap()[0],
+                    ConditionalCommitOutcome::Unknown(_)
+                ));
+            } else {
+                assert!(seq.acquire_authoritative_epoch(&key).is_err());
+            }
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            assert!(runtime.block_on(blob.list("meta/")).unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn observed_malformed_index_cannot_become_unseen_after_deletion() {
+    let blob = ControlledCas::new();
+    let stale = open(blob.clone());
+    let writer = open(blob.clone());
+    let key = PartitionKey("queue".into());
+    writer.acquire_authoritative_epoch(&key).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let index = runtime
+        .block_on(blob.list("meta/"))
+        .unwrap()
+        .into_iter()
+        .find(|key| key != "meta/catalog")
+        .unwrap();
+    runtime
+        .block_on(blob.put(&index, Bytes::from_static(b"{broken")))
+        .unwrap();
+    assert!(stale.authoritative_partition_state(&key).is_err());
+    runtime.block_on(blob.delete(&index)).unwrap();
+    runtime.block_on(blob.delete("meta/catalog")).unwrap();
+    assert!(stale.authoritative_partition_state(&key).is_err());
+    assert!(stale.acquire_authoritative_epoch(&key).is_err());
+    assert!(matches!(
+        stale
+            .commit_conditionally(&[batch("retry", 1)], &[Some(0)])
+            .unwrap()[0],
+        ConditionalCommitOutcome::Unknown(_)
+    ));
+    assert!(runtime.block_on(blob.list("meta/")).unwrap().is_empty());
 }

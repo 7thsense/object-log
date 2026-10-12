@@ -136,7 +136,7 @@ impl ManifestSequencer {
             rt: Some(rt),
             commit_order: Mutex::new(()),
             inner: Mutex::new(Inner {
-                uncertain_epochs: HashSet::new(),
+                uncertain_epochs: parts.keys().cloned().collect(),
                 parts,
                 counter,
                 catalog,
@@ -172,7 +172,7 @@ impl ManifestSequencer {
         self.block_on(self.blob.compare_and_swap(key, expected, new_value))
     }
 
-    fn ensure_catalog(&self, partitions: &[PartitionKey]) -> Result<(), ObjectLogError> {
+    fn ensure_catalog(&self, partitions: &[PartitionKey]) -> Result<bool, ObjectLogError> {
         let key = self.catalog_key();
         for _ in 0..8 {
             let current = self.read_object(&key)?;
@@ -183,6 +183,13 @@ impl ManifestSequencer {
             } else {
                 Vec::new()
             };
+            // Catalog observations remain known even if a later snapshot
+            // loses membership or the catalog itself is deleted.
+            self.inner
+                .lock()
+                .expect("poisoned")
+                .uncertain_epochs
+                .extend(names.iter().cloned().map(PartitionKey));
             let mut changed = false;
             for partition in partitions {
                 if !names.iter().any(|name| name == partition.as_str()) {
@@ -192,7 +199,7 @@ impl ManifestSequencer {
             }
             if !changed {
                 self.inner.lock().expect("poisoned").catalog = current;
-                return Ok(());
+                return Ok(false);
             }
             names.sort();
             names.dedup();
@@ -200,12 +207,58 @@ impl ManifestSequencer {
                 serde_json::to_vec(&IndexCatalog { partitions: names })
                     .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
             );
-            match self.cas(&key, current, new_bytes.clone())? {
+            self.inner
+                .lock()
+                .expect("poisoned")
+                .uncertain_epochs
+                .extend(partitions.iter().cloned());
+            match self
+                .cas(&key, current, new_bytes.clone())
+                .inspect_err(|_| {
+                    self.inner
+                        .lock()
+                        .expect("poisoned")
+                        .uncertain_epochs
+                        .extend(partitions.iter().cloned());
+                })? {
                 CasOutcome::Stored => {
-                    self.inner.lock().expect("poisoned").catalog = Some(new_bytes);
-                    return Ok(());
+                    let mut inner = self.inner.lock().expect("poisoned");
+                    inner.uncertain_epochs.extend(partitions.iter().cloned());
+                    inner.catalog = Some(new_bytes);
+                    return Ok(true);
                 }
-                CasOutcome::Conflict { .. } => continue,
+                CasOutcome::Conflict {
+                    current: Some(bytes),
+                } => {
+                    let catalog: IndexCatalog =
+                        serde_json::from_slice(&bytes).map_err(|error| {
+                            ObjectLogError::Sequencer(format!("conflicting catalog: {error}"))
+                        })?;
+                    let registered = partitions.iter().all(|partition| {
+                        catalog
+                            .partitions
+                            .iter()
+                            .any(|name| name == partition.as_str())
+                    });
+                    let mut inner = self.inner.lock().expect("poisoned");
+                    inner
+                        .uncertain_epochs
+                        .extend(catalog.partitions.into_iter().map(PartitionKey));
+                    inner.catalog = Some(bytes);
+                    if registered {
+                        return Ok(false);
+                    }
+                }
+                CasOutcome::Conflict { current: None } => {
+                    self.inner
+                        .lock()
+                        .expect("poisoned")
+                        .uncertain_epochs
+                        .extend(partitions.iter().cloned());
+                    return Err(ObjectLogError::StorageUnavailable(
+                        "catalog conflict lost authority".into(),
+                    ));
+                }
             }
         }
         Err(ObjectLogError::Sequencer(
@@ -328,7 +381,9 @@ impl ManifestSequencer {
             let (mut doc, observed) = match self.reload_partition(partition)? {
                 Some((doc, bytes)) => (doc, Some(bytes)),
                 None => {
-                    if self.has_known_history(partition) {
+                    if self.has_known_history(partition)
+                        || self.has_durable_catalog_entry(partition)?
+                    {
                         return Err(ObjectLogError::Sequencer("previously observed conditional index vanished or requires legacy migration".into()));
                     }
                     (
@@ -342,6 +397,9 @@ impl ManifestSequencer {
                     )
                 }
             };
+            if observed.is_some() {
+                self.ensure_catalog(std::slice::from_ref(partition))?;
+            }
             let mut outcomes = Vec::with_capacity(indexes.len());
             let mut planned = Vec::with_capacity(indexes.len());
             for index in indexes {
@@ -415,6 +473,15 @@ impl ManifestSequencer {
             }
             if planned.is_empty() {
                 return Ok(outcomes);
+            }
+            // A rejected first request must not register a catalog-only queue.
+            if observed.is_none() && !self.ensure_catalog(std::slice::from_ref(partition))? {
+                if self.reload_partition(partition)?.is_some() {
+                    continue;
+                }
+                return Err(ObjectLogError::Sequencer(
+                    "catalog-known conditional index is missing".into(),
+                ));
             }
             crate::bounded_lookup::validate_index(&doc.entries, doc.log_start, doc.next_offset)?;
             let bytes = Bytes::from(
@@ -502,6 +569,27 @@ impl ManifestSequencer {
             })
     }
 
+    /// A missing index is new only when the fresh durable catalog also omits it.
+    /// Catalog publication precedes index publication, so interrupted creation
+    /// must fail closed rather than manufacture replacement authority.
+    fn has_durable_catalog_entry(&self, partition: &PartitionKey) -> Result<bool, ObjectLogError> {
+        let Some(bytes) = self.read_object(&self.catalog_key())? else {
+            return Ok(false);
+        };
+        let catalog: IndexCatalog = serde_json::from_slice(&bytes)
+            .map_err(|error| ObjectLogError::Sequencer(format!("index catalog: {error}")))?;
+        let known = catalog
+            .partitions
+            .iter()
+            .any(|name| name == partition.as_str());
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .uncertain_epochs
+            .extend(catalog.partitions.into_iter().map(PartitionKey));
+        Ok(known)
+    }
+
     /// Install `partition`'s validated durable index, if any, and return it.
     fn reload_partition(
         &self,
@@ -510,6 +598,11 @@ impl ManifestSequencer {
         let Some(bytes) = self.read_object(&self.index_key(partition))? else {
             return Ok(None);
         };
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .uncertain_epochs
+            .insert(partition.clone());
         let doc: PartitionIndexDoc = serde_json::from_slice(&bytes)
             .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?;
         self.install_doc(partition, &doc, bytes.clone())?;
@@ -645,7 +738,6 @@ impl Sequencer for ManifestSequencer {
                 .or_default()
                 .push(index);
         }
-        self.ensure_catalog(&order)?;
         let mut outcomes = vec![None; batches.len()];
         let mut published = false;
         for partition in order {
@@ -844,7 +936,9 @@ impl Sequencer for ManifestSequencer {
         for _ in 0..8 {
             let (mut doc, observed) = match self.reload_partition(partition)? {
                 Some((doc, bytes)) => (doc, Some(bytes)),
-                None if self.has_known_history(partition) => {
+                None if self.has_known_history(partition)
+                    || self.has_durable_catalog_entry(partition)? =>
+                {
                     return Err(ObjectLogError::Sequencer(
                         "previously observed epoch index vanished or requires legacy migration"
                             .into(),
@@ -864,7 +958,18 @@ impl Sequencer for ManifestSequencer {
                 .epoch
                 .checked_add(1)
                 .ok_or_else(|| ObjectLogError::Sequencer("writer epoch exhausted".into()))?;
-            self.ensure_catalog(std::slice::from_ref(partition))?;
+            let registered = self.ensure_catalog(std::slice::from_ref(partition))?;
+            if observed.is_none() && !registered {
+                // Another creator registered after our absence check. Its
+                // surviving index may be acquired on the next iteration;
+                // missing authority must never be replaced by CAS(None).
+                if self.reload_partition(partition)?.is_some() {
+                    continue;
+                }
+                return Err(ObjectLogError::Sequencer(
+                    "catalog-known epoch index is missing".into(),
+                ));
+            }
             let bytes = Bytes::from(
                 serde_json::to_vec(&doc)
                     .map_err(|error| ObjectLogError::Sequencer(error.to_string()))?,
@@ -926,10 +1031,14 @@ impl Sequencer for ManifestSequencer {
                 log_start: doc.log_start,
                 next_offset: doc.next_offset,
             }),
-            None if self.has_known_history(partition) => Err(ObjectLogError::Sequencer(
-                "previously observed authoritative index vanished or requires legacy migration"
-                    .into(),
-            )),
+            None if self.has_known_history(partition)
+                || self.has_durable_catalog_entry(partition)? =>
+            {
+                Err(ObjectLogError::Sequencer(
+                    "previously observed authoritative index vanished or requires legacy migration"
+                        .into(),
+                ))
+            }
             None => Ok(AuthoritativePartitionState {
                 epoch: 0,
                 log_start: 0,
