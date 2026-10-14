@@ -25,6 +25,190 @@ fn xml(code: &str) -> Vec<u8> {
     format!("<Error><Code>{code}</Code><Message>precondition conflict 412</Message></Error>")
         .into_bytes()
 }
+
+#[tokio::test]
+async fn sdk_metadata_token_exact_budget_preserves_opaque_quotes_and_rejects_before_put() {
+    let token = format!("\"opaque-{}\"", "x".repeat(700));
+    for token_bytes in [token.len(), token.len() - 1] {
+        let (endpoint, stop, worker) = server(
+            response("200 OK", b"old!", Some(&token)),
+            Some(response("200 OK", b"", None)),
+            response("200 OK", b"new!", Some(&token)),
+        );
+        let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+        let limits = MetadataLimits {
+            payload_bytes: 4,
+            version_bytes: token_bytes,
+        };
+        let observed = store
+            .read_metadata("head", limits, metadata_owners(Arc::new(())))
+            .await;
+        if token_bytes == token.len() {
+            let observed = observed.unwrap();
+            assert!(
+                store
+                    .swap_metadata(
+                        "head",
+                        observed.clone(),
+                        Bytes::from_static(b"next"),
+                        MetadataLimits {
+                            version_bytes: token_bytes - 1,
+                            ..limits
+                        },
+                        metadata_owners(Arc::new(()))
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                store
+                    .swap_metadata(
+                        "head",
+                        observed,
+                        Bytes::from_static(b"next"),
+                        limits,
+                        metadata_owners(Arc::new(()))
+                    )
+                    .await
+                    .unwrap(),
+                MetadataSwap::Stored
+            ));
+        } else {
+            assert!(observed.is_err());
+        }
+        stop.store(true, Ordering::SeqCst);
+        let requests = worker.join().unwrap();
+        let puts: Vec<_> = requests
+            .iter()
+            .filter(|raw| raw.starts_with(b"PUT "))
+            .collect();
+        assert_eq!(puts.len(), usize::from(token_bytes == token.len()));
+        if let Some(put) = puts.first() {
+            let request = String::from_utf8_lossy(put);
+            let if_match = request
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("if-match"))
+                        .map(|(_, value)| value.trim())
+                })
+                .unwrap();
+            assert_eq!(
+                if_match, token,
+                "opaque token including quotes must remain exact"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sdk_oversized_conflict_token_is_unknown_without_second_conditional_write() {
+    let token = "\"version-one\"";
+    let larger = format!("\"{}\"", "z".repeat(token.len()));
+    let (endpoint, stop, worker) = server(
+        response("200 OK", b"old!", Some(token)),
+        Some(response(
+            "412 Precondition Failed",
+            &xml("PreconditionFailed"),
+            None,
+        )),
+        response("200 OK", b"new!", Some(&larger)),
+    );
+    let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+    let limits = MetadataLimits {
+        payload_bytes: 4,
+        version_bytes: token.len(),
+    };
+    let observed = store
+        .read_metadata("head", limits, metadata_owners(Arc::new(())))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .swap_metadata(
+                "head",
+                observed,
+                Bytes::from_static(b"next"),
+                limits,
+                metadata_owners(Arc::new(()))
+            )
+            .await
+            .is_err()
+    );
+    stop.store(true, Ordering::SeqCst);
+    let requests = worker.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|raw| raw.starts_with(b"PUT "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|raw| raw.starts_with(b"GET "))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn sdk_put_success_token_exact_limit_or_ambiguous_after_one_write() {
+    let token = format!("\"put-{}\"", "p".repeat(700));
+    for unsigned in [false, true] {
+        for version_bytes in [token.len(), token.len() - 1] {
+            let (endpoint, stop, worker) = server(
+                response("200 OK", b"old!", Some("\"v\"")),
+                Some(response("200 OK", b"", Some(&token))),
+                response("200 OK", b"next", Some("\"later\"")),
+            );
+            let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret")
+                .with_payload_signing_disabled(unsigned);
+            let limits = MetadataLimits {
+                payload_bytes: 4,
+                version_bytes,
+            };
+            let original = store
+                .read_metadata("head", limits, metadata_owners(Arc::new(())))
+                .await
+                .unwrap();
+            let result = store
+                .swap_metadata(
+                    "head",
+                    original,
+                    Bytes::from_static(b"next"),
+                    limits,
+                    metadata_owners(Arc::new(())),
+                )
+                .await;
+            if version_bytes == token.len() {
+                assert!(matches!(result.unwrap(), MetadataSwap::Stored));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "oversized success reply cannot establish Stored"
+                );
+            }
+            stop.store(true, Ordering::SeqCst);
+            let requests = worker.join().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with(b"PUT "))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with(b"GET "))
+                    .count(),
+                1
+            );
+        }
+    }
+}
 fn server(
     initial: Vec<u8>,
     put: Option<Vec<u8>>,
@@ -117,7 +301,13 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
             response("200 OK", b"new!", Some("\"version-two\"")),
         );
         let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
-        let observed = store.read_metadata("head", limit, Arc::new(())).await;
+        let observed = store
+            .read_metadata(
+                "head",
+                metadata_limits(limit),
+                metadata_owners(Arc::new(())),
+            )
+            .await;
         if limit == 4 {
             let observed = observed.unwrap();
             assert_eq!(observed.bytes().unwrap(), b"old!");
@@ -127,8 +317,8 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
                         "wrong",
                         observed.clone(),
                         Bytes::from_static(b"next"),
-                        4,
-                        Arc::new(())
+                        metadata_limits(4),
+                        metadata_owners(Arc::new(()))
                     )
                     .await
                     .is_err()
@@ -140,8 +330,8 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
                         "head",
                         observed.clone(),
                         Bytes::from_static(b"next"),
-                        4,
-                        Arc::new(())
+                        metadata_limits(4),
+                        metadata_owners(Arc::new(()))
                     )
                     .await
                     .is_err()
@@ -152,8 +342,8 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
                         "head",
                         observed.clone(),
                         Bytes::from_static(b"large"),
-                        4,
-                        Arc::new(())
+                        metadata_limits(4),
+                        metadata_owners(Arc::new(()))
                     )
                     .await
                     .is_err()
@@ -164,8 +354,8 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
                         "head",
                         observed,
                         Bytes::from_static(b"next"),
-                        4,
-                        Arc::new(())
+                        metadata_limits(4),
+                        metadata_owners(Arc::new(()))
                     )
                     .await
                     .unwrap(),
@@ -204,9 +394,18 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
             reread,
         );
         let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
-        let token = store.read_metadata("head", 4, Arc::new(())).await.unwrap();
+        let token = store
+            .read_metadata("head", metadata_limits(4), metadata_owners(Arc::new(())))
+            .await
+            .unwrap();
         let result = store
-            .swap_metadata("head", token, Bytes::from_static(b"next"), 4, Arc::new(()))
+            .swap_metadata(
+                "head",
+                token,
+                Bytes::from_static(b"next"),
+                metadata_limits(4),
+                metadata_owners(Arc::new(())),
+            )
             .await;
         if valid {
             assert!(
@@ -286,14 +485,9 @@ async fn sdk_native_head_root_preservation_missing_and_lost_reply() {
             puts[0]
                 .as_slice()
                 .windows(32)
-                .any(|w| w == initial.index_root)
+                .any(|w| w == initial.index_root.unwrap().hash)
         );
-        assert!(
-            puts[0]
-                .as_slice()
-                .windows(32)
-                .any(|w| w == initial.semantic_anchor)
-        );
+        assert!(puts[0].as_slice().windows(32).any(|w| w == [29; 32]));
     }
     let (endpoint, stop, worker) = server(
         response("404 Not Found", &xml("NoSuchKey"), None),
@@ -334,7 +528,10 @@ async fn sdk_native_head_conflict_floor_and_higher_fence_preserve_roots() {
             ..initial
         },
         NativeHead {
-            index_root: [31; 32],
+            index_root: Some(Descriptor {
+                hash: [31; 32],
+                ..initial.index_root.unwrap()
+            }),
             ..initial
         },
         NativeHead {
@@ -472,13 +669,21 @@ async fn sdk_metadata_rejects_unsupported_framing_before_waiting_for_bodies() {
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             if reading {
                 store
-                    .read_metadata("head", 4, Arc::new(()))
+                    .read_metadata("head", metadata_limits(4), metadata_owners(Arc::new(())))
                     .await
                     .map(|_| ())
             } else {
-                let token = store.read_metadata("head", 4, Arc::new(())).await?;
+                let token = store
+                    .read_metadata("head", metadata_limits(4), metadata_owners(Arc::new(())))
+                    .await?;
                 store
-                    .swap_metadata("head", token, Bytes::from_static(b"next"), 4, Arc::new(()))
+                    .swap_metadata(
+                        "head",
+                        token,
+                        Bytes::from_static(b"next"),
+                        metadata_limits(4),
+                        metadata_owners(Arc::new(())),
+                    )
                     .await
                     .map(|_| ())
             }
@@ -522,9 +727,18 @@ async fn sdk_bounded_writes_classify_single_attempt_in_both_signing_modes() {
             );
             let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret")
                 .with_payload_signing_disabled(disabled);
-            let token = store.read_metadata("head", 4, Arc::new(())).await.unwrap();
+            let token = store
+                .read_metadata("head", metadata_limits(4), metadata_owners(Arc::new(())))
+                .await
+                .unwrap();
             let result = store
-                .swap_metadata("head", token, Bytes::from_static(b"next"), 4, Arc::new(()))
+                .swap_metadata(
+                    "head",
+                    token,
+                    Bytes::from_static(b"next"),
+                    metadata_limits(4),
+                    metadata_owners(Arc::new(())),
+                )
                 .await;
             if success {
                 assert!(matches!(result, Ok(MetadataSwap::Stored)));
@@ -553,6 +767,7 @@ fn sdk_cancelled_response_retains_owner_in_backpressured_source_upload() {
     struct Payload {
         bytes: Vec<u8>,
         lifetime: std::sync::Weak<Lifetime>,
+        retained: std::sync::Weak<Lifetime>,
         dropped: Arc<AtomicBool>,
     }
     impl AsRef<[u8]> for Payload {
@@ -565,6 +780,10 @@ fn sdk_cancelled_response_retains_owner_in_backpressured_source_upload() {
             assert!(
                 self.lifetime.upgrade().is_some(),
                 "source upload outlived physical admission"
+            );
+            assert!(
+                self.retained.upgrade().is_some(),
+                "source upload outlived byte reservation"
             );
             self.dropped.store(true, Ordering::SeqCst);
         }
@@ -605,18 +824,38 @@ fn sdk_cancelled_response_retains_owner_in_backpressured_source_upload() {
         .unwrap();
     let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret")
         .with_payload_signing_disabled(true);
+    let retained = Arc::new(Lifetime);
+    let retained_weak = Arc::downgrade(&retained);
     let lifetime = Arc::new(Lifetime);
     let weak = Arc::downgrade(&lifetime);
     let token = runtime
-        .block_on(store.read_metadata("head", 4, lifetime.clone()))
+        .block_on(store.read_metadata(
+            "head",
+            metadata_limits(4),
+            MetadataOwners {
+                retained: retained.clone(),
+                physical: lifetime.clone(),
+            },
+        ))
         .unwrap();
+    assert!(retained_weak.upgrade().is_some());
     let dropped = Arc::new(AtomicBool::new(false));
     let bytes = Bytes::from_owner(Payload {
         bytes: vec![31; 32 << 20],
         lifetime: weak.clone(),
+        retained: retained_weak.clone(),
         dropped: dropped.clone(),
     });
-    let mut pending = Box::pin(store.swap_metadata("head", token, bytes, 32 << 20, lifetime));
+    let mut pending = Box::pin(store.swap_metadata(
+        "head",
+        token,
+        bytes,
+        metadata_limits(32 << 20),
+        MetadataOwners {
+            retained,
+            physical: lifetime,
+        },
+    ));
     runtime.block_on(async {
         tokio::select! {
             result=&mut pending => panic!("blocked upload unexpectedly completed: {result:?}"),
@@ -630,10 +869,14 @@ fn sdk_cancelled_response_retains_owner_in_backpressured_source_upload() {
         weak.upgrade().is_some(),
         "queued request source must retain its owner"
     );
+    assert!(
+        retained_weak.upgrade().is_some(),
+        "queued source must retain byte reservation"
+    );
     release_tx.send(()).unwrap();
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while weak.upgrade().is_some() {
+            while weak.upgrade().is_some() || retained_weak.upgrade().is_some() {
                 tokio::task::yield_now().await;
             }
         })

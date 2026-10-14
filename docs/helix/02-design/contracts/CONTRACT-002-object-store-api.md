@@ -8,7 +8,7 @@ ddx:
 
 # Object storage and bounded metadata authority
 
-Contract ID: CONTRACT-002. Version: v3. Status: accepted.
+Contract ID: CONTRACT-002. Version: v4. Status: accepted.
 
 The immutable data-object port remains `BlobStore`: durable put/put_chunks,
 get, range read, list, delete and media-operation accounting. Local publication
@@ -33,39 +33,55 @@ Native authority must never use that fallback.
 ## Bounded authority port
 
 `BoundedMetadataStore` is a separate required storage port with no defaults.
-Local and S3 implement `read_metadata` and `swap_metadata`. Callers supply a
-positive payload budget and a physical lifetime owner before I/O. Oversized
-input is rejected without publication. A returned snapshot binds the exact
+Local and S3 implement `read_metadata` and `swap_metadata`. Callers supply an
+explicit `MetadataLimits` with positive payload and opaque version-token byte
+bounds, plus a physical lifetime owner, before I/O. Both methods use these limits;
+Local requires 56 bytes for its fixed file-version identity. Oversized payload or
+observed token input is rejected without publication. A returned snapshot binds the exact
 adapter instance, literal key, observed version and bytes/absence; aliases
-retain payload ownership. Wrong-provider/key tokens fail before I/O.
+share one immutable allocation for payload, full key and version; cloning a
+snapshot does not copy their buffers. Wrong-provider/key tokens fail before I/O.
 
 Local reads check regular-file size before allocation and reject changes during
 read. Conditional replacement compares file identity/version and complete bytes
 under the cross-process lock, then uses durable atomic publication. A stale
 version conflicts even when replacement bytes happen to match.
 
-S3 reads validate status, Content-Length and ETag before collecting a successful
-body. Unsupported transfer/content encoding is rejected. Missing responses and
+S3 reads validate status, Content-Length and exact ETag byte length before
+successful-body collection or SDK token deserialization. Tokens preserve quotes
+and all opaque bytes; they are not interpreted as MD5. Any present ETag on a
+successful PUT is also bounded before SDK deserialization; an oversized 200
+response remains ambiguous after one conditional write. Missing PUT ETag remains
+allowed by the existing success protocol. Unsupported transfer/content encoding is rejected. Missing responses and
 412 conflicts are classified before error-body collection. Only bounded 409
 bodies enter SDK parsing, preserving exact ConditionalRequestConflict semantics.
-Every conditional PUT has one attempt. Conflict rereads use the same bound;
+Every conditional PUT has one attempt. Conflict rereads use the same payload
+and token bounds;
 transport failure, malformed/truncated response or failed conflict reread remains
 unknown, including a lost reply after possible publication. HTTP 200 alone does
 not establish success when the SDK reports an embedded error.
 
-Payload, token and upload aliases retain the supplied physical owner until their
-source bytes and version/key allocations are released. Local blocking closures
-retain it across caller/runtime cancellation. S3 source upload bytes retain it
-when the HTTP connection outlives the response future. This bounds admitted
-payloads; it does not certify all key/ETag/HTTP/TLS allocation or copied transport
-buffer lifetimes. Total resource and provider-effect qualification remain gates.
+Returned payload/token observations retain their byte reservation, independently
+of physical operation admission. Request closures and upload source bytes retain
+both owners until physical work and its source allocations finish. Local blocking
+closures preserve them across caller/runtime cancellation; S3 source uploads
+preserve them when the HTTP connection outlives the response future. Retaining a
+completed observation cannot prevent operation drain. This bounds admitted payloads and retained opaque tokens; callers also reserve
+key/provider source-copy scratch. HTTP header-parser, URI, connection/TLS,
+allocator and copied transport residency/lifetimes remain separately qualified. Total resource and provider-effect qualification remain gates.
 
 ## Fixed-head qualification boundary
 
 The test-internal head reader exercises the production port with an exact
-192-byte versioned/checksummed head: namespace and incarnation commitments,
-unsigned epoch, nonnegative signed-offset-compatible retained bounds, immutable
-index-root identity and an opaque semantic-anchor slot. Checked acquisition
+240-byte versioned/checksummed head: namespace and incarnation commitments,
+unsigned epoch, append-only signed-offset-compatible bounds, a complete 64-byte
+immutable index descriptor, and explicitly tagged semantic coverage. An empty
+index uses only the canonical zero descriptor; nonempty roots cover exactly
+[0, next_offset). Uninitialized semantic coverage contains zero coverage/root
+bytes; covered state contains a nonzero root and coverage no greater than the
+head. Unknown tags, reserved bytes, mixed uninitialized fields, and the previous
+192-byte format fail closed. The first append-only implementation publishes
+uninitialized coverage until consumer semantic publication is implemented. Checked acquisition
 increments only epoch, preserving roots/bounds exactly. Missing known authority,
 legacy JSON, scope mismatch, corrupt bytes, regressed conflict observations and
 epoch exhaustion fail closed. It cannot create heads, migrate manifests, publish
@@ -78,6 +94,48 @@ retention/reclamation are required; paging lookup alone is insufficient. Consume
 semantics stay outside the SDK. Checksums detect corruption, not authenticated
 provenance or valid-record substitution.
 
+## Captured index and immutable data
+
+The private native-v2 qualification implementation uses 4096-byte versioned
+pages. Version 2 leaf slots are 192 bytes and separately commit complete physical
+and logical identity overflow graphs, positive logical ranges, exact physical byte
+ranges, and payload SHA-256. Fixed fanout and height bounds constrain page/path
+allocation; page reads verify the complete descriptor, scope, checksum and shape.
+A captured head validates its actual root page before authorizing index reads.
+Missing or corrupt touched pages fail closed; absence requires authenticated bounds.
+
+Physical data names are bounded within disjoint scoped page/data namespaces.
+Hashes select names; they do not establish identity equality. Versioned data frames
+contain the full UTF-8 literal identity and exact payload length. Reuse compares
+complete identity and content. Captured payload reads check both authenticated
+identities, derived physical key, exact frame range, and digest. Logical identity
+length does not expand the physical filename; configured prefix/provider limits
+remain admission requirements.
+
+One store executor and byte pool serve all namespace bindings. Nested page/head
+work reuses the admitted outer operation. Returned cuts and payloads retain byte
+reservations independently of physical admission, allowing shutdown while those
+results remain alive. Conditional publication is single-attempt against the exact
+original observation. Ambiguous resolution proves original-prefix preservation
+with a bounded right-spine comparison before inspecting the exact assigned range.
+Append groups reject empty inputs, invalid counts/frames/offsets, aggregate limit
+violations, and duplicate full literal identities before immutable writes. The
+retained ordered certificates are byte-admitted before sequential frame work.
+One original head CAS publishes the complete group. Single-entry append uses the
+same preparation path. Duplicate rejection within a group does not establish
+cross-history deduplication.
+Resolution walks authenticated actual entry boundaries under an explicit proof-work
+budget, retaining any mismatch until the complete assigned range is covered.
+Merged or split competing entries may prove rejection only after full coverage;
+partial, missing, corrupt, regressed, or over-budget coverage remains unknown.
+Matching every ordered certificate proves durable content, not historical writer
+identity. Writer clones share serialized, monotonic knowledge of complete head
+prefixes and sticky revocation on a higher fence; refreshing does not reacquire
+or replace the original publication token.
+Committed and ambiguous pages remain retained; production reclamation and migration
+are unsupported. Semantic coverage is uninitialized until consumer publication is
+implemented; these index proofs do not authorize skipping Fireweed semantic replay.
+
 ## Verification
 
 Native-head tests exercise actual Local I/O and the pinned S3 SDK transport,
@@ -88,3 +146,16 @@ cleanup and backpressured upload cancellation. Hermetic HTTP controls prove the
 adapter protocol, not remote provider durability. The bounded CAS model covers
 root preservation, scope/budget admission, ambiguous outcomes and physical-owner
 release; its code mapping is documentary rather than a refinement proof.
+
+The COW gate executes a bounded independent model with a flat ghost-history oracle,
+separate storage/reply transitions, page-shape checks, completed witnesses and
+intentionally faulty variants. Reports bind the executed model/helper bytes to
+captured source hashes and invalidate old success before dependency loading.
+This is abstract tree/CAS/content-resolution evidence, not executed Rust
+correspondence, physical page reclamation, frame/provider durability, total memory,
+consumer semantic, or concrete multi-entry/fenced-writer qualification. The finite
+model includes unequal-count groups, all-or-none CAS, bounded actual-entry
+resolution, merged/split competitors, and mismatch before incomplete coverage. Physical tests and
+release performance gates remain separate obligations. S3 response-loss controls
+inject failure after validated HTTP 200 before SDK response processing; they do
+not claim TCP loss or process-crash coverage.

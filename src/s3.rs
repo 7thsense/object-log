@@ -173,6 +173,8 @@ fn shared_s3_client(
 /// S3-compatible blob store.
 pub struct S3BlobStore {
     authority_identity: std::sync::Arc<()>,
+    #[cfg(test)]
+    authority_lost_reply: std::sync::Mutex<Option<(String, std::sync::Arc<AtomicU64>)>>,
     client: Client,
     bucket: String,
     /// Objects larger than this use multipart upload.
@@ -197,6 +199,8 @@ impl S3BlobStore {
     ) -> Self {
         Self {
             authority_identity: std::sync::Arc::new(()),
+            #[cfg(test)]
+            authority_lost_reply: std::sync::Mutex::new(None),
             client: shared_s3_client(endpoint_url, region, access_key_id, secret_access_key),
             bucket: bucket.to_string(),
             multipart_threshold: 16 * 1024 * 1024,
@@ -205,6 +209,34 @@ impl S3BlobStore {
             media_ops: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
         }
+    }
+
+    // Explicit source-copy allowance for page caller/request/snapshot keys,
+    // overlapping observed/conflict tokens and bucket strings. HTTP parser,
+    // encoded URI, connection/TLS buffers and total SDK residency are separate.
+    #[cfg(test)]
+    pub(crate) fn native_page_source_scratch(
+        &self,
+        key_len: usize,
+        version_bytes: usize,
+    ) -> Result<usize, ObjectLogError> {
+        key_len
+            .checked_mul(8)
+            .and_then(|n| {
+                version_bytes
+                    .checked_mul(8)
+                    .and_then(|tokens| n.checked_add(tokens))
+            })
+            .and_then(|n| {
+                self.bucket
+                    .capacity()
+                    .checked_mul(8)
+                    .and_then(|bucket| n.checked_add(bucket))
+            })
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| {
+                ObjectLogError::InvalidConfig("native S3 source capacity overflow".into())
+            })
     }
 
     fn record_media(&self, ops: u64, bytes: u64) {

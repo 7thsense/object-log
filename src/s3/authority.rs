@@ -1,7 +1,10 @@
 //! Metadata responses are validated before SDK deserialization/body collection.
 use super::*;
 use crate::blob::authority::{MetadataVersion, validate_budget};
-use crate::{AppendOwner, BoundedMetadataStore, MetadataSnapshot, MetadataSwap};
+use crate::{
+    AppendOwner, BoundedMetadataStore, MetadataLimits, MetadataOwners, MetadataSnapshot,
+    MetadataSwap,
+};
 use std::sync::{Arc, atomic::AtomicU16};
 
 // Hyper can retain the source body after the SDK response future is dropped.
@@ -20,7 +23,10 @@ impl AsRef<[u8]> for OwnedMetadataBody {
 struct MetadataResponse {
     status: Arc<AtomicU16>,
     max_bytes: usize,
+    version_bytes: usize,
     reading: bool,
+    #[cfg(test)]
+    loss_counter: Option<Arc<AtomicU64>>,
 }
 impl aws_sdk_s3::config::Intercept for MetadataResponse {
     fn name(&self) -> &'static str {
@@ -33,6 +39,10 @@ impl aws_sdk_s3::config::Intercept for MetadataResponse {
         _config: &mut aws_sdk_s3::config::ConfigBag,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.status.store(0, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(counter) = &self.loss_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
     fn read_before_deserialization(
@@ -72,20 +82,34 @@ impl aws_sdk_s3::config::Intercept for MetadataResponse {
                 "invalid or oversized metadata response",
             )));
         }
-        if self.reading && response.headers().get("etag").is_none_or(str::is_empty) {
+        let token = response.headers().get("etag");
+        if (self.reading && token.is_none_or(str::is_empty))
+            || token.is_some_and(|token| token.len() > self.version_bytes)
+        {
             return Err(Box::new(unavailable("metadata response lacks version")));
+        }
+        #[cfg(test)]
+        if !self.reading && status == 200 && self.loss_counter.is_some() {
+            return Err(Box::new(unavailable("injected lost SDK metadata response")));
         }
         Ok(())
     }
 }
 impl S3BlobStore {
+    #[cfg(test)]
+    pub(crate) fn lose_next_metadata_reply(&self, key: &str) -> Arc<AtomicU64> {
+        let counter = Arc::new(AtomicU64::new(0));
+        *self.authority_lost_reply.lock().unwrap() = Some((key.to_owned(), counter.clone()));
+        counter
+    }
     async fn read_metadata_inner(
         &self,
         key: &str,
-        max_bytes: usize,
-        physical: AppendOwner,
+        limits: MetadataLimits,
+        owners: MetadataOwners,
     ) -> Result<MetadataSnapshot, ObjectLogError> {
-        validate_budget(max_bytes, 0)?;
+        limits.validate()?;
+        let max_bytes = limits.payload_bytes;
         let status = Arc::new(AtomicU16::new(0));
         let request = self
             .client
@@ -101,18 +125,23 @@ impl S3BlobStore {
                     .interceptor(MetadataResponse {
                         status: Arc::clone(&status),
                         max_bytes,
+                        version_bytes: limits.version_bytes,
                         reading: true,
+                        #[cfg(test)]
+                        loss_counter: None,
                     }),
             );
         let mut response = match request.send().await {
             Ok(response) => response,
             Err(_) if status.load(Ordering::Relaxed) == 404 => {
                 return Ok(MetadataSnapshot {
-                    _physical: Arc::clone(&physical),
-                    owner: Arc::clone(&self.authority_identity),
-                    key: key.to_owned(),
-                    bytes: None,
-                    version: MetadataVersion::S3(None),
+                    inner: Arc::new(crate::blob::authority::MetadataObservation {
+                        _retained: Arc::clone(&owners.retained),
+                        owner: Arc::clone(&self.authority_identity),
+                        key: key.to_owned(),
+                        bytes: None,
+                        version: MetadataVersion::S3(None),
+                    }),
                 });
             }
             Err(error) => return Err(unavailable(error)),
@@ -124,7 +153,7 @@ impl S3BlobStore {
         validate_budget(max_bytes, size)?;
         let etag = response
             .e_tag()
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && s.len() <= limits.version_bytes)
             .ok_or_else(|| unavailable("metadata version missing"))?
             .to_owned();
         let mut bytes = Vec::with_capacity(size);
@@ -143,11 +172,13 @@ impl S3BlobStore {
             return Err(unavailable("metadata body is truncated"));
         }
         Ok(MetadataSnapshot {
-            _physical: Arc::clone(&physical),
-            owner: Arc::clone(&self.authority_identity),
-            key: key.to_owned(),
-            bytes: Some(Bytes::from(bytes)),
-            version: MetadataVersion::S3(Some(etag)),
+            inner: Arc::new(crate::blob::authority::MetadataObservation {
+                _retained: Arc::clone(&owners.retained),
+                owner: Arc::clone(&self.authority_identity),
+                key: key.to_owned(),
+                bytes: Some(Bytes::from(bytes)),
+                version: MetadataVersion::S3(Some(etag)),
+            }),
         })
     }
 }
@@ -156,27 +187,49 @@ impl BoundedMetadataStore for S3BlobStore {
     async fn read_metadata(
         &self,
         key: &str,
-        max_bytes: usize,
-        physical: AppendOwner,
+        limits: MetadataLimits,
+        owners: MetadataOwners,
     ) -> Result<MetadataSnapshot, ObjectLogError> {
-        self.read_metadata_inner(key, max_bytes, Arc::clone(&physical))
-            .await
+        self.read_metadata_inner(key, limits, owners.clone()).await
     }
     async fn swap_metadata(
         &self,
         key: &str,
         observed: MetadataSnapshot,
         new_value: Bytes,
-        max_bytes: usize,
-        physical: AppendOwner,
+        limits: MetadataLimits,
+        owners: MetadataOwners,
     ) -> Result<MetadataSwap, ObjectLogError> {
+        limits.validate()?;
+        let max_bytes = limits.payload_bytes;
         observed.validate(&self.authority_identity, key)?;
+        if matches!(&observed.inner.version, MetadataVersion::S3(Some(token)) if token.len() > limits.version_bytes)
+        {
+            return Err(ObjectLogError::BudgetExceeded(
+                "metadata version exceeds admitted bound".into(),
+            ));
+        }
         validate_budget(max_bytes, new_value.len())?;
-        validate_budget(max_bytes, observed.bytes.as_ref().map_or(0, Bytes::len))?;
-        let MetadataVersion::S3(etag) = observed.version else {
+        validate_budget(
+            max_bytes,
+            observed.inner.bytes.as_ref().map_or(0, Bytes::len),
+        )?;
+        let MetadataVersion::S3(etag) = &observed.inner.version else {
             return Err(ObjectLogError::InvalidConfig(
                 "non-S3 metadata token".into(),
             ));
+        };
+        #[cfg(test)]
+        let loss_counter = {
+            let mut requested = self.authority_lost_reply.lock().unwrap();
+            if requested
+                .as_ref()
+                .is_some_and(|(requested, _)| requested == key)
+            {
+                requested.take().map(|(_, counter)| counter)
+            } else {
+                None
+            }
         };
         let size = new_value.len() as u64;
         let request =
@@ -186,10 +239,10 @@ impl BoundedMetadataStore for S3BlobStore {
                 .key(key)
                 .body(ByteStream::from(Bytes::from_owner(OwnedMetadataBody {
                     bytes: new_value,
-                    _physical: Arc::clone(&physical),
+                    _physical: owners.source(),
                 })));
         let request = match etag {
-            Some(etag) => request.if_match(etag),
+            Some(etag) => request.if_match(etag.clone()),
             None => request.if_none_match("*"),
         };
         let status = Arc::new(AtomicU16::new(0));
@@ -201,7 +254,10 @@ impl BoundedMetadataStore for S3BlobStore {
                 .interceptor(MetadataResponse {
                     status: Arc::clone(&status),
                     max_bytes: 0,
+                    version_bytes: limits.version_bytes,
                     reading: false,
+                    #[cfg(test)]
+                    loss_counter,
                 }),
         );
         let result = if self.disable_payload_signing {
@@ -219,7 +275,7 @@ impl BoundedMetadataStore for S3BlobStore {
             {
                 // Failure/oversize here remains unknown, never a head rejection.
                 Ok(MetadataSwap::Conflict(
-                    self.read_metadata_inner(key, max_bytes, Arc::clone(&physical))
+                    self.read_metadata_inner(key, limits, owners.clone())
                         .await?,
                 ))
             }

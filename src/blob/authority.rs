@@ -11,6 +11,9 @@ pub(crate) struct LocalMetadataHook {
 }
 #[cfg(test)]
 impl LocalBlobStore {
+    pub(crate) fn lose_next_metadata_reply(&self, key: &str) {
+        *self.authority_lost_reply.lock().unwrap() = Some(key.to_owned());
+    }
     pub(crate) fn pause_metadata_swap(
         &self,
         panic: bool,
@@ -51,24 +54,42 @@ pub(crate) enum MetadataVersion {
     #[cfg(feature = "s3")]
     S3(Option<String>),
 }
+/// Separate ownership of in-flight physical work and retained observation bytes.
+/// Returned snapshots retain only `retained`; upload/request sources retain both.
+#[derive(Clone)]
+pub struct MetadataOwners {
+    /// Keeps payload/key/version allocation admission through last observation.
+    pub retained: AppendOwner,
+    /// Keeps operation admission through actual request/source completion.
+    pub physical: AppendOwner,
+}
+impl MetadataOwners {
+    #[cfg(feature = "s3")]
+    pub(crate) fn source(&self) -> AppendOwner {
+        Arc::new(self.clone())
+    }
+}
 /// An opaque observation binding one adapter instance, literal key and version.
 /// Payload ownership remains with the snapshot; callers reserve payload, key,
 /// token and transport scratch before invoking the physical operation.
 #[derive(Clone)]
 pub struct MetadataSnapshot {
+    pub(crate) inner: Arc<MetadataObservation>,
+}
+pub(crate) struct MetadataObservation {
     pub(crate) owner: Arc<()>,
     pub(crate) key: String,
     pub(crate) bytes: Option<Bytes>,
     pub(crate) version: MetadataVersion,
     // Last: release payload/key/version allocations before their lifetime owner.
-    pub(crate) _physical: AppendOwner,
+    pub(crate) _retained: AppendOwner,
 }
 impl std::fmt::Debug for MetadataSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetadataSnapshot")
-            .field("key", &self.key)
-            .field("payload_bytes", &self.bytes.as_ref().map(Bytes::len))
-            .field("version", &self.version)
+            .field("key", &self.inner.key)
+            .field("payload_bytes", &self.inner.bytes.as_ref().map(Bytes::len))
+            .field("version", &self.inner.version)
             .finish_non_exhaustive()
     }
 }
@@ -87,10 +108,10 @@ impl MetadataSnapshot {
     /// }
     /// ```
     pub fn bytes(&self) -> Option<&[u8]> {
-        self.bytes.as_deref()
+        self.inner.bytes.as_deref()
     }
     pub(crate) fn validate(&self, owner: &Arc<()>, key: &str) -> Result<(), ObjectLogError> {
-        if !Arc::ptr_eq(&self.owner, owner) || self.key != key {
+        if !Arc::ptr_eq(&self.inner.owner, owner) || self.inner.key != key {
             return Err(ObjectLogError::InvalidConfig(
                 "metadata token belongs to another provider or literal key".into(),
             ));
@@ -107,9 +128,38 @@ pub enum MetadataSwap {
     /// The observed version did not match; contains a bounded fresh observation.
     Conflict(MetadataSnapshot),
 }
+/// Explicit source-memory limits for both reads and conditional writes.
+/// Transport/header-parser allocations require separate qualification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataLimits {
+    /// Maximum complete payload bytes, including conflict observations.
+    pub payload_bytes: usize,
+    /// Maximum opaque version-token bytes. Tokens are preserved verbatim.
+    /// Local metadata needs 56 bytes for its fixed version identity.
+    pub version_bytes: usize,
+}
+impl MetadataLimits {
+    pub(crate) fn validate(self) -> Result<(), ObjectLogError> {
+        if self.payload_bytes == 0 || self.version_bytes == 0 {
+            return Err(ObjectLogError::InvalidConfig(
+                "metadata source limit is zero".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_local(self) -> Result<(), ObjectLogError> {
+        self.validate()?;
+        if self.version_bytes < 56 {
+            return Err(ObjectLogError::BudgetExceeded(
+                "local metadata version exceeds admitted bound".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 /// Required bounded authority operations, independent of legacy BlobStore.
-/// There are deliberately no default implementations. `max_bytes` bounds every
-/// retained payload, including conflict observations; transport/header and
+/// There are deliberately no default implementations. `limits` bounds every
+/// retained payload and token, including conflict observations; transport/header and
 /// operation ownership require separate caller admission. Cancellation does not
 /// prove a conditional write had no effects. Owners must drive and drain it.
 /// Input/output source buffers retain the supplied lifetime owner. This does not
@@ -122,8 +172,8 @@ pub trait BoundedMetadataStore: Send + Sync {
     async fn read_metadata(
         &self,
         key: &str,
-        max_bytes: usize,
-        owner: AppendOwner,
+        limits: MetadataLimits,
+        owners: MetadataOwners,
     ) -> Result<MetadataSnapshot, ObjectLogError>;
     /// Conditional durable replacement of exactly the observed provider/key/
     /// version. No automatic conditional-write retry. Oversized input is rejected
@@ -133,8 +183,8 @@ pub trait BoundedMetadataStore: Send + Sync {
         key: &str,
         observed: MetadataSnapshot,
         new_value: Bytes,
-        max_bytes: usize,
-        owner: AppendOwner,
+        limits: MetadataLimits,
+        owners: MetadataOwners,
     ) -> Result<MetadataSwap, ObjectLogError>;
 }
 pub(crate) fn validate_budget(max_bytes: usize, size: usize) -> Result<(), ObjectLogError> {
@@ -155,17 +205,19 @@ fn read_local(
     owner: Arc<()>,
     key: String,
     max_bytes: usize,
-    physical: AppendOwner,
+    retained: AppendOwner,
 ) -> Result<MetadataSnapshot, ObjectLogError> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(MetadataSnapshot {
-                _physical: physical,
-                owner,
-                key,
-                bytes: None,
-                version: MetadataVersion::Local(None),
+                inner: Arc::new(crate::blob::authority::MetadataObservation {
+                    _retained: retained,
+                    owner,
+                    key,
+                    bytes: None,
+                    version: MetadataVersion::Local(None),
+                }),
             });
         }
         Err(error) => return Err(error.into()),
@@ -189,11 +241,13 @@ fn read_local(
         ));
     }
     Ok(MetadataSnapshot {
-        _physical: physical,
-        owner,
-        key,
-        bytes: Some(Bytes::from(bytes)),
-        version: MetadataVersion::Local(Some(version)),
+        inner: Arc::new(crate::blob::authority::MetadataObservation {
+            _retained: retained,
+            owner,
+            key,
+            bytes: Some(Bytes::from(bytes)),
+            version: MetadataVersion::Local(Some(version)),
+        }),
     })
 }
 #[async_trait]
@@ -201,18 +255,25 @@ impl BoundedMetadataStore for LocalBlobStore {
     async fn read_metadata(
         &self,
         key: &str,
-        max_bytes: usize,
-        owner: AppendOwner,
+        limits: MetadataLimits,
+        owners: MetadataOwners,
     ) -> Result<MetadataSnapshot, ObjectLogError> {
-        validate_budget(max_bytes, 0)?;
+        limits.validate_local()?;
+        let max_bytes = limits.payload_bytes;
         let path = self.path_for(key)?;
-        let physical = owner;
+        let physical = owners;
         let owner = Arc::clone(&self.authority_identity);
         let key = key.to_owned();
         tokio::task::spawn_blocking(move || {
             let _physical = physical;
             let path = path;
-            read_local(&path, owner, key, max_bytes, Arc::clone(&_physical))
+            read_local(
+                &path,
+                owner,
+                key,
+                max_bytes,
+                Arc::clone(&_physical.retained),
+            )
         })
         .await
         .map_err(|error| ObjectLogError::StorageUnavailable(error.to_string()))?
@@ -222,14 +283,29 @@ impl BoundedMetadataStore for LocalBlobStore {
         key: &str,
         observed: MetadataSnapshot,
         new_value: Bytes,
-        max_bytes: usize,
-        owner: AppendOwner,
+        limits: MetadataLimits,
+        owners: MetadataOwners,
     ) -> Result<MetadataSwap, ObjectLogError> {
+        limits.validate_local()?;
+        let max_bytes = limits.payload_bytes;
         observed.validate(&self.authority_identity, key)?;
         validate_budget(max_bytes, new_value.len())?;
-        validate_budget(max_bytes, observed.bytes.as_ref().map_or(0, Bytes::len))?;
+        validate_budget(
+            max_bytes,
+            observed.inner.bytes.as_ref().map_or(0, Bytes::len),
+        )?;
+        #[cfg(test)]
+        let lose_reply = {
+            let mut requested = self.authority_lost_reply.lock().unwrap();
+            if requested.as_deref() == Some(key) {
+                requested.take();
+                true
+            } else {
+                false
+            }
+        };
         let path = self.path_for(key)?;
-        let physical = owner;
+        let physical = owners;
         let owner = Arc::clone(&self.authority_identity);
         let key = key.to_owned();
         let size = new_value.len() as u64;
@@ -255,9 +331,16 @@ impl BoundedMetadataStore for LocalBlobStore {
                     .open(lock_name)?;
                 flock_exclusive(&lock)?;
                 // Closing the file releases flock on every error/panic path.
-                let current =
-                    read_local(&path, owner, key.clone(), max_bytes, Arc::clone(&_physical))?;
-                if current.version != observed.version || current.bytes != observed.bytes {
+                let current = read_local(
+                    &path,
+                    owner,
+                    key.clone(),
+                    max_bytes,
+                    Arc::clone(&_physical.retained),
+                )?;
+                if current.inner.version != observed.inner.version
+                    || current.inner.bytes != observed.inner.bytes
+                {
                     return Ok(MetadataSwap::Conflict(current));
                 }
                 #[cfg(test)]
@@ -273,6 +356,12 @@ impl BoundedMetadataStore for LocalBlobStore {
             .map_err(|error| ObjectLogError::StorageUnavailable(error.to_string()))??;
         if matches!(result, MetadataSwap::Stored) {
             self.record_put(size);
+            #[cfg(test)]
+            if lose_reply {
+                return Err(ObjectLogError::StorageUnavailable(
+                    "injected lost durable metadata reply".into(),
+                ));
+            }
         }
         Ok(result)
     }

@@ -25,6 +25,8 @@ jobs:
         run: cargo test --all-features
       - name: Native metadata authority model
         run: python3 scripts/formal/check_native_head.py --self-test --output target/native-head-model.json
+      - name: Native COW content-resolution model
+        run: python3 scripts/formal/check_native_cow.py --self-test --output target/native-cow-model.json
       - name: Package (dry-run)
         run: cargo publish --dry-run
 
@@ -74,6 +76,47 @@ jobs:
           '
       - name: S3 adapter tests
         run: cargo test --features s3 --test s3 -- --nocapture
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+          OBJECT_LOG_S3_REGION: us-east-1
+
+      - name: Native immutable index provider qualification
+        run: cargo test --features s3 --lib native_v2::index::tests::real_s3_runs_identical_full_root_contract_in_both_signing_modes -- --ignored --exact
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+          OBJECT_LOG_S3_REGION: us-east-1
+      - name: Native framed data provider qualification
+        run: cargo test --features s3 --lib native_v2::data::tests::real_s3_runs_identical_frame_contract_in_both_signing_modes -- --ignored --exact
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+          OBJECT_LOG_S3_REGION: us-east-1
+      - name: Native captured append provider qualification
+        run: cargo test --features s3 --lib native_v2::head::tests::real_s3_runs_identical_captured_append_contract_in_both_signing_modes -- --ignored --exact
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+          OBJECT_LOG_S3_REGION: us-east-1
+      - name: Native atomic group provider qualification
+        run: cargo test --features s3 --lib native_v2::head::tests::real_s3_runs_identical_group_contract_in_both_signing_modes -- --ignored --exact
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+          OBJECT_LOG_S3_REGION: us-east-1
+      - name: Native stored response-loss provider qualification
+        run: cargo test --features s3 --lib native_v2::head::tests::real_s3_lost_response_processing_resolves_after_later_append_without_resubmission -- --ignored --exact
         env:
           OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
           OBJECT_LOG_S3_BUCKET: object-log-ci

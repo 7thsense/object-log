@@ -50,14 +50,14 @@ mod engine;
 mod error;
 mod manifest_sequencer;
 #[cfg(test)]
-mod native_head;
+mod native_v2;
 #[cfg(feature = "s3")]
 mod s3;
 mod sequencer;
 
 pub use blob::{
     BlobStore, BoundedMetadataStore, CasOutcome, LocalBlobStore, MediaOpStats, MemoryBlobStore,
-    MetadataSnapshot, MetadataSwap,
+    MetadataLimits, MetadataOwners, MetadataSnapshot, MetadataSwap,
 };
 pub use budget::{BudgetConfig, BudgetMode, EffectiveKnob, EffectiveReason, PipelineSnapshot};
 pub use engine::{

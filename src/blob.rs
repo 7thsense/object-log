@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod authority;
-pub use authority::{BoundedMetadataStore, MetadataSnapshot, MetadataSwap};
+pub use authority::{
+    BoundedMetadataStore, MetadataLimits, MetadataOwners, MetadataSnapshot, MetadataSwap,
+};
 
 /// Result of [`BlobStore::compare_and_swap`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +341,8 @@ pub struct LocalBlobStore {
     authority_identity: Arc<()>,
     #[cfg(test)]
     authority_hook: Arc<Mutex<Option<Arc<authority::LocalMetadataHook>>>>,
+    #[cfg(test)]
+    authority_lost_reply: Arc<Mutex<Option<String>>>,
     root: Arc<PathBuf>,
     media_ops: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
@@ -351,10 +355,31 @@ impl LocalBlobStore {
             authority_identity: Arc::new(()),
             #[cfg(test)]
             authority_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            authority_lost_reply: Arc::new(Mutex::new(None)),
             root: Arc::new(root.into()),
             media_ops: Arc::new(AtomicU64::new(0)),
             bytes_written: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    // Conservative capacity for caller/snapshot keys, joined paths, CAS lock and
+    // temp paths in the bounded metadata adapter. Includes retained root capacity.
+    #[cfg(test)]
+    pub(crate) fn native_page_source_scratch(
+        &self,
+        key_len: usize,
+    ) -> Result<usize, ObjectLogError> {
+        self.root
+            .capacity()
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(TMP_SUFFIX.len() + 16))
+            .and_then(|n| n.checked_mul(8))
+            .and_then(|n| key_len.checked_mul(6).and_then(|keys| n.checked_add(keys)))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| {
+                ObjectLogError::InvalidConfig("native local path capacity overflow".into())
+            })
     }
 
     fn path_for(&self, key: &str) -> Result<PathBuf, ObjectLogError> {
