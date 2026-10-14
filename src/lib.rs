@@ -71,7 +71,7 @@ pub use bounded_lookup::BoundedSequencer;
 pub use error::ObjectLogError;
 pub use manifest_sequencer::{IndexSnapshot, ManifestSequencer, PartitionSnapshot};
 #[cfg(feature = "s3")]
-pub use s3::S3BlobStore;
+pub use s3::{S3BlobStore, S3ClientOptions};
 pub use sequencer::{
     AuthoritativePartitionState, BatchLocation, CommitBatch, CommitOutcome,
     ConditionalCommitOutcome, InMemorySequencer, IndexEntry, PartitionKey, Sequencer,

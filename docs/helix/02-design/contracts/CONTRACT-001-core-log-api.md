@@ -189,6 +189,20 @@ S3 composition calls `NativeLog::preflight_s3` before constructing its adapter
 client. The same checked byte-length/page/source planner validates native
 construction without copying derived paths before rejection.
 
+Owned S3 composition uses `S3BlobStore::new_owned_with_options`. It validates
+bounded caller configuration before client creation, retains and submits the
+canonical endpoint, and supplies explicit timeouts and signing policy. Its HTTP
+transport disables proxies and uses compiled Mozilla roots plus optional,
+validated additive PEM certificates. Platform proxy/trust configuration is not
+inherited. AWS request metadata is outside this transport isolation guarantee.
+Caller configuration and the fixed compiled root bundle have separate bounds;
+neither is advertised as native page credit or total SDK/HTTP/TLS residency.
+The compatibility constructor retains its environment-derived settings but owns
+a separate client and connection pool per store. No constructor shares a
+process-global pool across independently owned runtimes. Per-store ownership
+does not supply an execution runtime: callers must keep the runtime driving
+that store alive until its I/O is drained. `NativeLog` manages its own runtime.
+
 `open` observes an existing namespace; `provision_new` explicitly publishes an
 empty candidate. Empty candidate election is not consumer queue provisioning:
 the consumer must establish its unique genesis and semantic authority.

@@ -403,20 +403,48 @@ async fn external_s3_common_append_reopen_contract_both_signing_modes() {
         getrandom::fill(&mut nonce).unwrap();
         let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         let prefix = format!("native-facade-contract/{nonce}/{disabled}");
-        let store = object_log::S3BlobStore::new(&endpoint, &region, &bucket, &key, &secret)
-            .with_payload_signing_disabled(disabled);
+        let store = object_log::S3BlobStore::new_owned_with_options(
+            &endpoint,
+            &region,
+            &bucket,
+            &key,
+            &secret,
+            object_log::S3ClientOptions {
+                disable_payload_signing: disabled,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut configured = limits();
         configured.binding_bytes = 256;
         let log = NativeLog::s3(store, prefix.clone(), configured).unwrap();
         append_reopen_contract(&log).await;
         log.shutdown().await.unwrap();
         drop(log);
-        let fresh_store = object_log::S3BlobStore::new(&endpoint, &region, &bucket, &key, &secret)
-            .with_payload_signing_disabled(disabled);
+        let fresh_store = object_log::S3BlobStore::new_owned_with_options(
+            &endpoint,
+            &region,
+            &bucket,
+            &key,
+            &secret,
+            object_log::S3ClientOptions {
+                disable_payload_signing: disabled,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let reopened = NativeLog::s3(fresh_store, prefix.clone(), configured).unwrap();
         cold_read_contract(&reopened).await;
         reopened.shutdown().await.unwrap();
-        let cleanup = object_log::S3BlobStore::new(&endpoint, &region, &bucket, &key, &secret);
+        let cleanup = object_log::S3BlobStore::new_owned_with_options(
+            &endpoint,
+            &region,
+            &bucket,
+            &key,
+            &secret,
+            Default::default(),
+        )
+        .unwrap();
         for object in cleanup.list(&prefix).await.unwrap() {
             cleanup.delete(&object).await.unwrap();
         }

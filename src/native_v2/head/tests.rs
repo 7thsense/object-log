@@ -1064,6 +1064,9 @@ async fn real_s3_runs_identical_captured_append_contract_in_both_signing_modes()
         let prefix = format!("native-v2-captured-{nonce}-{unsigned}");
         let head_key = format!("{prefix}-head");
         exercise_prepared_append(store.clone(), prefix.clone(), head_key.clone(), 4096).await;
+        // Cleanup uses this runtime, after the exercised I/O runtime closed.
+        let store = crate::S3BlobStore::new(&endpoint, &region, &bucket, &key, &secret)
+            .with_payload_signing_disabled(unsigned);
         for object in store.list(&format!("{prefix}/")).await.unwrap() {
             store.delete(&object).await.unwrap();
         }
@@ -1242,6 +1245,8 @@ async fn real_s3_lost_response_processing_resolves_after_later_append_without_re
             Ok(())
         }).await.unwrap();
         resources.close_and_drain().await.unwrap();
+        let local = crate::S3BlobStore::new(&endpoint, &region, &bucket, &key, &secret)
+            .with_payload_signing_disabled(unsigned);
         for object in local.list(&format!("{prefix}/")).await.unwrap() {
             local.delete(&object).await.unwrap();
         }

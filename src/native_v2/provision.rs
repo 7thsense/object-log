@@ -918,6 +918,7 @@ mod tests {
             .await
             .unwrap();
         reopened_resources.close_and_drain().await.unwrap();
+        let provider = factory();
         for key in provider.list(&prefix).await.unwrap() {
             provider.delete(&key).await.unwrap();
         }

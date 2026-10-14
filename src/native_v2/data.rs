@@ -249,6 +249,8 @@ mod tests {
                 .as_nanos();
             let prefix = format!("native-v2-frame-qualification-{nonce}-{unsigned}");
             exercise_frames(store.clone(), reopened, prefix.clone(), 4096).await;
+            let store = crate::S3BlobStore::new(&endpoint, &region, &bucket, &key, &secret)
+                .with_payload_signing_disabled(unsigned);
             for object in store.list(&prefix).await.unwrap() {
                 store.delete(&object).await.unwrap();
             }

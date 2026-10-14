@@ -8,6 +8,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+fn owned_store(endpoint: &str, region: &str, bucket: &str, key: &str, secret: &str) -> S3BlobStore {
+    S3BlobStore::new_owned_with_options(endpoint, region, bucket, key, secret, Default::default())
+        .unwrap()
+}
 fn response(status: &str, body: &[u8], etag: Option<&str>) -> Vec<u8> {
     let mut out = format!(
         "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n",
@@ -35,7 +39,7 @@ async fn sdk_metadata_token_exact_budget_preserves_opaque_quotes_and_rejects_bef
             Some(response("200 OK", b"", None)),
             response("200 OK", b"new!", Some(&token)),
         );
-        let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+        let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
         let limits = MetadataLimits {
             payload_bytes: 4,
             version_bytes: token_bytes,
@@ -114,7 +118,7 @@ async fn sdk_oversized_conflict_token_is_unknown_without_second_conditional_writ
         )),
         response("200 OK", b"new!", Some(&larger)),
     );
-    let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+    let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
     let limits = MetadataLimits {
         payload_bytes: 4,
         version_bytes: token.len(),
@@ -163,7 +167,7 @@ async fn sdk_put_success_token_exact_limit_or_ambiguous_after_one_write() {
                 Some(response("200 OK", b"", Some(&token))),
                 response("200 OK", b"next", Some("\"later\"")),
             );
-            let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret")
+            let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret")
                 .with_payload_signing_disabled(unsigned);
             let limits = MetadataLimits {
                 payload_bytes: 4,
@@ -300,7 +304,7 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
             Some(response("200 OK", b"", None)),
             response("200 OK", b"new!", Some("\"version-two\"")),
         );
-        let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+        let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
         let observed = store
             .read_metadata(
                 "head",
@@ -323,7 +327,7 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
                     .await
                     .is_err()
             );
-            let other = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+            let other = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
             assert!(
                 other
                     .swap_metadata(
@@ -393,7 +397,7 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
             Some(response("412 Precondition Failed", b"", None)),
             reread,
         );
-        let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+        let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
         let token = store
             .read_metadata("head", metadata_limits(4), metadata_owners(Arc::new(())))
             .await
@@ -445,7 +449,7 @@ async fn sdk_native_head_root_preservation_missing_and_lost_reply() {
                 Some("\"new\""),
             ),
         );
-        let store = Arc::new(S3BlobStore::new(
+        let store = Arc::new(owned_store(
             &endpoint,
             "us-east-1",
             "bucket",
@@ -495,7 +499,7 @@ async fn sdk_native_head_root_preservation_missing_and_lost_reply() {
         response("404 Not Found", b"", None),
     );
     let reader = NativeHeadReader::new_known(
-        Arc::new(S3BlobStore::new(
+        Arc::new(owned_store(
             &endpoint,
             "us-east-1",
             "bucket",
@@ -548,7 +552,7 @@ async fn sdk_native_head_conflict_floor_and_higher_fence_preserve_roots() {
             ],
             response("200 OK", &current.encode(), Some("\"winner\"")),
         );
-        let store = Arc::new(S3BlobStore::new(
+        let store = Arc::new(owned_store(
             &endpoint,
             "us-east-1",
             "bucket",
@@ -665,7 +669,7 @@ async fn sdk_metadata_rejects_unsupported_framing_before_waiting_for_bodies() {
             }
             requests
         });
-        let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret");
+        let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             if reading {
                 store
@@ -725,7 +729,7 @@ async fn sdk_bounded_writes_classify_single_attempt_in_both_signing_modes() {
                 put,
                 response("200 OK", b"win!", Some("\"winner\"")),
             );
-            let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret")
+            let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret")
                 .with_payload_signing_disabled(disabled);
             let token = store
                 .read_metadata("head", metadata_limits(4), metadata_owners(Arc::new(())))
@@ -822,7 +826,7 @@ fn sdk_cancelled_response_retains_owner_in_backpressured_source_upload() {
         .enable_all()
         .build()
         .unwrap();
-    let store = S3BlobStore::new(&endpoint, "us-east-1", "bucket", "key", "secret")
+    let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret")
         .with_payload_signing_disabled(true);
     let retained = Arc::new(Lifetime);
     let retained_weak = Arc::downgrade(&retained);

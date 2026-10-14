@@ -17,10 +17,8 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 mod authority;
@@ -119,63 +117,77 @@ fn transient_s3(err: &impl std::fmt::Display) -> bool {
         || text.contains("slowdown")
 }
 
-fn shared_s3_client(
+// Connection tasks belong to the runtime that drives a request. Sharing a
+// process-wide pool lets another store's runtime teardown interrupt requests.
+// Keep pooling within a store and preserve the legacy constructor's settings.
+fn legacy_s3_client(
     endpoint_url: &str,
     region: &str,
     access_key_id: &str,
     secret_access_key: &str,
 ) -> Client {
-    type Cache = HashMap<(String, String, String, String), Client>;
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let key = (
-        endpoint_url.to_string(),
-        region.to_string(),
-        access_key_id.to_string(),
-        secret_access_key.to_string(),
-    );
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("s3 client cache");
-    if let Some(client) = guard.get(&key) {
-        return client.clone();
-    }
-    let creds = Credentials::new(access_key_id, secret_access_key, None, None, "object-log");
-    let client = Client::from_conf(
-        aws_sdk_s3::config::Builder::new()
-            .behavior_version(BehaviorVersion::latest())
-            .endpoint_url(endpoint_url)
-            .region(Region::new(region.to_string()))
-            .credentials_provider(creds)
-            .force_path_style(true)
-            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
-            .timeout_config(
-                TimeoutConfig::builder()
-                    .connect_timeout(Duration::from_secs(env_u64(
-                        "OBJECT_LOG_S3_CONNECT_TIMEOUT_SECS",
-                        5,
-                    )))
-                    .read_timeout(Duration::from_secs(env_u64(
-                        "OBJECT_LOG_S3_READ_TIMEOUT_SECS",
-                        10,
-                    )))
-                    .operation_timeout(Duration::from_secs(env_u64(
-                        "OBJECT_LOG_S3_OPERATION_TIMEOUT_SECS",
-                        30,
-                    )))
-                    .build(),
-            )
-            .build(),
-    );
-    guard.insert(key, client.clone());
-    client
+    build_s3_client(
+        endpoint_url,
+        region,
+        access_key_id,
+        secret_access_key,
+        Duration::from_secs(env_u64("OBJECT_LOG_S3_CONNECT_TIMEOUT_SECS", 5)),
+        Duration::from_secs(env_u64("OBJECT_LOG_S3_READ_TIMEOUT_SECS", 10)),
+        Duration::from_secs(env_u64("OBJECT_LOG_S3_OPERATION_TIMEOUT_SECS", 30)),
+    )
 }
 
+mod owned_client;
+use owned_client::OwnedClientConfiguration;
+pub use owned_client::S3ClientOptions;
+
+fn s3_client_config(
+    endpoint_url: &str,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+    connect: Duration,
+    read: Duration,
+    operation: Duration,
+) -> aws_sdk_s3::config::Builder {
+    let creds = Credentials::new(access_key_id, secret_access_key, None, None, "object-log");
+    aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .endpoint_url(endpoint_url)
+        .region(Region::new(region.to_string()))
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(connect)
+                .read_timeout(read)
+                .operation_timeout(operation)
+                .build(),
+        )
+}
+
+fn build_s3_client(
+    endpoint: &str,
+    region: &str,
+    key: &str,
+    secret: &str,
+    connect: Duration,
+    read: Duration,
+    operation: Duration,
+) -> Client {
+    Client::from_conf(
+        s3_client_config(endpoint, region, key, secret, connect, read, operation).build(),
+    )
+}
 /// S3-compatible blob store.
 pub struct S3BlobStore {
     authority_identity: std::sync::Arc<()>,
     #[cfg(test)]
     authority_lost_reply: std::sync::Mutex<Option<(String, std::sync::Arc<AtomicU64>)>>,
     client: Client,
+    _owned_configuration: Option<OwnedClientConfiguration>,
     bucket: String,
     /// Objects larger than this use multipart upload.
     multipart_threshold: usize,
@@ -201,7 +213,8 @@ impl S3BlobStore {
             authority_identity: std::sync::Arc::new(()),
             #[cfg(test)]
             authority_lost_reply: std::sync::Mutex::new(None),
-            client: shared_s3_client(endpoint_url, region, access_key_id, secret_access_key),
+            client: legacy_s3_client(endpoint_url, region, access_key_id, secret_access_key),
+            _owned_configuration: None,
             bucket: bucket.to_string(),
             multipart_threshold: 16 * 1024 * 1024,
             part_size: 8 * 1024 * 1024,
@@ -209,6 +222,40 @@ impl S3BlobStore {
             media_ops: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
         }
+    }
+
+    /// Build one uncached client with explicit configuration. Errors never
+    /// include endpoint or credential contents. Timeouts are positive and at
+    /// most one day; total input is bounded by at most one MiB before allocation.
+    pub fn new_owned_with_options(
+        endpoint_url: &str,
+        region: &str,
+        bucket: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        options: S3ClientOptions,
+    ) -> Result<Self, ObjectLogError> {
+        let (client, admitted) = owned_client::build_owned(
+            endpoint_url,
+            region,
+            bucket,
+            access_key_id,
+            secret_access_key,
+            &options,
+        )?;
+        Ok(Self {
+            authority_identity: std::sync::Arc::new(()),
+            #[cfg(test)]
+            authority_lost_reply: std::sync::Mutex::new(None),
+            client,
+            _owned_configuration: Some(admitted),
+            bucket: bucket.to_string(),
+            multipart_threshold: 16 * 1024 * 1024,
+            part_size: 8 * 1024 * 1024,
+            disable_payload_signing: options.disable_payload_signing,
+            media_ops: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+        })
     }
 
     // Explicit source-copy allowance for page caller/request/snapshot keys,
@@ -855,3 +902,6 @@ impl BlobStore for S3BlobStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod runtime_tests;

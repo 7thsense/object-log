@@ -586,6 +586,10 @@ mod tests {
             .await;
             // Qualification-only cleanup after all captured-root checks/drain.
             // Production append-only retention/reclamation remains unsupported.
+            // The exercised Resources runtime is closed. Its store's pooled
+            // connection tasks cannot be reused on this test's runtime.
+            let local = crate::S3BlobStore::new(&endpoint, &region, &bucket, &key, &secret)
+                .with_payload_signing_disabled(unsigned);
             for object in local.list(&prefix).await.unwrap() {
                 local.delete(&object).await.unwrap();
             }

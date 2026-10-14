@@ -23,7 +23,7 @@ default = []
 # Bounded native append-log facade, independent of the legacy sequencer port.
 native = ["dep:getrandom"]
 # Optional S3-compatible BlobStore adapter (AWS S3, MinIO, Garage).
-s3 = ["dep:aws-sdk-s3"]
+s3 = ["dep:aws-sdk-s3", "dep:url", "dep:aws-smithy-http-client", "dep:base64", "dep:webpki-root-certs", "dep:rustls", "dep:rustls-pemfile"]
 # Diagnostics binary: `cargo run --features cli --bin object-log -- --help`
 cli = ["dep:clap"]
 
@@ -33,6 +33,12 @@ path = "src/bin/object-log.rs"
 required-features = ["cli"]
 
 [dependencies]
+aws-smithy-http-client = { version = "1.5", default-features = false, features = ["rustls-aws-lc"], optional = true }
+base64 = { version = "0.22", optional = true }
+webpki-root-certs = { version = "1.0.9", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+url = { version = "2", optional = true }
 getrandom = { version = "0.4", optional = true }
 async-trait = "0.1"
 bytes = "1"
@@ -45,5 +51,6 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-
 aws-sdk-s3 = { version = "1.122", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"], optional = true }
 
 [dev-dependencies]
+rcgen = "0.13.2"
 getrandom = "0.4"
 tempfile = "3"
