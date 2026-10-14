@@ -684,6 +684,15 @@ impl CapturedHead {
         let Some(owned) = self.lookup(pages.clone(), offset).await? else {
             return Ok(None);
         };
+        Self::hydrate_record(pages, &owned, max_payload_bytes)
+            .await
+            .map(Some)
+    }
+    pub(super) async fn hydrate_record(
+        pages: Arc<super::page_store::PageStore>,
+        owned: &super::index::OwnedEntry,
+        max_payload_bytes: usize,
+    ) -> Result<(u64, u32, OwnedPayload), ObjectLogError> {
         let entry = owned.entry();
         if entry.byte_len as usize > max_payload_bytes {
             return Err(ObjectLogError::ReadLimitExceeded {
@@ -718,7 +727,7 @@ impl CapturedHead {
                 "indexed data identity, range or payload digest differs",
             ));
         }
-        Ok(Some((
+        Ok((
             entry.base,
             entry.record_count,
             OwnedPayload {
@@ -726,7 +735,7 @@ impl CapturedHead {
                 start: entry.byte_start as usize,
                 len: entry.byte_len as usize,
             },
-        )))
+        ))
     }
     #[cfg(test)]
     pub async fn read_payload(

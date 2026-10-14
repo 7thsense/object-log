@@ -211,7 +211,10 @@ drains physical work; retained byte-only handles may outlive it. Payload reads
 use one authenticated captured-root lookup for range and content validation.
 `read_bounded` rejects an authenticated payload length above the caller limit
 before identity-overflow or data reads. The caller must separately admit its own
-consumer allocation before invoking hydration. `NativeRecord::into_bytes` transfers
+consumer allocation before invoking hydration. `plan_read` returns EOF or a sealed
+fixed-cut entry with its exact payload length without identity/payload hydration.
+The consumer admits actual bytes, then consumes that same entry with `read_planned`;
+no fresh head observation or second index lookup replaces the plan. `NativeRecord::into_bytes` transfers
 the SDK owner without copying; byte aliases retain admission through final drop.
 The external append/reopen contract runs unchanged on Local and explicitly
 configured S3, with both S3 payload-signing modes. These checks do not establish

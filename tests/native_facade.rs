@@ -198,6 +198,23 @@ async fn external_foreign_handles_and_invalid_limits_have_no_storage_effects() {
     let namespace = log.provision_new(b"queue").await.unwrap();
     assert!(peer.capture(&namespace).await.is_err());
     assert!(peer.acquire(&namespace).await.is_err());
+    let writer = log.acquire(&namespace).await.unwrap();
+    let publication = log
+        .prepare(
+            &writer,
+            &[NativeAppend {
+                identity: "one",
+                payload: b"one",
+                records: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    log.submit(&publication).await.unwrap();
+    let cut = log.capture(&namespace).await.unwrap();
+    assert!(peer.plan_read(&cut, 0).await.is_err());
+    let plan = log.plan_read(&cut, 0).await.unwrap().unwrap();
+    assert!(peer.read_planned(plan, 3).await.is_err());
     assert!(peer_store.list("").await.unwrap().is_empty());
     let mut invalid = limits();
     invalid.operations = 0;
@@ -315,7 +332,16 @@ async fn append_reopen_contract(log: &NativeLog) {
     assert!(log.read(&empty, 0).await.unwrap().is_none());
     let reopened = log.open(b"contract\0queue").await.unwrap().unwrap();
     let cut = log.capture(&reopened).await.unwrap();
-    let record = log.read(&cut, 1).await.unwrap().unwrap();
+    let plan = log.plan_read(&cut, 1).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            plan.base_offset(),
+            plan.record_count(),
+            plan.payload_bytes()
+        ),
+        (0, 2, payload.len())
+    );
+    let record = log.read_planned(plan, payload.len()).await.unwrap();
     assert_eq!((record.base_offset(), record.record_count()), (0, 2));
     assert_eq!(record.bytes(), payload);
     let owned_bytes = record.into_bytes();
@@ -519,6 +545,67 @@ async fn external_payload_limit_precedes_missing_data_read() {
     assert!(matches!(
         log.read_bounded(&cut, 0, payload.len()).await,
         Err(object_log::ObjectLogError::Sequencer(_))
+    ));
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_sealed_plan_preserves_actual_length_and_fixed_entry() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::new(directory.path());
+    let log = NativeLog::local(store.clone(), "planned-read".into(), limits()).unwrap();
+    let namespace = log.provision_new(b"queue").await.unwrap();
+    let writer = log.acquire(&namespace).await.unwrap();
+    let publication = log
+        .prepare(
+            &writer,
+            &[NativeAppend {
+                identity: "one",
+                payload: b"small",
+                records: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    log.submit(&publication).await.unwrap();
+    let cut = log.capture(&namespace).await.unwrap();
+    assert!(log.plan_read(&cut, 1).await.unwrap().is_none());
+    let plan = log.plan_read(&cut, 0).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            plan.base_offset(),
+            plan.record_count(),
+            plan.payload_bytes()
+        ),
+        (0, 1, 5)
+    );
+    let limited = log.plan_read(&cut, 0).await.unwrap().unwrap();
+    let peer = NativeLog::local(store.clone(), "planned-read".into(), limits()).unwrap();
+    let foreign = log.plan_read(&cut, 0).await.unwrap().unwrap();
+    assert!(peer.read_planned(foreign, 5).await.is_err());
+    peer.shutdown().await.unwrap();
+    let mut leaves = 0;
+    for key in store.list("planned-read").await.unwrap() {
+        if key.contains("/pages/") {
+            let raw = store.get(&key).await.unwrap().unwrap();
+            if raw.len() > 72 && raw[72] == 1 {
+                store.delete(&key).await.unwrap();
+                leaves += 1;
+            }
+        }
+    }
+    assert_eq!(leaves, 1);
+    store
+        .delete(&head_key(&store, "planned-read").await)
+        .await
+        .unwrap();
+    assert_eq!(log.read_planned(plan, 5).await.unwrap().bytes(), b"small");
+    assert!(matches!(
+        log.read_planned(limited, 4).await,
+        Err(object_log::ObjectLogError::ReadLimitExceeded {
+            actual: 5,
+            limit: 4
+        })
     ));
     log.shutdown().await.unwrap();
 }

@@ -159,6 +159,30 @@ pub enum NativeResolution {
     /// Available authenticated coverage cannot classify the complete range.
     Unknown,
 }
+/// Sealed authenticated entry plan for exact consumer admission before hydration.
+pub struct NativeReadPlan {
+    entry: super::index::OwnedEntry,
+    binding: PageBinding,
+    origin: Arc<()>,
+    _charge: Arc<Charge>,
+}
+impl NativeReadPlan {
+    /// Exact authenticated payload length; excludes immutable frame headers.
+    pub fn payload_bytes(&self) -> usize {
+        self.entry.entry().byte_len as usize
+    }
+    /// First logical offset represented by the entry.
+    pub fn base_offset(&self) -> u64 {
+        self.entry.entry().base
+    }
+    /// Logical records represented by the entry.
+    pub fn record_count(&self) -> u32 {
+        self.entry.entry().record_count
+    }
+}
+impl Drop for NativeReadPlan {
+    fn drop(&mut self) {}
+}
 /// A charged payload and its authenticated logical range.
 pub struct NativeRecord {
     base: u64,
@@ -556,6 +580,71 @@ impl NativeLog {
             },
         )
     }
+    /// Authenticate a fixed-cut entry without hydrating identity or payload bytes.
+    pub async fn plan_read(
+        &self,
+        cut: &NativeReadCut,
+        offset: u64,
+    ) -> Result<Option<NativeReadPlan>, ObjectLogError> {
+        self.check(&cut.origin)?;
+        let read = RetainedRead {
+            captured: cut.read.captured.clone(),
+            binding: cut.read.binding.clone(),
+            knowledge: cut.read.knowledge.clone(),
+            charge: cut.read.charge.clone(),
+        };
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let pages = owner
+                    .pages
+                    .in_operation(physical)?
+                    .for_binding(&read.binding)?;
+                let charge = pages.charge_output(std::mem::size_of::<NativeReadPlan>())?;
+                let Some(entry) = read.captured.lookup(pages, offset).await? else {
+                    return Ok(None);
+                };
+                Ok(Some(NativeReadPlan {
+                    entry,
+                    binding: read.binding.clone(),
+                    origin: owner.identity.clone(),
+                    _charge: charge,
+                }))
+            })
+            .await
+    }
+    /// Hydrate the exact sealed entry after the consumer admits its actual length.
+    pub async fn read_planned(
+        &self,
+        plan: NativeReadPlan,
+        max_payload_bytes: usize,
+    ) -> Result<NativeRecord, ObjectLogError> {
+        self.check(&plan.origin)?;
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let pages = owner
+                    .pages
+                    .in_operation(physical)?
+                    .for_binding(&plan.binding)?;
+                let charge = pages.charge_output(std::mem::size_of::<NativeRecord>())?;
+                let (base, records, payload) = super::head::CapturedHead::hydrate_record(
+                    pages,
+                    &plan.entry,
+                    max_payload_bytes,
+                )
+                .await?;
+                Ok(NativeRecord {
+                    base,
+                    records,
+                    payload,
+                    _charge: charge,
+                })
+            })
+            .await
+    }
     /// Read only the original authenticated cut; validate touched pages and frame bytes.
     pub async fn read(
         &self,
@@ -616,6 +705,49 @@ fn invalid(message: &str) -> ObjectLogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sealed_read_plan_retains_credit_after_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = NativeLog::local(
+            crate::LocalBlobStore::new(directory.path()),
+            "plan-owner".into(),
+            NativeLimits {
+                workers: 1,
+                blocking_workers: 1,
+                operations: 2,
+                bytes: 4 << 20,
+                version_bytes: 4096,
+                binding_bytes: 4096,
+                group_entries: 1,
+                group_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
+        let before = log.owner.resources.bytes.available();
+        let namespace = log.provision_new(b"queue").await.unwrap();
+        let writer = log.acquire(&namespace).await.unwrap();
+        let publication = log
+            .prepare(
+                &writer,
+                &[NativeAppend {
+                    identity: "one",
+                    payload: b"planned",
+                    records: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        log.submit(&publication).await.unwrap();
+        let cut = log.capture(&namespace).await.unwrap();
+        let plan = log.plan_read(&cut, 0).await.unwrap().unwrap();
+        log.shutdown().await.unwrap();
+        drop((namespace, writer, publication, cut));
+        assert_eq!(plan.payload_bytes(), 7);
+        assert!(log.owner.resources.bytes.available() < before);
+        drop(plan);
+        assert_eq!(log.owner.resources.bytes.available(), before);
+    }
 
     #[tokio::test]
     async fn payload_byte_aliases_retain_credit_after_drain() {

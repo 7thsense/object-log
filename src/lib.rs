@@ -80,7 +80,8 @@ pub use sequencer::{
 #[cfg(feature = "native")]
 pub use native_v2::facade::{
     NativeAppend, NativeLimits, NativeLog, NativeNamespace, NativePublication,
-    NativePublishOutcome, NativeReadCut, NativeRecord, NativeResolution, NativeWriter,
+    NativePublishOutcome, NativeReadCut, NativeReadPlan, NativeRecord, NativeResolution,
+    NativeWriter,
 };
 #[cfg(feature = "native")]
 pub use native_v2::head::NativeHead;
