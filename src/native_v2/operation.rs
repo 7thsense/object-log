@@ -17,7 +17,7 @@ pub(super) struct ExecutionConfig {
     pub workers: usize,
     pub blocking_workers: usize,
     pub operations: usize,
-    pub bytes: u32,
+    pub bytes: u64,
 }
 struct State {
     closed: bool,

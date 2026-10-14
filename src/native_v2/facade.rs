@@ -25,7 +25,7 @@ pub struct NativeLimits {
     /// Concurrent physical operations.
     pub operations: usize,
     /// Shared retained and in-flight owned-byte admission.
-    pub bytes: u32,
+    pub bytes: u64,
     /// Maximum opaque metadata version bytes.
     pub version_bytes: usize,
     /// Maximum complete literal namespace binding frame bytes.
@@ -37,6 +37,8 @@ pub struct NativeLimits {
 }
 impl NativeLimits {
     fn validate(self) -> Result<(), ObjectLogError> {
+        let bytes = usize::try_from(self.bytes)
+            .map_err(|_| ObjectLogError::InvalidConfig("native store limits".into()))?;
         if self.workers == 0
             || self.workers > 64
             || self.blocking_workers == 0
@@ -44,13 +46,13 @@ impl NativeLimits {
             || self.operations == 0
             || self.operations > tokio::sync::Semaphore::MAX_PERMITS
             || self.bytes == 0
-            || self.bytes as usize > tokio::sync::Semaphore::MAX_PERMITS
+            || isize::try_from(self.bytes).is_err()
             || self.version_bytes == 0
             || self.binding_bytes <= 112
-            || self.binding_bytes > self.bytes as usize
+            || self.binding_bytes > bytes
             || self.group_entries == 0
             || self.group_bytes == 0
-            || self.group_bytes > self.bytes as usize
+            || self.group_bytes > bytes
         {
             return Err(ObjectLogError::InvalidConfig("native store limits".into()));
         }
@@ -263,7 +265,7 @@ impl NativeLog {
                     bucket.len(),
                 )
             })?;
-        if required > limits.bytes as usize {
+        if required > usize::try_from(limits.bytes).map_err(|_| invalid("native byte capacity"))? {
             return Err(invalid("native configuration exceeds byte admission"));
         }
         Ok(())
@@ -288,7 +290,7 @@ impl NativeLog {
             PageStore::planned_allocation_for_len(derived_len, metadata, |key_len, limits| {
                 store.page_source_scratch(key_len, limits)
             })?;
-        if required > limits.bytes as usize {
+        if required > usize::try_from(limits.bytes).map_err(|_| invalid("native byte capacity"))? {
             return Err(invalid("native configuration exceeds byte admission"));
         }
         let page_prefix = format!("{prefix}/wire-pages");

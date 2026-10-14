@@ -181,7 +181,8 @@ fetched:
 The `native` feature exposes `NativeLog` independently of the legacy sequencer
 interface. Local and S3 adapters use the same namespace, writer, publication and
 fixed-cut operations. `NativeLimits` specifies store-wide execution admission,
-retained byte admission, opaque version size, namespace-binding size, append
+retained byte admission (a checked 64-bit ledger, bounded by platform allocation
+size), opaque version size, namespace-binding size, append
 entry count and framed append-group size. Namespace size does not constrain
 payload size. Invalid page allocation limits fail before executor creation.
 S3 composition calls `NativeLog::preflight_s3` before constructing its adapter

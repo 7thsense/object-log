@@ -9,8 +9,10 @@ use crate::{
     ObjectLogError,
 };
 use bytes::Bytes;
-use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 pub(super) trait NativeStore: BlobStore + BoundedMetadataStore {
     fn page_source_scratch(
@@ -43,41 +45,60 @@ impl NativeStore for crate::S3BlobStore {
 }
 
 pub(super) struct ByteBudget {
-    available: Arc<Semaphore>,
-    capacity: u32,
+    used: AtomicU64,
+    capacity: u64,
 }
 impl ByteBudget {
-    pub fn new(capacity: u32) -> Result<Arc<Self>, ObjectLogError> {
-        if capacity == 0 || capacity as usize > Semaphore::MAX_PERMITS {
+    pub fn new(capacity: u64) -> Result<Arc<Self>, ObjectLogError> {
+        if capacity == 0 || isize::try_from(capacity).is_err() {
             return Err(ObjectLogError::InvalidConfig("native byte capacity".into()));
         }
         Ok(Arc::new(Self {
-            available: Arc::new(Semaphore::new(capacity as usize)),
+            used: AtomicU64::new(0),
             capacity,
         }))
     }
     pub fn charge(self: &Arc<Self>, bytes: usize) -> Result<Arc<Charge>, ObjectLogError> {
-        let count = u32::try_from(bytes)
+        let count = u64::try_from(bytes)
             .map_err(|_| ObjectLogError::BudgetExceeded("native byte capacity".into()))?;
         if count == 0 || count > self.capacity {
             return Err(ObjectLogError::BudgetExceeded(
                 "native byte capacity".into(),
             ));
         }
-        let permit = self
-            .available
-            .clone()
-            .try_acquire_many_owned(count)
+        // Install the local release owner before reservation; no fallible work
+        // intervenes between the successful CAS and arming exact-once release.
+        let mut charge = Charge {
+            budget: self.clone(),
+            count,
+            reserved: false,
+        };
+        self.used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(count)
+                    .filter(|next| *next <= self.capacity)
+            })
             .map_err(|_| ObjectLogError::BudgetExceeded("native shared byte admission".into()))?;
-        Ok(Arc::new(Charge { _permit: permit }))
+        charge.reserved = true;
+        Ok(Arc::new(charge))
     }
     #[cfg(test)]
     pub fn available(&self) -> usize {
-        self.available.available_permits()
+        usize::try_from(self.capacity - self.used.load(Ordering::Acquire))
+            .expect("validated native byte capacity fits usize")
     }
 }
 pub(super) struct Charge {
-    _permit: OwnedSemaphorePermit,
+    budget: Arc<ByteBudget>,
+    count: u64,
+    reserved: bool,
+}
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if self.reserved {
+            self.budget.used.fetch_sub(self.count, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Decoded capacity cannot escape its charge through the page-store API.
@@ -262,7 +283,9 @@ impl PageStore {
             ));
         }
         let allocation = Self::planned_allocation(store.as_ref(), &prefix, limits)?;
-        if allocation > budget.capacity as usize {
+        let capacity = usize::try_from(budget.capacity)
+            .map_err(|_| ObjectLogError::InvalidConfig("native byte capacity".into()))?;
+        if allocation > capacity {
             return Err(ObjectLogError::InvalidConfig(
                 "native budget cannot hold one page".into(),
             ));
@@ -869,7 +892,7 @@ mod tests {
                 local.clone(),
                 "pages".into(),
                 scope(),
-                ByteBudget::new(bytes as u32 - 1).unwrap(),
+                ByteBudget::new(u64::try_from(bytes).unwrap() - 1).unwrap(),
                 crate::MetadataLimits {
                     payload_bytes: PAGE_BYTES,
                     version_bytes: 56
@@ -877,7 +900,7 @@ mod tests {
             )
             .is_err()
         );
-        let budget = ByteBudget::new(bytes as u32).unwrap();
+        let budget = ByteBudget::new(u64::try_from(bytes).unwrap()).unwrap();
         let store = PageStore::new(
             local.clone(),
             "pages".into(),
@@ -1181,5 +1204,90 @@ mod data_namespace_tests {
             .await
             .unwrap();
         resources.close_and_drain().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod byte_ledger_tests {
+    use super::*;
+    #[test]
+    fn exact_admission_aliases_and_unwind_release_once() {
+        assert!(ByteBudget::new(0).is_err());
+        assert!(ByteBudget::new(u64::MAX).is_err());
+        let budget = ByteBudget::new(17).unwrap();
+        assert!(budget.charge(0).is_err());
+        assert!(budget.charge(18).is_err());
+        assert!(budget.charge(usize::MAX).is_err());
+        assert_eq!(budget.available(), 17);
+        let first = budget.charge(16).unwrap();
+        assert!(budget.charge(2).is_err());
+        let last = budget.charge(1).unwrap();
+        assert_eq!(budget.available(), 0);
+        let alias = first.clone();
+        drop(first);
+        assert_eq!(budget.available(), 0);
+        drop(last);
+        assert_eq!(budget.available(), 1);
+        drop(alias);
+        assert_eq!(budget.available(), 17);
+        let result = std::panic::catch_unwind(|| {
+            let charge = budget.charge(17).unwrap();
+            let _alias = charge.clone();
+            panic!("unwind exact byte ownership");
+        });
+        assert!(result.is_err());
+        assert_eq!(budget.available(), 17);
+    }
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn accounting_above_u32_requires_no_payload_allocation() {
+        let count = u64::from(u32::MAX) + 128;
+        let budget = ByteBudget::new(count).unwrap();
+        let retained = budget.charge(usize::try_from(count).unwrap()).unwrap();
+        assert_eq!(budget.available(), 0);
+        assert!(budget.charge(1).is_err());
+        let alias = retained.clone();
+        drop(retained);
+        assert_eq!(budget.available(), 0);
+        drop(alias);
+        assert_eq!(budget.available(), usize::try_from(count).unwrap());
+    }
+    #[test]
+    fn simultaneous_contenders_cannot_oversubscribe() {
+        use std::sync::{Barrier, atomic::AtomicUsize};
+        let budget = ByteBudget::new(100).unwrap();
+        let start = Arc::new(Barrier::new(33));
+        let attempted = Arc::new(Barrier::new(33));
+        let release = Arc::new(Barrier::new(33));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..32 {
+            let (budget, start, attempted, release, successes) = (
+                budget.clone(),
+                start.clone(),
+                attempted.clone(),
+                release.clone(),
+                successes.clone(),
+            );
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let charge = budget.charge(7).ok();
+                if charge.is_some() {
+                    successes.fetch_add(1, Ordering::AcqRel);
+                }
+                attempted.wait();
+                release.wait();
+                drop(charge);
+            }));
+        }
+        start.wait();
+        attempted.wait();
+        assert_eq!(successes.load(Ordering::Acquire), 14);
+        assert_eq!(budget.available(), 2);
+        release.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(budget.available(), 100);
     }
 }
