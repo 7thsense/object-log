@@ -11,6 +11,9 @@ pub(crate) struct LocalMetadataHook {
 }
 #[cfg(test)]
 impl LocalBlobStore {
+    pub(crate) fn take_metadata_swap_calls(&self) -> u64 {
+        self.authority_swap_calls.swap(0, Ordering::Relaxed)
+    }
     pub(crate) fn lose_next_metadata_reply(&self, key: &str) {
         *self.authority_lost_reply.lock().unwrap() = Some(key.to_owned());
     }
@@ -286,6 +289,8 @@ impl BoundedMetadataStore for LocalBlobStore {
         limits: MetadataLimits,
         owners: MetadataOwners,
     ) -> Result<MetadataSwap, ObjectLogError> {
+        #[cfg(test)]
+        self.authority_swap_calls.fetch_add(1, Ordering::Relaxed);
         limits.validate_local()?;
         let max_bytes = limits.payload_bytes;
         observed.validate(&self.authority_identity, key)?;

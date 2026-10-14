@@ -190,3 +190,16 @@ resolution, merged/split competitors, and mismatch before incomplete coverage. P
 release performance gates remain separate obligations. S3 response-loss controls
 inject failure after validated HTTP 200 before SDK response processing; they do
 not claim TCP loss or process-crash coverage.
+
+The private retained-publication carrier preserves the original cut/token,
+ordered certificates, sealed binding and writer lineage before dispatch. It
+retains byte admission only. Submit and resolve acquire its mutex inside the
+shared executor's admitted operation, then reconstruct an operation-scoped store.
+The existing publication attempted bit is the sole terminal submission state;
+caller cancellation while waiting for admission does not claim it. A dispatched
+attempt remains available for fresh durable resolution after caller cancellation,
+lost reply or owned-task panic. Cloned submitters may issue at most one original
+conditional write. Construction verifies the admitting store, selected binding
+and literal head key before allocating the carrier. Durable-content resolution
+proves the original complete bytes, not historical writer identity or a workflow
+business outcome. This test-internal carrier is not public backend activation.

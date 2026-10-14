@@ -246,6 +246,19 @@ pub(super) enum Resolution {
     Unknown,
 }
 impl PreparedAppend {
+    pub(super) fn validate_binding(
+        &self,
+        pages: &super::page_store::PageStore,
+        key: &str,
+    ) -> Result<(), ObjectLogError> {
+        pages.require_operation()?;
+        if !Arc::ptr_eq(&self.original.identity, &pages.binding_identity())
+            || self.original.observed.inner.key != key
+        {
+            return Err(invalid("append belongs to another authority binding"));
+        }
+        Ok(())
+    }
     pub async fn resolve_range(
         &self,
         pages: Arc<super::page_store::PageStore>,

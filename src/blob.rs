@@ -343,6 +343,8 @@ pub struct LocalBlobStore {
     authority_hook: Arc<Mutex<Option<Arc<authority::LocalMetadataHook>>>>,
     #[cfg(test)]
     authority_lost_reply: Arc<Mutex<Option<String>>>,
+    #[cfg(test)]
+    authority_swap_calls: Arc<AtomicU64>,
     root: Arc<PathBuf>,
     media_ops: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
@@ -357,6 +359,8 @@ impl LocalBlobStore {
             authority_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             authority_lost_reply: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            authority_swap_calls: Arc::new(AtomicU64::new(0)),
             root: Arc::new(root.into()),
             media_ops: Arc::new(AtomicU64::new(0)),
             bytes_written: Arc::new(AtomicU64::new(0)),
