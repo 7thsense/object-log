@@ -202,6 +202,31 @@ pub(super) struct PageStore {
     _container_charge: Option<Arc<Charge>>,
 }
 impl PageStore {
+    pub(super) fn planned_allocation(
+        store: &dyn NativeStore,
+        prefix: &str,
+        limits: MetadataLimits,
+    ) -> Result<usize, ObjectLogError> {
+        // Config-owned prefix is shared. Reserve the complete generated key,
+        // adapter key copy, encoded page, decoded capacity and source scratch.
+        limits.validate()?;
+        if limits.payload_bytes < PAGE_BYTES {
+            return Err(ObjectLogError::InvalidConfig(
+                "native metadata payload limit cannot hold a page".into(),
+            ));
+        }
+        let key_len = prefix
+            .len()
+            .checked_add(195)
+            .ok_or_else(|| ObjectLogError::InvalidConfig("native key length overflow".into()))?;
+        let allocation = store
+            .page_source_scratch(key_len, limits)?
+            .checked_add(PAGE_BYTES * 4)
+            .ok_or_else(|| {
+                ObjectLogError::InvalidConfig("native page allocation overflow".into())
+            })?;
+        Ok(allocation)
+    }
     pub fn new(
         store: Arc<dyn NativeStore>,
         prefix: String,
@@ -222,24 +247,7 @@ impl PageStore {
                 "native page store binding".into(),
             ));
         }
-        // Config-owned prefix is shared. Reserve the complete generated key,
-        // adapter key copy, encoded page, decoded capacity and source scratch.
-        limits.validate()?;
-        if limits.payload_bytes < PAGE_BYTES {
-            return Err(ObjectLogError::InvalidConfig(
-                "native metadata payload limit cannot hold a page".into(),
-            ));
-        }
-        let key_len = prefix
-            .len()
-            .checked_add(195)
-            .ok_or_else(|| ObjectLogError::InvalidConfig("native key length overflow".into()))?;
-        let allocation = store
-            .page_source_scratch(key_len, limits)?
-            .checked_add(PAGE_BYTES * 4)
-            .ok_or_else(|| {
-                ObjectLogError::InvalidConfig("native page allocation overflow".into())
-            })?;
+        let allocation = Self::planned_allocation(store.as_ref(), &prefix, limits)?;
         if allocation > budget.capacity as usize {
             return Err(ObjectLogError::InvalidConfig(
                 "native budget cannot hold one page".into(),
@@ -588,6 +596,7 @@ impl PageStore {
             version_bytes: self.limits.version_bytes,
         }
     }
+    #[cfg(test)]
     pub fn allocation(&self) -> usize {
         self.allocation
     }

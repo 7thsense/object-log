@@ -87,16 +87,18 @@ legacy JSON, scope mismatch, corrupt bytes, regressed conflict observations and
 epoch exhaustion fail closed. It cannot create heads, migrate manifests, publish
 arbitrary roots or enable Fireweed prefix reuse.
 
-A production native-v2 sequencer must subsequently own this component, publish
-immutable authenticated pages before its head CAS, and commit log and semantic
-roots together. Lazy open/refresh/acquire/install, bounded page proofs and explicit
-retention/reclamation are required; paging lookup alone is insufficient. Consumer
+The `native` feature owns the production head codec and authority core through
+`NativeLog`, publishes immutable authenticated pages before its head CAS, and
+provides lazy open, explicit refresh/acquire, fixed cuts and bounded page proofs.
+The separate head-reader harness remains test-internal. Coupled consumer log and
+semantic-root publication and explicit retention/reclamation remain required;
+paging lookup alone is insufficient. Consumer
 semantics stay outside the SDK. Checksums detect corruption, not authenticated
 provenance or valid-record substitution.
 
 ## Captured index and immutable data
 
-The private native-v2 qualification implementation uses 4096-byte versioned
+The native-v2 implementation exposed through the `native` feature uses 4096-byte versioned
 pages. Version 2 leaf slots are 192 bytes and separately commit complete physical
 and logical identity overflow graphs, positive logical ranges, exact physical byte
 ranges, and payload SHA-256. Fixed fanout and height bounds constrain page/path
@@ -202,4 +204,6 @@ lost reply or owned-task panic. Cloned submitters may issue at most one original
 conditional write. Construction verifies the admitting store, selected binding
 and literal head key before allocating the carrier. Durable-content resolution
 proves the original complete bytes, not historical writer identity or a workflow
-business outcome. This test-internal carrier is not public backend activation.
+business outcome. The `native` feature exposes this retained carrier as `NativePublication`. This
+SDK API exposure does not activate the Fireweed queue backend or qualify coupled
+semantic publication, registry deletion, reclamation or release performance.

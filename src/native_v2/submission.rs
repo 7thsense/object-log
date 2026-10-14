@@ -1,6 +1,8 @@
 //! Retained original publication authority across owned dispatch and lost replies.
+#[cfg(test)]
+use super::head::NativeHead;
 use super::{
-    head::{NativeHead, PreparedAppend, ProofBudget, Resolution},
+    head::{PreparedAppend, ProofBudget, PublishOutcome, Resolution},
     operation::Resources,
     page_store::{Charge, PageBinding, PageStore},
 };
@@ -55,17 +57,17 @@ impl PublicationAttempt {
 
     /// Admission precedes acquisition of the retained attempt. The inner
     /// publication bit is the sole one-shot state and never resets after panic.
-    pub async fn submit(
+    pub async fn submit_outcome(
         self: &Arc<Self>,
         resources: &Arc<Resources>,
         base: Arc<PageStore>,
-    ) -> Result<NativeHead, ObjectLogError> {
+    ) -> Result<PublishOutcome, ObjectLogError> {
         let attempt = self.clone();
         resources
             .run(move |physical| async move {
                 let mut prepared = attempt.prepared.lock().await;
                 let pages = base.in_operation(physical)?.for_binding(&attempt.binding)?;
-                let result = prepared.publish(pages, &attempt.head_key).await;
+                let result = prepared.publish_outcome(pages, &attempt.head_key).await;
                 #[cfg(test)]
                 assert!(
                     !attempt
@@ -77,6 +79,20 @@ impl PublicationAttempt {
                 result
             })
             .await
+    }
+
+    #[cfg(test)]
+    pub async fn submit(
+        self: &Arc<Self>,
+        resources: &Arc<Resources>,
+        base: Arc<PageStore>,
+    ) -> Result<super::head::NativeHead, ObjectLogError> {
+        match self.submit_outcome(resources, base).await? {
+            PublishOutcome::Stored(head) => Ok(head),
+            PublishOutcome::Conflict => Err(ObjectLogError::Sequencer(
+                "original append authority changed".into(),
+            )),
+        }
     }
 
     /// Resolution always observes storage using the retained original cut and

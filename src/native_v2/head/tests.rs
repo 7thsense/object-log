@@ -1863,3 +1863,81 @@ async fn real_s3_runs_identical_group_contract_in_both_signing_modes() {
         .await;
     }
 }
+
+#[tokio::test]
+async fn fence_conflicts_preserve_shared_prefix_and_unreadable_higher_epoch() {
+    use crate::native_v2::{
+        codec::Scope,
+        operation::{ExecutionConfig, Resources},
+        page_store::PageStore,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalBlobStore::new(directory.path()));
+    let empty = NativeHead {
+        index_root: None,
+        next_offset: 0,
+        semantic_anchor: SemanticCoverage::Uninitialized,
+        ..head()
+    };
+    local
+        .put("head", Bytes::copy_from_slice(&empty.encode()))
+        .await
+        .unwrap();
+    let resources = Resources::new(ExecutionConfig {
+        workers: 2,
+        blocking_workers: 2,
+        operations: 1,
+        bytes: 1 << 20,
+    })
+    .unwrap();
+    let base = PageStore::new(
+        local.clone(),
+        "pages".into(),
+        Scope {
+            namespace: empty.namespace,
+            incarnation: empty.incarnation,
+        },
+        resources.bytes.clone(),
+        MetadataLimits {
+            payload_bytes: 4096,
+            version_bytes: 56,
+        },
+    )
+    .unwrap();
+    resources.run(move |physical| async move {
+        let pages = base.in_operation(physical)?;
+        let original = CapturedHead::capture(&pages, "head").await?;
+        let knowledge = AuthorityKnowledge::new(&original, &pages)?;
+        let copied = NativeHead { epoch: 1000, ..empty };
+        local.put("copied-head", Bytes::copy_from_slice(&copied.encode())).await?;
+        assert!(matches!(knowledge.observe(pages.clone(), "copied-head").await, Err(ObjectLogError::Sequencer(message)) if message == "knowledge belongs to another authority binding"));
+        assert_eq!(knowledge.gate.lock().await.highest_epoch, empty.epoch);
+
+        let peer = original.acquire_and_recapture(&pages, "head").await?;
+        let mut append = peer.prepare_append(pages.clone(), "peer", b"peer bytes", 1).await?;
+        let advanced = append.publish(pages.clone(), "head").await?;
+        assert!(original.acquire_with_knowledge(&pages, "head", knowledge.clone()).await.is_err());
+        assert_eq!(knowledge.gate.lock().await.floor, advanced);
+        local.put("head", Bytes::copy_from_slice(&empty.encode())).await?;
+        assert!(knowledge.observe(pages.clone(), "head").await?.is_none());
+        local.take_metadata_swap_calls();
+        assert!(original.acquire_with_knowledge(&pages, "head", knowledge).await.is_err());
+        assert_eq!(local.take_metadata_swap_calls(), 0);
+
+        let unreadable_knowledge = AuthorityKnowledge::new(&original, &pages)?;
+        let mut missing = advanced;
+        missing.epoch += 5;
+        missing.index_root.as_mut().unwrap().hash = [88; 32];
+        local.put("head", Bytes::copy_from_slice(&missing.encode())).await?;
+        assert!(original.acquire_with_knowledge(&pages, "head", unreadable_knowledge.clone()).await.is_err());
+        assert_eq!(unreadable_knowledge.gate.lock().await.highest_epoch, missing.epoch);
+        assert_eq!(unreadable_knowledge.gate.lock().await.floor, empty);
+        local.put("head", Bytes::copy_from_slice(&empty.encode())).await?;
+        assert!(unreadable_knowledge.observe(pages.clone(), "head").await?.is_none());
+        local.take_metadata_swap_calls();
+        assert!(original.acquire_with_knowledge(&pages, "head", unreadable_knowledge).await.is_err());
+        assert_eq!(local.take_metadata_swap_calls(), 0);
+        Ok(())
+    }).await.unwrap();
+    resources.close_and_drain().await.unwrap();
+}

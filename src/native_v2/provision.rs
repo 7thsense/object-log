@@ -1,7 +1,7 @@
 //! Private candidate election. Existing bindings never authorize empty replacement.
 use super::{
     codec::Scope,
-    head::{CapturedHead, HEAD_BYTES, NativeHead},
+    head::{AuthorityKnowledge, CapturedHead, HEAD_BYTES, NativeHead},
     page_store::{Charge, PageBinding, PageStore},
 };
 use crate::{MetadataSnapshot, MetadataSwap, ObjectLogError};
@@ -11,11 +11,24 @@ const MAGIC: &[u8; 8] = b"ONB2\0\0\0\x01";
 const HEADER: usize = 80;
 const DIGEST: usize = 32;
 
+pub(super) fn candidate_keys(prefix: &str, scope: Scope) -> (String, String) {
+    let stem = format!(
+        "{prefix}/candidates/{}/{}",
+        hex(&scope.namespace),
+        hex(&scope.incarnation)
+    );
+    (format!("{stem}/head"), format!("{stem}/pages"))
+}
+
 pub(super) struct NamespaceContext {
     pages: Arc<PageStore>,
     prefix: Arc<str>,
     binding_limit: usize,
     _charge: Arc<Charge>,
+}
+pub(super) struct ChargedHeadKey {
+    pub key: String,
+    pub charge: Arc<Charge>,
 }
 struct OwnedBinding {
     bytes: Vec<u8>,
@@ -41,11 +54,23 @@ pub(super) struct PublishedNamespace {
     literal: Vec<u8>,
     binding: MetadataSnapshot,
     captured: CapturedHead,
+    knowledge: Arc<AuthorityKnowledge>,
     identity: Arc<()>,
     registry_prefix: Arc<str>,
     selected: PageBinding,
     scope: Scope,
     _charge: Arc<Charge>,
+}
+pub(super) struct RetainedRead {
+    pub captured: CapturedHead,
+    pub binding: PageBinding,
+    pub knowledge: Arc<AuthorityKnowledge>,
+    pub charge: Arc<Charge>,
+}
+// Preserve knowledge and byte ownership when a dispatch borrows only the
+// captured head and binding fields from this retained carrier.
+impl Drop for RetainedRead {
+    fn drop(&mut self) {}
 }
 impl NamespaceContext {
     pub fn new(
@@ -100,13 +125,7 @@ impl NamespaceContext {
         format!("{}/bindings/{}", self.prefix, hex(&namespace))
     }
     fn candidate_keys(&self, scope: Scope) -> (String, String) {
-        let stem = format!(
-            "{}/candidates/{}/{}",
-            self.prefix,
-            hex(&scope.namespace),
-            hex(&scope.incarnation)
-        );
-        (format!("{stem}/head"), format!("{stem}/pages"))
+        candidate_keys(&self.prefix, scope)
     }
     pub async fn open(
         self: &Arc<Self>,
@@ -139,10 +158,12 @@ impl NamespaceContext {
         let (head_key, page_prefix) = self.candidate_keys(scope);
         let pages = self.pages.derive(page_prefix, scope)?;
         let captured = CapturedHead::capture(&pages, &head_key).await?;
+        let knowledge = AuthorityKnowledge::new(&captured, &pages)?;
         Ok(PublishedNamespace {
             literal: literal.to_vec(),
             binding,
             captured,
+            knowledge,
             identity: self.pages.binding_identity(),
             registry_prefix: self.prefix.clone(),
             selected: pages.seal_binding()?,
@@ -163,14 +184,16 @@ impl NamespaceContext {
         }
         let pages = self.pages.for_binding(&known.selected)?;
         let (head_key, _) = self.candidate_keys(known.scope);
-        let captured = CapturedHead::capture(&pages, &head_key).await?;
-        if !known.captured.validates_successor(pages, &captured).await? {
-            return Err(invalid("known namespace authority regressed"));
-        }
+        let captured = known
+            .knowledge
+            .observe(pages, &head_key)
+            .await?
+            .ok_or_else(|| invalid("known namespace authority regressed"))?;
         Ok(PublishedNamespace {
             literal: known.literal,
             binding: current,
             captured,
+            knowledge: known.knowledge,
             identity: known.identity,
             registry_prefix: known.registry_prefix,
             selected: known.selected,
@@ -343,9 +366,51 @@ impl NativeProvisionAttempt {
     }
 }
 impl PublishedNamespace {
+    pub(super) fn retained_read(&self) -> Result<RetainedRead, ObjectLogError> {
+        Ok(RetainedRead {
+            captured: self.captured.clone(),
+            binding: self.selected.clone(),
+            knowledge: self.knowledge.clone(),
+            charge: self._charge.clone(),
+        })
+    }
+    pub(super) fn duplicate(&self, context: &NamespaceContext) -> Result<Self, ObjectLogError> {
+        self.validate_context(context)?;
+        let charge = context.key_charge(&self.literal)?;
+        Ok(Self {
+            literal: self.literal.clone(),
+            binding: self.binding.clone(),
+            captured: self.captured.clone(),
+            knowledge: self.knowledge.clone(),
+            identity: self.identity.clone(),
+            registry_prefix: self.registry_prefix.clone(),
+            selected: self.selected.clone(),
+            scope: self.scope,
+            _charge: charge,
+        })
+    }
+    pub(super) fn charged_head_key(
+        &self,
+        context: &NamespaceContext,
+        extra: usize,
+    ) -> Result<ChargedHeadKey, ObjectLogError> {
+        self.validate_context(context)?;
+        let bytes = context
+            .prefix
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(2048))
+            .and_then(|n| n.checked_add(extra))
+            .ok_or_else(|| invalid("head key allocation overflow"))?;
+        let charge = context.pages.charge_output(bytes)?;
+        let (key, _) = context.candidate_keys(self.scope);
+        Ok(ChargedHeadKey { key, charge })
+    }
+    #[cfg(test)]
     pub fn scope(&self) -> Scope {
         self.scope
     }
+    #[cfg(test)]
     pub fn head_bytes(&self) -> [u8; HEAD_BYTES] {
         self.captured.head_bytes()
     }
@@ -363,7 +428,7 @@ impl PublishedNamespace {
         let (head_key, _) = context.candidate_keys(self.scope);
         let writer = self
             .captured
-            .acquire_and_recapture(&pages, &head_key)
+            .acquire_with_knowledge(&pages, &head_key, self.knowledge.clone())
             .await?;
         Ok((writer, self.selected))
     }
@@ -404,7 +469,7 @@ fn decode_binding(raw: &[u8], literal: &[u8]) -> Result<Scope, ObjectLogError> {
     }
     Ok(scope)
 }
-fn validate_prefix(prefix: &str) -> Result<(), ObjectLogError> {
+pub(super) fn validate_prefix(prefix: &str) -> Result<(), ObjectLogError> {
     if prefix.is_empty()
         || prefix.starts_with('/')
         || prefix.contains('\0')

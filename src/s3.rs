@@ -214,7 +214,7 @@ impl S3BlobStore {
     // Explicit source-copy allowance for page caller/request/snapshot keys,
     // overlapping observed/conflict tokens and bucket strings. HTTP parser,
     // encoded URI, connection/TLS buffers and total SDK residency are separate.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native"))]
     pub(crate) fn native_page_source_scratch(
         &self,
         key_len: usize,

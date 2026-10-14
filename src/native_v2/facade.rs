@@ -1,0 +1,686 @@
+//! Native append-log facade. Queue policy remains in the consumer's planners.
+use super::{
+    codec::Scope,
+    data::DataFrame,
+    head::{
+        AppendGroupLimits, AppendInput, FencedHead, NativeHead, OwnedPayload, ProofBudget,
+        PublishOutcome, Resolution,
+    },
+    operation::{ExecutionConfig, Physical, Resources},
+    page_store::{Charge, NativeStore, PageBinding, PageStore},
+    provision::{NamespaceContext, PublishedNamespace, RetainedRead},
+    submission::PublicationAttempt,
+};
+use crate::{LocalBlobStore, MetadataLimits, ObjectLogError};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Explicit store-wide execution and owned-byte limits.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeLimits {
+    /// Executor worker threads, from one through 64.
+    pub workers: usize,
+    /// Blocking worker threads, from one through 64.
+    pub blocking_workers: usize,
+    /// Concurrent physical operations.
+    pub operations: usize,
+    /// Shared retained and in-flight owned-byte admission.
+    pub bytes: u32,
+    /// Maximum opaque metadata version bytes.
+    pub version_bytes: usize,
+    /// Maximum complete literal namespace binding frame bytes.
+    pub binding_bytes: usize,
+    /// Maximum entries in one conditional append group.
+    pub group_entries: usize,
+    /// Maximum aggregate framed bytes in one append group.
+    pub group_bytes: usize,
+}
+impl NativeLimits {
+    fn validate(self) -> Result<(), ObjectLogError> {
+        if self.workers == 0
+            || self.workers > 64
+            || self.blocking_workers == 0
+            || self.blocking_workers > 64
+            || self.operations == 0
+            || self.operations > tokio::sync::Semaphore::MAX_PERMITS
+            || self.bytes == 0
+            || self.bytes as usize > tokio::sync::Semaphore::MAX_PERMITS
+            || self.version_bytes == 0
+            || self.binding_bytes <= 112
+            || self.binding_bytes > self.bytes as usize
+            || self.group_entries == 0
+            || self.group_bytes == 0
+            || self.group_bytes > self.bytes as usize
+        {
+            return Err(ObjectLogError::InvalidConfig("native store limits".into()));
+        }
+        Ok(())
+    }
+}
+struct Owner {
+    resources: Arc<Resources>,
+    pages: Arc<PageStore>,
+    prefix: Arc<str>,
+    limits: NativeLimits,
+    identity: Arc<()>,
+}
+impl Owner {
+    fn context(&self, physical: Arc<Physical>) -> Result<Arc<NamespaceContext>, ObjectLogError> {
+        let pages = self.pages.in_operation(physical)?;
+        let _copy = pages.charge_output(self.prefix.len() + std::mem::size_of::<String>())?;
+        NamespaceContext::new(pages, self.prefix.to_string(), self.limits.binding_bytes)
+    }
+}
+/// One bounded executor and byte pool shared by all namespaces and clones.
+#[derive(Clone)]
+pub struct NativeLog {
+    owner: Arc<Owner>,
+}
+/// Validated namespace identity with shared monotonic authority knowledge.
+#[derive(Clone)]
+pub struct NativeNamespace {
+    state: Arc<NamespaceState>,
+    origin: Arc<()>,
+}
+struct NamespaceState {
+    known: Mutex<PublishedNamespace>,
+    _charge: Arc<Charge>,
+}
+/// Immutable authenticated read cut; payload reads do not refresh its head.
+pub struct NativeReadCut {
+    read: RetainedRead,
+    origin: Arc<()>,
+}
+struct WriterBinding {
+    writer: FencedHead,
+    binding: PageBinding,
+    head_key: String,
+    _charge: Arc<Charge>,
+}
+/// Sealed writer family. Clones share knowledge and fencing authority.
+#[derive(Clone)]
+pub struct NativeWriter {
+    inner: Arc<Mutex<WriterBinding>>,
+    origin: Arc<()>,
+}
+/// Caller-retained original publication proof, including after reply loss.
+#[derive(Clone)]
+pub struct NativePublication {
+    attempt: Arc<PublicationAttempt>,
+    origin: Arc<()>,
+}
+/// Borrowed append input; backend-owned copies are admitted before allocation.
+pub struct NativeAppend<'a> {
+    /// Complete immutable logical identity.
+    pub identity: &'a str,
+    /// Opaque checked consumer record bytes.
+    pub payload: &'a [u8],
+    /// Number of logical records represented by this entry.
+    pub records: u32,
+}
+struct OwnedAppend {
+    identity: String,
+    payload: Vec<u8>,
+    records: u32,
+}
+struct LiteralInput {
+    bytes: Vec<u8>,
+    _charge: Arc<Charge>,
+}
+struct Inputs {
+    entries: Vec<OwnedAppend>,
+    _charge: Arc<Charge>,
+}
+// Drop implementations force whole-container capture under Rust's precise
+// closure capture: input bytes cannot outlive their admission field.
+impl Drop for LiteralInput {
+    fn drop(&mut self) {}
+}
+impl Drop for Inputs {
+    fn drop(&mut self) {}
+}
+
+/// Result of the original conditional publication, after authority validation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativePublishOutcome {
+    /// The exact original conditional write succeeded.
+    Stored(NativeHead),
+    /// Storage rejected the original condition; current authority validated.
+    Conflict,
+}
+
+/// Complete original content resolution; does not establish writer identity.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeResolution {
+    /// All original ordered certificates are durably covered.
+    DurableContent,
+    /// Complete competing coverage is incompatible with the original content.
+    IncompatibleCoverage,
+    /// Available authenticated coverage cannot classify the complete range.
+    Unknown,
+}
+/// A charged payload and its authenticated logical range.
+pub struct NativeRecord {
+    base: u64,
+    records: u32,
+    payload: OwnedPayload,
+    _charge: Arc<Charge>,
+}
+impl NativeRecord {
+    /// First logical offset represented by this immutable entry.
+    pub fn base_offset(&self) -> u64 {
+        self.base
+    }
+    /// Number of logical records in this entry.
+    pub fn record_count(&self) -> u32 {
+        self.records
+    }
+    /// Borrow payload bytes while their retained owner is alive.
+    pub fn bytes(&self) -> &[u8] {
+        self.payload.bytes()
+    }
+}
+impl NativeReadCut {
+    /// Opaque complete captured authority, without a mutable root interface.
+    pub fn head(&self) -> NativeHead {
+        self.read.captured.value()
+    }
+}
+impl NativeLog {
+    /// Configure a local native log without contacting storage.
+    pub fn local(
+        store: LocalBlobStore,
+        prefix: String,
+        limits: NativeLimits,
+    ) -> Result<Self, ObjectLogError> {
+        Self::new(Arc::new(store), prefix, limits)
+    }
+    /// Configure an S3 native log over an already configured adapter.
+    #[cfg(feature = "s3")]
+    pub fn s3(
+        store: crate::S3BlobStore,
+        prefix: String,
+        limits: NativeLimits,
+    ) -> Result<Self, ObjectLogError> {
+        Self::new(Arc::new(store), prefix, limits)
+    }
+    fn new(
+        store: Arc<dyn NativeStore>,
+        prefix: String,
+        limits: NativeLimits,
+    ) -> Result<Self, ObjectLogError> {
+        limits.validate()?;
+        super::provision::validate_prefix(&prefix)?;
+        let metadata = MetadataLimits {
+            payload_bytes: limits.binding_bytes.max(limits.group_bytes).max(4096),
+            version_bytes: limits.version_bytes,
+        };
+        let page_prefix = format!("{prefix}/wire-pages");
+        let registry_prefix = format!("{prefix}/namespaces");
+        let (_, derived_prefix) = super::provision::candidate_keys(
+            &registry_prefix,
+            Scope {
+                namespace: [1; 32],
+                incarnation: [1; 32],
+            },
+        );
+        let required = PageStore::planned_allocation(store.as_ref(), &derived_prefix, metadata)?;
+        if required > limits.bytes as usize {
+            return Err(invalid("native configuration exceeds byte admission"));
+        }
+        let resources = Resources::new(ExecutionConfig {
+            workers: limits.workers,
+            blocking_workers: limits.blocking_workers,
+            operations: limits.operations,
+            bytes: limits.bytes,
+        })?;
+        let pages = PageStore::new(
+            store,
+            page_prefix,
+            Scope {
+                namespace: [1; 32],
+                incarnation: [1; 32],
+            },
+            resources.bytes.clone(),
+            metadata,
+        )?;
+        Ok(Self {
+            owner: Arc::new(Owner {
+                resources,
+                pages,
+                prefix: registry_prefix.into(),
+                limits,
+                identity: Arc::new(()),
+            }),
+        })
+    }
+    fn check(&self, origin: &Arc<()>) -> Result<(), ObjectLogError> {
+        if !Arc::ptr_eq(origin, &self.owner.identity) {
+            return Err(invalid("native handle belongs to another store"));
+        }
+        Ok(())
+    }
+    fn literal(&self, literal: &[u8]) -> Result<LiteralInput, ObjectLogError> {
+        if literal.is_empty()
+            || literal
+                .len()
+                .checked_add(112)
+                .is_none_or(|n| n > self.owner.limits.binding_bytes)
+        {
+            return Err(invalid("literal namespace binding limit"));
+        }
+        let charge = self.owner.pages.charge_output(
+            literal
+                .len()
+                .checked_add(std::mem::size_of::<Vec<u8>>())
+                .ok_or_else(|| invalid("literal size"))?,
+        )?;
+        Ok(LiteralInput {
+            bytes: literal.to_vec(),
+            _charge: charge,
+        })
+    }
+    /// Capture an existing namespace. Missing/corrupt selected authority fails closed.
+    pub async fn open(&self, literal: &[u8]) -> Result<Option<NativeNamespace>, ObjectLogError> {
+        let literal = self.literal(literal)?;
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let context = owner.context(physical)?;
+                let Some(known) = context.open(&literal.bytes).await? else {
+                    return Ok(None);
+                };
+                let charge = owner.pages.charge_output(
+                    std::mem::size_of::<NamespaceState>() + 2 * std::mem::size_of::<usize>(),
+                )?;
+                Ok(Some(NativeNamespace {
+                    state: Arc::new(NamespaceState {
+                        known: Mutex::new(known),
+                        _charge: charge,
+                    }),
+                    origin: owner.identity.clone(),
+                }))
+            })
+            .await
+    }
+    /// Explicitly publish a new empty namespace candidate; this does not provision a queue.
+    pub async fn provision_new(&self, literal: &[u8]) -> Result<NativeNamespace, ObjectLogError> {
+        let literal = self.literal(literal)?;
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let context = owner.context(physical)?;
+                let charge = owner.pages.charge_output(
+                    std::mem::size_of::<NamespaceState>() + 2 * std::mem::size_of::<usize>(),
+                )?;
+                let mut attempt = context.attempt(&literal.bytes).await?;
+                attempt.prepare_candidate().await?;
+                let known = attempt.publish().await?;
+                Ok(NativeNamespace {
+                    state: Arc::new(NamespaceState {
+                        known: Mutex::new(known),
+                        _charge: charge,
+                    }),
+                    origin: owner.identity.clone(),
+                })
+            })
+            .await
+    }
+    /// Validate fresh authority and retain its knowledge before delivering a fixed cut.
+    pub async fn capture(
+        &self,
+        namespace: &NativeNamespace,
+    ) -> Result<NativeReadCut, ObjectLogError> {
+        self.check(&namespace.origin)?;
+        let namespace = namespace.clone();
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let context = owner.context(physical)?;
+                let mut known = namespace.state.known.lock().await;
+                let current = context.capture_known(known.duplicate(&context)?).await?;
+                *known = current;
+                Ok(NativeReadCut {
+                    read: known.retained_read()?,
+                    origin: owner.identity.clone(),
+                })
+            })
+            .await
+    }
+    /// Fence the exact retained observation; no hidden fresh capture precedes CAS.
+    pub async fn acquire(
+        &self,
+        namespace: &NativeNamespace,
+    ) -> Result<NativeWriter, ObjectLogError> {
+        self.check(&namespace.origin)?;
+        let namespace = namespace.clone();
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let context = owner.context(physical)?;
+                let known = namespace.state.known.lock().await;
+                let selected = known.duplicate(&context)?;
+                let charged_key = selected.charged_head_key(
+                    &context,
+                    std::mem::size_of::<Mutex<WriterBinding>>() + 2 * std::mem::size_of::<usize>(),
+                )?;
+                let (writer, binding) = selected.into_writer(&context).await?;
+                Ok(NativeWriter {
+                    inner: Arc::new(Mutex::new(WriterBinding {
+                        writer,
+                        binding,
+                        head_key: charged_key.key,
+                        _charge: charged_key.charge,
+                    })),
+                    origin: owner.identity.clone(),
+                })
+            })
+            .await
+    }
+    /// Explicitly refresh a writer in its acquired epoch, without another fence.
+    /// The fresh observation is retained before the response is delivered.
+    pub async fn refresh_writer(
+        &self,
+        writer: &NativeWriter,
+    ) -> Result<NativeReadCut, ObjectLogError> {
+        self.check(&writer.origin)?;
+        let writer = writer.clone();
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let pages = owner.pages.in_operation(physical)?;
+                let mut writer = writer.inner.lock().await;
+                let selected = pages.for_binding(&writer.binding)?;
+                let current = writer
+                    .writer
+                    .clone()
+                    .refresh(selected, &writer.head_key)
+                    .await?;
+                writer.writer = current;
+                Ok(NativeReadCut {
+                    read: RetainedRead {
+                        captured: writer.writer.snapshot().clone(),
+                        binding: writer.binding.clone(),
+                        knowledge: writer.writer.knowledge(),
+                        charge: writer._charge.clone(),
+                    },
+                    origin: owner.identity.clone(),
+                })
+            })
+            .await
+    }
+
+    /// Prepare immutable group objects without publishing the authoritative head.
+    pub async fn prepare(
+        &self,
+        writer: &NativeWriter,
+        inputs: &[NativeAppend<'_>],
+    ) -> Result<NativePublication, ObjectLogError> {
+        self.check(&writer.origin)?;
+        if inputs.is_empty() || inputs.len() > self.owner.limits.group_entries {
+            return Err(invalid("native group entry limit"));
+        }
+        let mut framed = 0usize;
+        let mut allocation = std::mem::size_of::<Inputs>();
+        for (i, input) in inputs.iter().enumerate() {
+            if input.records == 0
+                || input.identity.is_empty()
+                || input.identity.contains('\0')
+                || inputs[..i]
+                    .iter()
+                    .any(|prior| prior.identity == input.identity)
+            {
+                return Err(invalid("native append identity or count"));
+            }
+            framed = framed
+                .checked_add(DataFrame::encoded_len(input.identity, input.payload.len())?)
+                .ok_or_else(|| invalid("native group bytes"))?;
+            allocation = allocation
+                .checked_add(input.identity.len())
+                .and_then(|n| n.checked_add(input.payload.len()))
+                .and_then(|n| {
+                    n.checked_add(
+                        std::mem::size_of::<OwnedAppend>() + std::mem::size_of::<AppendInput<'_>>(),
+                    )
+                })
+                .ok_or_else(|| invalid("native input allocation"))?;
+        }
+        if framed > self.owner.limits.group_bytes {
+            return Err(invalid("native group framed limit"));
+        }
+        let charge = self.owner.pages.charge_output(allocation)?;
+        let inputs = Inputs {
+            entries: inputs
+                .iter()
+                .map(|i| OwnedAppend {
+                    identity: i.identity.into(),
+                    payload: i.payload.into(),
+                    records: i.records,
+                })
+                .collect(),
+            _charge: charge,
+        };
+        let writer = writer.clone();
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let scoped = owner.pages.in_operation(physical)?;
+                let writer = writer.inner.lock().await;
+                let pages = scoped.for_binding(&writer.binding)?;
+                let references: Vec<_> = inputs
+                    .entries
+                    .iter()
+                    .map(|i| AppendInput {
+                        object_id: &i.identity,
+                        payload: &i.payload,
+                        records: i.records,
+                    })
+                    .collect();
+                let prepared = writer
+                    .writer
+                    .clone()
+                    .prepare_group(
+                        pages.clone(),
+                        &references,
+                        AppendGroupLimits {
+                            entries: owner.limits.group_entries,
+                            framed_bytes: owner.limits.group_bytes,
+                        },
+                    )
+                    .await?;
+                let attempt = PublicationAttempt::new(
+                    &pages,
+                    prepared,
+                    writer.binding.clone(),
+                    &writer.head_key,
+                )?;
+                Ok(NativePublication {
+                    attempt,
+                    origin: owner.identity.clone(),
+                })
+            })
+            .await
+    }
+    /// Submit the retained original transition once; errors require original resolution.
+    pub async fn submit(
+        &self,
+        publication: &NativePublication,
+    ) -> Result<NativePublishOutcome, ObjectLogError> {
+        self.check(&publication.origin)?;
+        Ok(
+            match publication
+                .attempt
+                .submit_outcome(&self.owner.resources, self.owner.pages.clone())
+                .await?
+            {
+                PublishOutcome::Stored(head) => NativePublishOutcome::Stored(head),
+                PublishOutcome::Conflict => NativePublishOutcome::Conflict,
+            },
+        )
+    }
+    /// Resolve the complete original group using bounded actual competing entries.
+    pub async fn resolve(
+        &self,
+        publication: &NativePublication,
+        entries: usize,
+    ) -> Result<NativeResolution, ObjectLogError> {
+        self.check(&publication.origin)?;
+        Ok(
+            match publication
+                .attempt
+                .resolve(
+                    &self.owner.resources,
+                    self.owner.pages.clone(),
+                    ProofBudget { entries },
+                )
+                .await?
+            {
+                Resolution::DurableContent => NativeResolution::DurableContent,
+                Resolution::Rejected => NativeResolution::IncompatibleCoverage,
+                Resolution::Unknown => NativeResolution::Unknown,
+            },
+        )
+    }
+    /// Read only the original authenticated cut; validate touched pages and frame bytes.
+    pub async fn read(
+        &self,
+        cut: &NativeReadCut,
+        offset: u64,
+    ) -> Result<Option<NativeRecord>, ObjectLogError> {
+        self.check(&cut.origin)?;
+        let read = RetainedRead {
+            captured: cut.read.captured.clone(),
+            binding: cut.read.binding.clone(),
+            knowledge: cut.read.knowledge.clone(),
+            charge: cut.read.charge.clone(),
+        };
+        let owner = self.owner.clone();
+        self.owner
+            .resources
+            .run(move |physical| async move {
+                let pages = owner
+                    .pages
+                    .in_operation(physical)?
+                    .for_binding(&read.binding)?;
+                let charge = pages.charge_output(std::mem::size_of::<NativeRecord>())?;
+                let Some((base, records, payload)) =
+                    read.captured.read_record(pages, offset).await?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(NativeRecord {
+                    base,
+                    records,
+                    payload,
+                    _charge: charge,
+                }))
+            })
+            .await
+    }
+    /// Close admission and drain actual owned work; retained byte-only handles may survive.
+    pub async fn shutdown(&self) -> Result<(), ObjectLogError> {
+        self.owner.resources.close_and_drain().await
+    }
+}
+fn invalid(message: &str) -> ObjectLogError {
+    ObjectLogError::InvalidBatch(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn constructor_rejects_derived_page_allocation_minus_one_before_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::LocalBlobStore::new(directory.path());
+        let prefix = "derived-allocation";
+        let metadata = MetadataLimits {
+            payload_bytes: 4096,
+            version_bytes: 4096,
+        };
+        let (_, derived) = super::super::provision::candidate_keys(
+            &format!("{prefix}/namespaces"),
+            Scope {
+                namespace: [1; 32],
+                incarnation: [1; 32],
+            },
+        );
+        let required = PageStore::planned_allocation(&store, &derived, metadata).unwrap();
+        let base = PageStore::planned_allocation(&store, &format!("{prefix}/wire-pages"), metadata)
+            .unwrap();
+        assert!(required > base);
+        let mut limits = NativeLimits {
+            workers: 1,
+            blocking_workers: 1,
+            operations: 1,
+            bytes: (required - 1).try_into().unwrap(),
+            version_bytes: 4096,
+            binding_bytes: 256,
+            group_entries: 1,
+            group_bytes: 4096,
+        };
+        assert!(NativeLog::local(store.clone(), prefix.into(), limits).is_err());
+        assert!(crate::BlobStore::list(&store, "").await.unwrap().is_empty());
+        limits.bytes = required.try_into().unwrap();
+        let log = NativeLog::local(store.clone(), prefix.into(), limits).unwrap();
+        assert!(crate::BlobStore::list(&store, "").await.unwrap().is_empty());
+        log.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_namespace_state_retains_credit_after_caller_abort() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = NativeLog::local(
+            crate::LocalBlobStore::new(directory.path()),
+            "cancelled-namespace".into(),
+            NativeLimits {
+                workers: 2,
+                blocking_workers: 2,
+                operations: 4,
+                bytes: 4 << 20,
+                version_bytes: 4096,
+                binding_bytes: 4096,
+                group_entries: 16,
+                group_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
+        let before = log.owner.resources.bytes.available();
+        let namespace = log.provision_new(b"queue").await.unwrap();
+        let weak = Arc::downgrade(&namespace.state);
+        let admitted_credit = log.owner.resources.bytes.available();
+        assert!(admitted_credit < before);
+        let resources = log.owner.resources.clone();
+        let (started, admitted) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            resources
+                .run(move |_physical| async move {
+                    // Deliberately use only the state field: this reproduces precise
+                    // closure capture in capture/acquire without timing-dependent IO.
+                    let guard = namespace.state.known.lock().await;
+                    started.send(()).unwrap();
+                    resume.await.unwrap();
+                    drop(guard);
+                    Ok(())
+                })
+                .await
+        });
+        admitted.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(weak.upgrade().is_some());
+        assert_eq!(log.owner.resources.bytes.available(), admitted_credit);
+        release.send(()).unwrap();
+        log.shutdown().await.unwrap();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(log.owner.resources.bytes.available(), before);
+    }
+}

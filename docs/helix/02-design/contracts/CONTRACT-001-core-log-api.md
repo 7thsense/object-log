@@ -175,3 +175,40 @@ fetched:
 - [x] Error handling is explicit.
 - [x] Executable tests can be derived (see test plan).
 - [x] Non-normative notes cannot be mistaken for requirements.
+
+## Bounded native append facade
+
+The `native` feature exposes `NativeLog` independently of the legacy sequencer
+interface. Local and S3 adapters use the same namespace, writer, publication and
+fixed-cut operations. `NativeLimits` specifies store-wide execution admission,
+retained byte admission, opaque version size, namespace-binding size, append
+entry count and framed append-group size. Namespace size does not constrain
+payload size. Invalid page allocation limits fail before executor creation.
+
+`open` observes an existing namespace; `provision_new` explicitly publishes an
+empty candidate. Empty candidate election is not consumer queue provisioning:
+the consumer must establish its unique genesis and semantic authority.
+`acquire` fences the exact retained namespace observation. `capture` and
+`refresh_writer` explicitly observe fresh authority; immutable read cuts never
+refresh while reading. Derived handles share monotonic authority knowledge.
+This family knowledge is not a global registry or cold-restart rollback oracle.
+
+`prepare` admits and retains the complete ordered append group and its original
+conditional authority. `submit` attempts that original transition once.
+`NativePublishOutcome::Stored` proves the exact conditional write succeeded;
+`Conflict` requires an actual rejected storage condition and fully validated
+current authority. Regressed, malformed or incompatible authority is an error.
+An error or lost reply never grants permission to prepare a replacement as if
+the original were absent. The retained publication supports bounded `resolve`:
+`DurableContent` proves complete original ordered content, `IncompatibleCoverage`
+proves complete competing content, and `Unknown` provides neither proof.
+Content resolution does not establish which writer published it.
+
+Admitted operations own their work through caller cancellation. Namespace,
+writer, publication, cut and payload allocations retain their byte credits until
+the corresponding owned bytes are destroyed. `shutdown` closes admission and
+drains physical work; retained byte-only handles may outlive it. Payload reads
+use one authenticated captured-root lookup for range and content validation.
+The external append/reopen contract runs unchanged on Local and explicitly
+configured S3, with both S3 payload-signing modes. These checks do not establish
+provider durability, consumer semantic-index correctness or release throughput.

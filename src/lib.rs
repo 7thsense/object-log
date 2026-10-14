@@ -49,7 +49,7 @@ mod budget;
 mod engine;
 mod error;
 mod manifest_sequencer;
-#[cfg(test)]
+#[cfg(any(test, feature = "native"))]
 mod native_v2;
 #[cfg(feature = "s3")]
 mod s3;
@@ -76,3 +76,11 @@ pub use sequencer::{
     AuthoritativePartitionState, BatchLocation, CommitBatch, CommitOutcome,
     ConditionalCommitOutcome, InMemorySequencer, IndexEntry, PartitionKey, Sequencer,
 };
+
+#[cfg(feature = "native")]
+pub use native_v2::facade::{
+    NativeAppend, NativeLimits, NativeLog, NativeNamespace, NativePublication,
+    NativePublishOutcome, NativeReadCut, NativeRecord, NativeResolution, NativeWriter,
+};
+#[cfg(feature = "native")]
+pub use native_v2::head::NativeHead;

@@ -134,6 +134,15 @@ jobs:
           OBJECT_LOG_S3_SECRET: minioadmin
           OBJECT_LOG_S3_REGION: us-east-1
 
+      - name: Native public facade parity and cold reopen
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_REGION: us-east-1
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+        run: cargo test --features native,s3 --test native_facade external_s3_common_append_reopen_contract_both_signing_modes -- --ignored --exact
+
   docs:
     runs-on: ubuntu-latest
     steps:

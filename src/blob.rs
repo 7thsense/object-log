@@ -369,7 +369,7 @@ impl LocalBlobStore {
 
     // Conservative capacity for caller/snapshot keys, joined paths, CAS lock and
     // temp paths in the bounded metadata adapter. Includes retained root capacity.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native"))]
     pub(crate) fn native_page_source_scratch(
         &self,
         key_len: usize,

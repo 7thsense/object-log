@@ -20,6 +20,8 @@ exclude = [
 
 [features]
 default = []
+# Bounded native append-log facade, independent of the legacy sequencer port.
+native = ["dep:getrandom"]
 # Optional S3-compatible BlobStore adapter (AWS S3, MinIO, Garage).
 s3 = ["dep:aws-sdk-s3"]
 # Diagnostics binary: `cargo run --features cli --bin object-log -- --help`
@@ -31,6 +33,7 @@ path = "src/bin/object-log.rs"
 required-features = ["cli"]
 
 [dependencies]
+getrandom = { version = "0.4", optional = true }
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"], optional = true }

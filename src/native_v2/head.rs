@@ -1,11 +1,14 @@
 //! Captured read authority, sealed writer fencing, and append-only publication.
-use crate::{
-    AppendOwner, BoundedMetadataStore, MetadataLimits, MetadataOwners, MetadataSnapshot,
-    MetadataSwap, ObjectLogError,
-};
+#[cfg(test)]
+use crate::{AppendOwner, BoundedMetadataStore, MetadataLimits, MetadataOwners};
+use crate::{MetadataSnapshot, MetadataSwap, ObjectLogError};
+#[cfg(test)]
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
 use tokio::sync::{Notify, Semaphore, oneshot};
 
 const MAGIC: &[u8; 8] = b"ONH2\0\0\0\x02";
@@ -16,18 +19,26 @@ enum SemanticCoverage {
     Uninitialized,
     Covered { through: u64, root: [u8; 32] },
 }
+#[cfg(test)]
 fn metadata_owners(owner: AppendOwner) -> MetadataOwners {
     MetadataOwners {
         retained: owner.clone(),
         physical: owner,
     }
 }
+#[cfg(test)]
 fn metadata_limits(payload_bytes: usize) -> MetadataLimits {
     MetadataLimits {
         payload_bytes,
         version_bytes: 4096,
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PublishOutcome {
+    Stored(NativeHead),
+    Conflict,
+}
+
 /// An exact versioned native head, obtained from bounded durable authority.
 /// Roots are opaque commitments; this observation grants neither writer
 /// exclusivity nor semantic membership/nonmembership proof.
@@ -62,9 +73,11 @@ impl NativeHead {
         (self.log_start, self.next_offset)
     }
     /// Complete immutable index descriptor captured with this head.
+    #[cfg(test)]
     pub(crate) fn index_root(&self) -> Option<Descriptor> {
         self.index_root
     }
+    #[cfg(test)]
     fn semantic_anchor(&self) -> SemanticCoverage {
         self.semantic_anchor
     }
@@ -148,11 +161,57 @@ pub(super) struct CapturedHead {
 }
 struct LineageState {
     floor: NativeHead,
-    acquired_epoch: u64,
-    revoked: bool,
+    highest_epoch: u64,
+}
+pub(super) struct AuthorityKnowledge {
+    gate: Arc<tokio::sync::Mutex<LineageState>>,
+    identity: Arc<()>,
+    key_owner: MetadataSnapshot,
+    _charge: Arc<super::page_store::Charge>,
+}
+impl AuthorityKnowledge {
+    pub fn new(
+        captured: &CapturedHead,
+        pages: &super::page_store::PageStore,
+    ) -> Result<Arc<Self>, ObjectLogError> {
+        pages.require_operation()?;
+        if !Arc::ptr_eq(&captured.identity, &pages.binding_identity()) {
+            return Err(invalid("knowledge belongs to another store binding"));
+        }
+        let charge = pages.charge_output(
+            std::mem::size_of::<Self>()
+                + std::mem::size_of::<tokio::sync::Mutex<LineageState>>()
+                + 4 * std::mem::size_of::<usize>(),
+        )?;
+        Ok(Arc::new(Self {
+            gate: Arc::new(tokio::sync::Mutex::new(LineageState {
+                floor: captured.head,
+                highest_epoch: captured.head.epoch,
+            })),
+            identity: pages.binding_identity(),
+            key_owner: captured.observed.clone(),
+            _charge: charge,
+        }))
+    }
+    pub async fn observe(
+        &self,
+        pages: Arc<super::page_store::PageStore>,
+        key: &str,
+    ) -> Result<Option<CapturedHead>, ObjectLogError> {
+        if !Arc::ptr_eq(&self.identity, &pages.binding_identity())
+            || self.key_owner.inner.key != key
+        {
+            return Err(invalid("knowledge belongs to another authority binding"));
+        }
+        let mut state = self.gate.lock().await;
+        let observed = pages.read_head(key, HEAD_BYTES).await?;
+        WriterLineage::validate(&mut state, pages, observed).await
+    }
 }
 struct WriterLineage {
-    gate: tokio::sync::Mutex<LineageState>,
+    gate: Arc<tokio::sync::Mutex<LineageState>>,
+    acquired_epoch: u64,
+    _knowledge: Arc<AuthorityKnowledge>,
     _charge: Arc<super::page_store::Charge>,
 }
 impl WriterLineage {
@@ -180,14 +239,13 @@ impl WriterLineage {
         )?;
         // Seeing a higher valid fence revokes this lineage even if its root is
         // missing/corrupt or the attempted range cannot subsequently resolve.
-        if head.epoch > state.acquired_epoch {
-            state.revoked = true;
-        }
+        state.highest_epoch = state.highest_epoch.max(head.epoch);
         if let Some(root) = head.index_root {
             drop(pages.read(root).await?);
         }
         let floor = state.floor;
-        if head.epoch < floor.epoch
+        if head.epoch < state.highest_epoch
+            || head.epoch < floor.epoch
             || head.log_start != floor.log_start
             || head.next_offset < floor.next_offset
             || head.semantic_anchor != floor.semantic_anchor
@@ -259,6 +317,7 @@ impl PreparedAppend {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub async fn resolve_range(
         &self,
         pages: Arc<super::page_store::PageStore>,
@@ -341,11 +400,11 @@ impl PreparedAppend {
         }
         Ok(Resolution::Unknown)
     }
-    pub async fn publish(
+    pub async fn publish_outcome(
         &mut self,
         pages: Arc<super::page_store::PageStore>,
         key: &str,
-    ) -> Result<NativeHead, ObjectLogError> {
+    ) -> Result<PublishOutcome, ObjectLogError> {
         pages.require_operation()?;
         if !Arc::ptr_eq(&self.original.identity, &pages.binding_identity()) {
             return Err(invalid("append belongs to another store binding"));
@@ -360,7 +419,9 @@ impl PreparedAppend {
         // us reject it before issuing its original conditional write.
         self.attempted = true;
         let mut lineage = self.lineage.gate.lock().await;
-        if lineage.revoked || lineage.floor != self.original.head {
+        if lineage.highest_epoch > self.lineage.acquired_epoch
+            || lineage.floor != self.original.head
+        {
             return Err(invalid(
                 "writer original authority is below its shared floor",
             ));
@@ -371,17 +432,31 @@ impl PreparedAppend {
         {
             MetadataSwap::Stored => {
                 lineage.floor = self.next;
-                Ok(self.next)
+                Ok(PublishOutcome::Stored(self.next))
             }
             MetadataSwap::Conflict(current) => {
-                WriterLineage::validate(&mut lineage, pages, current).await?;
-                Err(invalid("original append authority changed"))
+                WriterLineage::validate(&mut lineage, pages, current)
+                    .await?
+                    .ok_or_else(|| invalid("conflicting authority regressed or changed prefix"))?;
+                Ok(PublishOutcome::Conflict)
             }
+        }
+    }
+    #[cfg(test)]
+    pub async fn publish(
+        &mut self,
+        pages: Arc<super::page_store::PageStore>,
+        key: &str,
+    ) -> Result<NativeHead, ObjectLogError> {
+        match self.publish_outcome(pages, key).await? {
+            PublishOutcome::Stored(head) => Ok(head),
+            PublishOutcome::Conflict => Err(invalid("original append authority changed")),
         }
     }
     /// Exact full-head equality proves this complete original transition.
     /// Later/different authority requires resolve_range instead;
     /// numeric head advancement alone never establishes our publication.
+    #[cfg(test)]
     pub async fn resolve_exact(
         &self,
         pages: Arc<super::page_store::PageStore>,
@@ -420,9 +495,13 @@ pub(super) struct FencedHead {
     lineage: Arc<WriterLineage>,
 }
 impl FencedHead {
+    pub(super) fn knowledge(&self) -> Arc<AuthorityKnowledge> {
+        self.lineage._knowledge.clone()
+    }
     pub fn snapshot(&self) -> &CapturedHead {
         &self.captured
     }
+    #[cfg(test)]
     pub async fn prepare_append(
         self,
         pages: Arc<super::page_store::PageStore>,
@@ -463,7 +542,7 @@ impl FencedHead {
         pages.require_operation()?;
         {
             let state = lineage.gate.lock().await;
-            if state.revoked || state.floor != captured.head {
+            if state.highest_epoch > lineage.acquired_epoch || state.floor != captured.head {
                 return Err(invalid(
                     "writer original authority is below its shared floor",
                 ));
@@ -576,8 +655,8 @@ impl FencedHead {
             return Err(invalid("writer authority regressed during refresh"));
         };
         let state = self.lineage.gate.lock().await;
-        if state.revoked
-            || current.head.epoch != state.acquired_epoch
+        if state.highest_epoch > self.lineage.acquired_epoch
+            || current.head.epoch != self.lineage.acquired_epoch
             || current.head != state.floor
         {
             return Err(invalid("writer authority changed during refresh"));
@@ -589,39 +668,18 @@ impl FencedHead {
     }
 }
 impl CapturedHead {
+    pub(super) fn value(&self) -> NativeHead {
+        self.head
+    }
     pub(super) fn head_bytes(&self) -> [u8; HEAD_BYTES] {
         self.head.encode()
     }
 
-    pub(super) async fn validates_successor(
-        &self,
-        pages: Arc<super::page_store::PageStore>,
-        current: &Self,
-    ) -> Result<bool, ObjectLogError> {
-        if !Arc::ptr_eq(&self.identity, &pages.binding_identity())
-            || !Arc::ptr_eq(&current.identity, &self.identity)
-            || current.head.epoch < self.head.epoch
-            || current.head.next_offset < self.head.next_offset
-            || current.head.log_start != self.head.log_start
-            || current.head.semantic_anchor != self.head.semantic_anchor
-        {
-            return Ok(false);
-        }
-        match (self.head.index_root, current.head.index_root) {
-            (Some(before), Some(after)) => {
-                super::index::Index::new(pages)
-                    .proves_extension(before, after)
-                    .await
-            }
-            (Some(_), None) => Ok(false),
-            (None, _) => Ok(true),
-        }
-    }
-    pub async fn read_payload(
+    pub async fn read_record(
         &self,
         pages: Arc<super::page_store::PageStore>,
         offset: u64,
-    ) -> Result<Option<OwnedPayload>, ObjectLogError> {
+    ) -> Result<Option<(u64, u32, OwnedPayload)>, ObjectLogError> {
         let Some(owned) = self.lookup(pages.clone(), offset).await? else {
             return Ok(None);
         };
@@ -653,11 +711,26 @@ impl CapturedHead {
                 "indexed data identity, range or payload digest differs",
             ));
         }
-        Ok(Some(OwnedPayload {
-            observed,
-            start: entry.byte_start as usize,
-            len: entry.byte_len as usize,
-        }))
+        Ok(Some((
+            entry.base,
+            entry.record_count,
+            OwnedPayload {
+                observed,
+                start: entry.byte_start as usize,
+                len: entry.byte_len as usize,
+            },
+        )))
+    }
+    #[cfg(test)]
+    pub async fn read_payload(
+        &self,
+        pages: Arc<super::page_store::PageStore>,
+        offset: u64,
+    ) -> Result<Option<OwnedPayload>, ObjectLogError> {
+        Ok(self
+            .read_record(pages, offset)
+            .await?
+            .map(|(_, _, payload)| payload))
     }
     pub async fn capture(
         pages: &super::page_store::PageStore,
@@ -687,7 +760,7 @@ impl CapturedHead {
     /// head is a fence result, not a publication token: this cut still owns
     /// the pre-acquisition observation. Publication must recapture authority
     /// and validate its epoch/root before constructing a transition.
-    pub async fn acquire(
+    fn fence_transition(
         &self,
         pages: &super::page_store::PageStore,
         key: &str,
@@ -704,6 +777,18 @@ impl CapturedHead {
                 .ok_or_else(|| invalid("native epoch exhausted"))?,
             ..self.head
         };
+        if self.observed.inner.key != key {
+            return Err(invalid("fence literal head key mismatch"));
+        }
+        Ok(fenced)
+    }
+    #[cfg(test)]
+    pub async fn acquire(
+        &self,
+        pages: &super::page_store::PageStore,
+        key: &str,
+    ) -> Result<NativeHead, ObjectLogError> {
+        let fenced = self.fence_transition(pages, key)?;
         match pages
             .swap_head(key, self.observed.clone(), &fenced.encode())
             .await?
@@ -714,25 +799,63 @@ impl CapturedHead {
     }
     /// Obtain the post-fence token without relabeling the old observation.
     /// Any intervening change invalidates this writer attempt.
+    #[cfg(test)]
     pub async fn acquire_and_recapture(
         &self,
-        pages: &super::page_store::PageStore,
+        pages: &Arc<super::page_store::PageStore>,
         key: &str,
     ) -> Result<FencedHead, ObjectLogError> {
-        let fenced = self.acquire(pages, key).await?;
-        let current = Self::capture(pages, key).await?;
+        let knowledge = AuthorityKnowledge::new(self, pages)?;
+        self.acquire_with_knowledge(pages, key, knowledge).await
+    }
+    pub(super) async fn acquire_with_knowledge(
+        &self,
+        pages: &Arc<super::page_store::PageStore>,
+        key: &str,
+        knowledge: Arc<AuthorityKnowledge>,
+    ) -> Result<FencedHead, ObjectLogError> {
+        pages.require_operation()?;
+        if !Arc::ptr_eq(&knowledge.identity, &self.identity)
+            || knowledge.key_owner.inner.key != key
+            || self.observed.inner.key != key
+        {
+            return Err(invalid("fence belongs to another authority family"));
+        }
+        let charge = pages.charge_output(
+            std::mem::size_of::<WriterLineage>() + 2 * std::mem::size_of::<usize>(),
+        )?;
+        let mut state = knowledge.gate.lock().await;
+        if state.floor != self.head || state.highest_epoch > self.head.epoch {
+            return Err(invalid(
+                "fence original authority is below shared knowledge",
+            ));
+        }
+        let fenced = self.fence_transition(pages, key)?;
+        match pages
+            .swap_head(key, self.observed.clone(), &fenced.encode())
+            .await?
+        {
+            MetadataSwap::Stored => {}
+            MetadataSwap::Conflict(observed) => {
+                WriterLineage::validate(&mut state, pages.clone(), observed).await?;
+                return Err(invalid("captured head changed before acquisition"));
+            }
+        }
+        // Stored establishes knowledge, but does not relabel the original token.
+        state.floor = fenced;
+        state.highest_epoch = state.highest_epoch.max(fenced.epoch);
+        let observed = pages.read_head(key, HEAD_BYTES).await?;
+        let current = WriterLineage::validate(&mut state, pages.clone(), observed)
+            .await?
+            .ok_or_else(|| invalid("native authority regressed after acquisition"))?;
         if current.head != fenced {
             return Err(invalid("native authority changed after acquisition"));
         }
-        let charge = pages.charge_output(
-            std::mem::size_of::<WriterLineage>() + std::mem::size_of::<usize>() * 2,
-        )?;
+        drop(state);
         let lineage = Arc::new(WriterLineage {
-            gate: tokio::sync::Mutex::new(LineageState {
-                floor: current.head,
-                acquired_epoch: current.head.epoch,
-                revoked: false,
-            }),
+            gate: knowledge.gate.clone(),
+            acquired_epoch: current.head.epoch,
+            _knowledge: knowledge,
             _charge: charge,
         });
         Ok(FencedHead {
@@ -761,10 +884,12 @@ impl CapturedHead {
 fn invalid(message: &str) -> ObjectLogError {
     ObjectLogError::Sequencer(message.into())
 }
+#[cfg(test)]
 struct Lifecycle {
     closed: bool,
     owned: usize,
 }
+#[cfg(test)]
 struct Owner {
     store: Arc<dyn BoundedMetadataStore>,
     key: String,
@@ -774,10 +899,12 @@ struct Owner {
     lifecycle: Mutex<Lifecycle>,
     drained: Notify,
 }
+#[cfg(test)]
 struct PhysicalOwner {
     owner: Arc<Owner>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
+#[cfg(test)]
 impl Drop for PhysicalOwner {
     fn drop(&mut self) {
         drop(self.permit.take());
@@ -797,9 +924,11 @@ impl Drop for PhysicalOwner {
 /// authorize Fireweed to bypass cold recovery. Operations are physically owned
 /// after dispatch, serialized, and drained even when the caller drops its reply.
 #[derive(Clone)]
+#[cfg(test)]
 pub struct NativeHeadReader {
     owner: Arc<Owner>,
 }
+#[cfg(test)]
 impl NativeHeadReader {
     /// Bind an existing head's literal storage key and immutable scope. This
     /// performs no I/O. Missing authority always fails closed, including known
@@ -907,6 +1036,7 @@ impl NativeHeadReader {
         }
     }
 }
+#[cfg(test)]
 impl Owner {
     fn decode(&self, observed: &MetadataSnapshot) -> Result<NativeHead, ObjectLogError> {
         let bytes = observed

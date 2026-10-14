@@ -7,3 +7,6 @@ mod operation;
 mod page_store;
 mod provision;
 mod submission;
+
+#[cfg(feature = "native")]
+pub(crate) mod facade;
