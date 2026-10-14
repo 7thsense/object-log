@@ -51,6 +51,14 @@ pub enum ObjectLogError {
     /// Durable-ops budget admission failed (`BudgetMode::FailClosed` or timed out).
     #[error("durable-ops budget exceeded: {0}")]
     BudgetExceeded(String),
+    /// An authenticated native payload exceeds the caller's read limit.
+    #[error("native payload length {actual} exceeds read limit {limit}")]
+    ReadLimitExceeded {
+        /// Authenticated payload length, before data hydration.
+        actual: usize,
+        /// Caller-supplied maximum payload length.
+        limit: usize,
+    },
     /// Invalid engine or budget configuration.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),

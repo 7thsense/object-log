@@ -686,9 +686,10 @@ impl CapturedHead {
         };
         let entry = owned.entry();
         if entry.byte_len as usize > max_payload_bytes {
-            return Err(ObjectLogError::BudgetExceeded(
-                "native payload exceeds caller read limit".into(),
-            ));
+            return Err(ObjectLogError::ReadLimitExceeded {
+                actual: entry.byte_len as usize,
+                limit: max_payload_bytes,
+            });
         }
         let index = super::index::Index::new(pages.clone());
         let logical = index.literal_id(entry.logical_id).await?;

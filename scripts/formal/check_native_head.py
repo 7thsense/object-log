@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODEL = ROOT / 'scripts/formal/native_head_model.py'
 DEFAULT = ROOT / 'target/native-head-model.json'
 SOURCES = (
-    'Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/blob.rs', 'src/blob/authority.rs',
+    'Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/error.rs', 'src/blob.rs', 'src/blob/authority.rs',
     'src/s3.rs', 'src/s3/authority.rs', 'src/sequencer.rs', 'src/native_v2/head.rs',
     'src/native_v2/mod.rs', 'src/native_v2/data.rs', 'src/native_v2/codec.rs', 'src/native_v2/operation.rs',
     'src/native_v2/facade.rs', 'tests/native_facade.rs', 'src/native_v2/page_store.rs', 'src/native_v2/index.rs', 'src/native_v2/provision.rs', 'src/native_v2/submission.rs',

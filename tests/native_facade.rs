@@ -514,7 +514,7 @@ async fn external_payload_limit_precedes_missing_data_read() {
     store.delete(data[0]).await.unwrap();
     assert!(matches!(
         log.read_bounded(&cut, 0, payload.len() - 1).await,
-        Err(object_log::ObjectLogError::BudgetExceeded(_))
+        Err(object_log::ObjectLogError::ReadLimitExceeded { actual, limit }) if actual == payload.len() && limit == payload.len() - 1
     ));
     assert!(matches!(
         log.read_bounded(&cut, 0, payload.len()).await,
