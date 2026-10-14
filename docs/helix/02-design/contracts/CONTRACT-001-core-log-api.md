@@ -204,7 +204,9 @@ the original were absent. The retained publication supports bounded `resolve`:
 proves complete competing content, and `Unknown` provides neither proof.
 Content resolution does not establish which writer published it.
 
-Admitted operations own their work through caller cancellation. Namespace,
+Admitted operations own their work through caller cancellation. Replies and errors
+are delivered to the caller only after that operation's final physical source owner
+has released its admission, including owned-task panic and detached cleanup. Namespace,
 writer, publication, cut and payload allocations retain their byte credits until
 the corresponding owned bytes are destroyed. `shutdown` closes admission and
 drains physical work; retained byte-only handles may outlive it. Payload reads

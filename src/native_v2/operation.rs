@@ -59,7 +59,25 @@ pub(super) struct Resources {
     drained: Notify,
     executor: Executor,
 }
+struct OperationCompletion {
+    done: AtomicBool,
+    notify: Notify,
+}
+impl OperationCompletion {
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 pub(super) struct Physical {
+    completion: Arc<OperationCompletion>,
     resources: Arc<Resources>,
     permit: Option<OwnedSemaphorePermit>,
 }
@@ -81,6 +99,9 @@ impl Drop for Physical {
         if state.physical == 0 {
             self.resources.drained.notify_waiters();
         }
+        drop(state);
+        self.completion.done.store(true, Ordering::Release);
+        self.completion.notify.notify_waiters();
     }
 }
 struct OwnedTask<F: Future> {
@@ -164,6 +185,9 @@ impl Resources {
         }))
     }
 
+    // Output T must contain no Physical or operation-scoped PageStore: the
+    // caller waits for their final release before receiving T. Public carriers
+    // retain only byte admission and immutable binding/certificate ownership.
     pub async fn run<T, F, Fut>(self: &Arc<Self>, factory: F) -> Result<T, ObjectLogError>
     where
         T: Send + 'static,
@@ -188,7 +212,12 @@ impl Resources {
             }
             state.physical += 1;
         }
+        let completion = Arc::new(OperationCompletion {
+            done: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
         let physical = Arc::new(Physical {
+            completion: completion.clone(),
             resources: self.clone(),
             permit: Some(permit),
         });
@@ -202,9 +231,11 @@ impl Resources {
             future: Box::pin(future),
             _physical: physical,
         });
-        reply
+        let result = reply
             .await
-            .map_err(|_| invalid("native operation panicked"))?
+            .map_err(|_| invalid("native operation panicked"));
+        completion.wait().await;
+        result?
     }
 
     pub async fn close_and_drain(&self) -> Result<(), ObjectLogError> {
@@ -601,6 +632,64 @@ mod tests {
         .unwrap();
         assert!(weak.upgrade().is_none());
         assert!(!completion.failed.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn error_and_panic_wait_for_detached_source_owner_terminal() {
+        struct Signal(Arc<Notify>);
+        impl std::task::Wake for Signal {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
+        for panic in [false, true] {
+            let resources = resources();
+            let (entered, started) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            let (reply_release, reply_gate) = oneshot::channel();
+            let retained = Arc::new(());
+            let weak = Arc::downgrade(&retained);
+            let worker = resources.clone();
+            let mut caller = Box::pin(async move {
+                let result: Result<(), ObjectLogError> = worker
+                    .run(move |physical| async move {
+                        tokio::spawn(async move {
+                            entered.send(()).unwrap();
+                            resume.await.unwrap();
+                            drop(physical);
+                        });
+                        reply_gate.await.unwrap();
+                        if panic {
+                            panic!("injected source reply panic")
+                        }
+                        Err(invalid("injected source reply error"))
+                    })
+                    .await;
+                drop(retained);
+                result
+            });
+            let signal = Arc::new(Notify::new());
+            let waker = std::task::Waker::from(Arc::new(Signal(signal.clone())));
+            let mut context = Context::from_waker(&waker);
+            assert!(caller.as_mut().poll(&mut context).is_pending());
+            started.await.unwrap();
+            // No reply exists yet, so this poll installs the controlled Waker.
+            assert!(caller.as_mut().poll(&mut context).is_pending());
+            reply_release.send(()).unwrap();
+            signal.notified().await;
+            // The reply/error is ready, but the detached source is not terminal.
+            assert!(caller.as_mut().poll(&mut context).is_pending());
+            assert_eq!(resources.state.lock().unwrap().physical, 1);
+            assert!(weak.upgrade().is_some());
+            release.send(()).unwrap();
+            assert!(caller.await.is_err());
+            assert!(weak.upgrade().is_none());
+            assert_eq!(resources.state.lock().unwrap().physical, 0);
+            resources.close_and_drain().await.unwrap();
+        }
     }
 
     #[test]
