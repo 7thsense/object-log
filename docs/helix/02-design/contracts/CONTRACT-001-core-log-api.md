@@ -184,7 +184,10 @@ fixed-cut operations. `NativeLimits` specifies store-wide execution admission,
 retained byte admission (a checked 64-bit ledger, bounded by platform allocation
 size), opaque version size, namespace-binding size, append
 entry count and framed append-group size. Namespace size does not constrain
-payload size. Invalid page allocation limits fail before executor creation.
+payload size. Binding reads reserve the exact checked frame size for the
+requested literal, rather than the configured maximum namespace size. Responses
+that exceed that exact size fail closed; bound errors never imply absence.
+Invalid page allocation limits fail before executor creation.
 S3 composition calls `NativeLog::preflight_s3` before constructing its adapter
 client. The same checked byte-length/page/source planner validates native
 construction without copying derived paths before rejection.

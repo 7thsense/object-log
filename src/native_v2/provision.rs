@@ -137,14 +137,20 @@ impl NamespaceContext {
     fn candidate_keys(&self, scope: Scope) -> (String, String) {
         candidate_keys(&self.prefix, scope)
     }
+    // A valid binding has one exact length for its requested literal. Reserve
+    // that length, retaining the configured domain cap and failing closed on
+    // any longer provider response rather than treating it as absence.
+    async fn read_binding(&self, literal: &[u8]) -> Result<MetadataSnapshot, ObjectLogError> {
+        let bytes = self.length(literal)?;
+        let key = self.binding_key(Sha256::digest(literal).into());
+        self.pages.read_head(&key, bytes).await
+    }
     pub async fn open(
         self: &Arc<Self>,
         literal: &[u8],
     ) -> Result<Option<PublishedNamespace>, ObjectLogError> {
         let charge = self.key_charge(literal)?;
-        let namespace = Sha256::digest(literal).into();
-        let key = self.binding_key(namespace);
-        let binding = self.pages.read_head(&key, self.binding_limit).await?;
+        let binding = self.read_binding(literal).await?;
         if binding.bytes().is_none() {
             return Ok(None);
         }
@@ -187,8 +193,7 @@ impl NamespaceContext {
     ) -> Result<PublishedNamespace, ObjectLogError> {
         known.validate_context(self)?;
         let charge = self.key_charge(&known.literal)?;
-        let key = self.binding_key(known.scope.namespace);
-        let current = self.pages.read_head(&key, self.binding_limit).await?;
+        let current = self.read_binding(&known.literal).await?;
         if current.bytes() != known.binding.bytes() {
             return Err(invalid("known immutable binding changed or vanished"));
         }
@@ -235,13 +240,7 @@ impl NamespaceContext {
         }
         let binding_key = self.binding_key(namespace);
         // An existing registry entry is capture-only, including malformed entries.
-        if self
-            .pages
-            .read_head(&binding_key, self.binding_limit)
-            .await?
-            .bytes()
-            .is_some()
-        {
+        if self.read_binding(literal).await?.bytes().is_some() {
             return Err(invalid("existing namespace requires capture"));
         }
         let scope = Scope {
@@ -324,12 +323,7 @@ impl NativeProvisionAttempt {
         if self.ready.is_none() {
             return Err(invalid("candidate is not ready"));
         }
-        self.binding_observed = Some(
-            self.context
-                .pages
-                .read_head(&self.binding_key, self.context.binding_limit)
-                .await?,
-        );
+        self.binding_observed = Some(self.context.read_binding(&self.literal).await?);
         Ok(())
     }
     pub async fn publish(&mut self) -> Result<PublishedNamespace, ObjectLogError> {
@@ -365,11 +359,7 @@ impl NativeProvisionAttempt {
             return Err(invalid("binding not attempted"));
         }
         let charge = self.context.key_charge(&self.literal)?;
-        let winner = self
-            .context
-            .pages
-            .read_head(&self.binding_key, self.context.binding_limit)
-            .await?;
+        let winner = self.context.read_binding(&self.literal).await?;
         self.context
             .validate_winner(&self.literal, winner, charge)
             .await
@@ -429,8 +419,7 @@ impl PublishedNamespace {
         context: &NamespaceContext,
     ) -> Result<(super::head::FencedHead, PageBinding), ObjectLogError> {
         self.validate_context(context)?;
-        let key = context.binding_key(self.scope.namespace);
-        let current = context.pages.read_head(&key, context.binding_limit).await?;
+        let current = context.read_binding(&self.literal).await?;
         if current.bytes() != self.binding.bytes() {
             return Err(invalid("known immutable binding changed or vanished"));
         }
@@ -923,6 +912,114 @@ mod tests {
             provider.delete(&key).await.unwrap();
         }
     }
+    #[tokio::test]
+    async fn exact_binding_reads_preserve_domain_checks_with_small_remaining_credit() {
+        use crate::BlobStore;
+        const BUDGET: u64 = 64 << 20;
+        const CAP: usize = 8 << 20;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalBlobStore::new(directory.path()));
+        let resources = Resources::new(ExecutionConfig {
+            workers: 2,
+            blocking_workers: 2,
+            operations: 1,
+            bytes: BUDGET,
+        })
+        .unwrap();
+        let budget = resources.bytes.clone();
+        let pages = PageStore::new(
+            store.clone(),
+            "exact-binding-pages".into(),
+            Scope {
+                namespace: [1; 32],
+                incarnation: [1; 32],
+            },
+            budget.clone(),
+            MetadataLimits {
+                payload_bytes: CAP,
+                version_bytes: 56,
+            },
+        )
+        .unwrap();
+        let observed_budget = budget.clone();
+        resources
+            .run(move |physical| async move {
+                let context = NamespaceContext::new(
+                    pages.in_operation(physical)?,
+                    "exact-registry".into(),
+                    CAP,
+                )?;
+                // No large allocation: hold ledger credit so the former configured
+                // maximum read reservation cannot fit, while exact reads can.
+                let filler = budget.charge(budget.available() - (2 << 20))?;
+                let literal = b"short";
+                let mut attempt = context.attempt(literal).await?;
+                attempt.prepare_candidate().await?;
+                attempt.prepare_binding().await?;
+                let published = attempt.publish().await?;
+                drop(published);
+                drop(attempt.resolve().await?);
+                let opened = context.open(literal).await?.unwrap();
+                let captured = context.capture_known(opened).await?;
+                let head_key = context.candidate_keys(captured.scope).0;
+                let (writer, binding) = captured.into_writer(&context).await?;
+                let selected_pages = context.pages.for_binding(&binding)?;
+                let refreshed = writer.refresh(selected_pages, &head_key).await?;
+                drop(refreshed);
+                drop(writer);
+                drop(binding);
+                drop(attempt);
+                let key = context.binding_key(Sha256::digest(literal).into());
+                let original = store.get(&key).await?.unwrap();
+                assert_eq!(original.len(), HEADER + literal.len() + DIGEST);
+                let mut longer = original.to_vec();
+                longer.push(0);
+                assert!(longer.len() < CAP);
+                store.put(&key, longer.into()).await?;
+                assert!(context.open(literal).await.is_err());
+                store.put(&key, original.clone()).await?;
+                let known = context.open(literal).await?.unwrap();
+                let mut foreign = original.to_vec();
+                foreign[HEADER] ^= 1;
+                let end = foreign.len() - DIGEST;
+                let digest = Sha256::digest(&foreign[..end]);
+                foreign[end..].copy_from_slice(&digest);
+                store.put(&key, foreign.into()).await?;
+                assert!(context.open(literal).await.is_err());
+                assert!(context.capture_known(known).await.is_err());
+                let mut corrupt = original.to_vec();
+                *corrupt.last_mut().unwrap() ^= 1;
+                store.put(&key, corrupt.into()).await?;
+                assert!(context.open(literal).await.is_err());
+                store
+                    .put(&key, original.slice(..original.len() - 1))
+                    .await?;
+                assert!(context.open(literal).await.is_err());
+                store.put(&key, original).await?;
+                let narrow = NamespaceContext::new(
+                    context.pages.clone(),
+                    "exact-registry".into(),
+                    HEADER + DIGEST + 1,
+                )?;
+                // Domain validation wins before an attempted provider read, even
+                // though this literal has an existing object at the same key.
+                assert!(matches!(narrow.read_binding(literal).await,
+                Err(ObjectLogError::Sequencer(reason)) if reason.contains("binding frame limit")));
+                drop(narrow);
+                drop(context.open(literal).await?.unwrap());
+                drop(context);
+                drop(filler);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        resources.close_and_drain().await.unwrap();
+        assert_eq!(
+            observed_budget.available(),
+            usize::try_from(BUDGET).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn local_candidate_election_loss_collision_known_missing_and_reopen() {
         let directory = Arc::new(tempfile::tempdir().unwrap());
