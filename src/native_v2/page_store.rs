@@ -179,15 +179,27 @@ impl OwnedDataKey {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct PageBinding {
+    identity: Arc<()>,
+    store_identity: Arc<()>,
+    prefix: Arc<str>,
+    scope: Scope,
+    allocation: usize,
+    _binding_charge: Arc<Charge>,
+}
 pub(super) struct PageStore {
     store: Arc<dyn NativeStore>,
     identity: Arc<()>,
+    store_identity: Arc<()>,
     prefix: Arc<str>,
     scope: Scope,
     budget: Arc<ByteBudget>,
     allocation: usize,
     limits: MetadataLimits,
     physical: Option<Arc<super::operation::Physical>>,
+    _binding_charge: Option<Arc<Charge>>,
+    _container_charge: Option<Arc<Charge>>,
 }
 impl PageStore {
     pub fn new(
@@ -233,15 +245,19 @@ impl PageStore {
                 "native budget cannot hold one page".into(),
             ));
         }
+        let identity = Arc::new(());
         Ok(Arc::new(Self {
             store,
-            identity: Arc::new(()),
+            store_identity: identity.clone(),
+            identity,
             prefix: prefix.into(),
             scope,
             budget,
             allocation,
             limits,
             physical: None,
+            _binding_charge: None,
+            _container_charge: None,
         }))
     }
     /// Nested page operations reuse the admitted outer operation. Returned
@@ -254,12 +270,81 @@ impl PageStore {
         Ok(Arc::new(Self {
             store: self.store.clone(),
             identity: self.identity.clone(),
+            store_identity: self.store_identity.clone(),
             prefix: self.prefix.clone(),
             scope: self.scope,
             budget: self.budget.clone(),
             allocation: self.allocation,
             limits: self.limits,
             physical: Some(physical),
+            _binding_charge: self._binding_charge.clone(),
+            _container_charge: if self._binding_charge.is_some() {
+                Some(self.charge_output(
+                    std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>(),
+                )?)
+            } else {
+                None
+            },
+        }))
+    }
+    pub fn derive(&self, prefix: String, scope: Scope) -> Result<Arc<Self>, ObjectLogError> {
+        self.require_operation()?;
+        let bytes = prefix
+            .len()
+            .checked_mul(2)
+            .and_then(|n| {
+                n.checked_add(2 * std::mem::size_of::<Self>() + 4 * std::mem::size_of::<usize>())
+            })
+            .ok_or_else(|| {
+                ObjectLogError::BudgetExceeded("derived binding allocation overflow".into())
+            })?;
+        let charge = self.charge_output(bytes)?;
+        let mut pages = Self::new(
+            self.store.clone(),
+            prefix,
+            scope,
+            self.budget.clone(),
+            self.limits,
+        )?;
+        let inner = Arc::get_mut(&mut pages).expect("new exclusive binding");
+        inner.store_identity = self.store_identity.clone();
+        inner._binding_charge = Some(charge);
+        pages.in_operation(self.physical.as_ref().expect("checked operation").clone())
+    }
+    pub fn seal_binding(&self) -> Result<PageBinding, ObjectLogError> {
+        let charge = self._binding_charge.clone().ok_or_else(|| {
+            ObjectLogError::InvalidConfig("only admitted derived bindings can be sealed".into())
+        })?;
+        Ok(PageBinding {
+            identity: self.identity.clone(),
+            store_identity: self.store_identity.clone(),
+            prefix: self.prefix.clone(),
+            scope: self.scope,
+            allocation: self.allocation,
+            _binding_charge: charge,
+        })
+    }
+    pub fn for_binding(&self, binding: &PageBinding) -> Result<Arc<Self>, ObjectLogError> {
+        self.require_operation()?;
+        if !Arc::ptr_eq(&self.store_identity, &binding.store_identity) {
+            return Err(ObjectLogError::InvalidConfig(
+                "selected binding belongs to another store".into(),
+            ));
+        }
+        let charge =
+            self.charge_output(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>())?;
+        Ok(Arc::new(Self {
+            store: self.store.clone(),
+            identity: binding.identity.clone(),
+            store_identity: self.store_identity.clone(),
+            prefix: binding.prefix.clone(),
+            scope: binding.scope,
+            budget: self.budget.clone(),
+            allocation: binding.allocation,
+            limits: self.limits,
+            physical: self.physical.clone(),
+            _binding_charge: Some(binding._binding_charge.clone()),
+            _container_charge: Some(charge),
         }))
     }
     fn owners(&self, retained: AppendOwner) -> MetadataOwners {
@@ -285,12 +370,7 @@ impl PageStore {
     pub fn binding_identity(&self) -> Arc<()> {
         self.identity.clone()
     }
-    pub async fn read_head(
-        &self,
-        key: &str,
-        bytes: usize,
-    ) -> Result<crate::MetadataSnapshot, ObjectLogError> {
-        self.require_operation()?;
+    pub fn validate_authority_key(&self, key: &str) -> Result<(), ObjectLogError> {
         if key == self.prefix.as_ref()
             || key
                 .strip_prefix(self.prefix.as_ref())
@@ -304,6 +384,15 @@ impl PageStore {
         {
             return Err(ObjectLogError::InvalidConfig("native head key".into()));
         }
+        Ok(())
+    }
+    pub async fn read_head(
+        &self,
+        key: &str,
+        bytes: usize,
+    ) -> Result<crate::MetadataSnapshot, ObjectLogError> {
+        self.require_operation()?;
+        self.validate_authority_key(key)?;
         let charge = self.budget.charge(
             self.store
                 .page_source_scratch(key.len(), self.metadata_limits(bytes))?

@@ -136,6 +136,37 @@ Committed and ambiguous pages remain retained; production reclamation and migrat
 are unsupported. Semantic coverage is uninitialized until consumer publication is
 implemented; these index proofs do not authorize skipping Fireweed semantic replay.
 
+Namespace initialization creates a fresh candidate head before publishing its
+immutable full-literal namespace binding. Incarnations come from admitted OS
+entropy; callers cannot supply a production seed. Candidate and binding attempts
+are single-use. Existing candidate bytes are collisions, even if identical.
+Lost candidate replies leave unreachable candidates; they cannot grant binding
+rights. Competing binding publications resolve the actual stored winner and
+validate its scoped head and root. Missing known heads never authorize creation.
+Published bindings and candidates remain retained. Detecting deletion of the
+sole registry across a cold reopen requires a surviving catalog anchor and is
+not established by this private protocol.
+
+A published namespace owns a sealed, byte-admitted page binding without a store
+session or physical permit. Writer handoff consumes its original captured token;
+it cannot replace that observation with a fresh one. Known refresh also consumes
+the prior cap and validates non-regression and its authenticated prefix. Returned
+writers use the existing shared lineage. The handoff returns a writer and sealed
+binding; operation-scoped stores are reconstructed only inside admitted work.
+Namespace publication alone is not Fireweed provision success. For a newly
+selected empty namespace, the consumer fences its initial epoch and publishes
+or adopts offset-zero genesis. It validates the full address and schema and
+preserves the winning original cursor secret. Existing winners may already
+be fenced or contain genesis.
+
+The focused finite election model separates candidate and binding storage from
+observed replies. Independent transition oracles check selected-head validity
+at capability emission, immutable selection, and refusal to reset missing or
+corrupt published authority, including empty heads. It assumes distinct fresh
+incarnations and does not prove entropy quality, Rust correspondence, physical
+durability, registry deletion detection, or a shared authority floor across
+separately opened handles and cold reopen.
+
 ## Verification
 
 Native-head tests exercise actual Local I/O and the pinned S3 SDK transport,

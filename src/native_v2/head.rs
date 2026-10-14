@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, Semaphore, oneshot};
 
 const MAGIC: &[u8; 8] = b"ONH2\0\0\0\x02";
-const HEAD_BYTES: usize = 240;
+pub(super) const HEAD_BYTES: usize = 240;
 use crate::native_v2::codec::{Descriptor, Kind};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SemanticCoverage {
@@ -42,6 +42,17 @@ pub struct NativeHead {
     semantic_anchor: SemanticCoverage,
 }
 impl NativeHead {
+    pub(super) fn empty(scope: super::codec::Scope) -> Self {
+        Self {
+            namespace: scope.namespace,
+            incarnation: scope.incarnation,
+            epoch: 0,
+            log_start: 0,
+            next_offset: 0,
+            index_root: None,
+            semantic_anchor: SemanticCoverage::Uninitialized,
+        }
+    }
     /// Durable writer fence, distinct from any historical record epoch.
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -57,7 +68,7 @@ impl NativeHead {
     fn semantic_anchor(&self) -> SemanticCoverage {
         self.semantic_anchor
     }
-    fn encode(&self) -> [u8; HEAD_BYTES] {
+    pub(super) fn encode(&self) -> [u8; HEAD_BYTES] {
         let mut out = [0; HEAD_BYTES];
         out[..8].copy_from_slice(MAGIC);
         out[8..40].copy_from_slice(&self.namespace);
@@ -565,6 +576,34 @@ impl FencedHead {
     }
 }
 impl CapturedHead {
+    pub(super) fn head_bytes(&self) -> [u8; HEAD_BYTES] {
+        self.head.encode()
+    }
+
+    pub(super) async fn validates_successor(
+        &self,
+        pages: Arc<super::page_store::PageStore>,
+        current: &Self,
+    ) -> Result<bool, ObjectLogError> {
+        if !Arc::ptr_eq(&self.identity, &pages.binding_identity())
+            || !Arc::ptr_eq(&current.identity, &self.identity)
+            || current.head.epoch < self.head.epoch
+            || current.head.next_offset < self.head.next_offset
+            || current.head.log_start != self.head.log_start
+            || current.head.semantic_anchor != self.head.semantic_anchor
+        {
+            return Ok(false);
+        }
+        match (self.head.index_root, current.head.index_root) {
+            (Some(before), Some(after)) => {
+                super::index::Index::new(pages)
+                    .proves_extension(before, after)
+                    .await
+            }
+            (Some(_), None) => Ok(false),
+            (None, _) => Ok(true),
+        }
+    }
     pub async fn read_payload(
         &self,
         pages: Arc<super::page_store::PageStore>,
