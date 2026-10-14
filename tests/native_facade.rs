@@ -318,6 +318,10 @@ async fn append_reopen_contract(log: &NativeLog) {
     let record = log.read(&cut, 1).await.unwrap().unwrap();
     assert_eq!((record.base_offset(), record.record_count()), (0, 2));
     assert_eq!(record.bytes(), payload);
+    let owned_bytes = record.into_bytes();
+    let alias = owned_bytes.clone();
+    drop(owned_bytes);
+    assert_eq!(alias.as_ref(), payload);
     assert_eq!(log.read(&cut, 2).await.unwrap().unwrap().bytes(), b"tail");
     assert!(log.read(&cut, 3).await.unwrap().is_none());
 }
@@ -474,5 +478,47 @@ async fn external_cloned_submitters_share_one_terminal_publication() {
     );
     let cut = log.capture(&namespace).await.unwrap();
     assert_eq!(cut.head().bounds(), (0, 1));
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_payload_limit_precedes_missing_data_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::new(directory.path());
+    let log = NativeLog::local(store.clone(), "bounded-read".into(), limits()).unwrap();
+    let namespace = log.provision_new(b"queue").await.unwrap();
+    let writer = log.acquire(&namespace).await.unwrap();
+    let payload = vec![21; 16 * 1024];
+    let publication = log
+        .prepare(
+            &writer,
+            &[NativeAppend {
+                identity: "large",
+                payload: &payload,
+                records: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        log.submit(&publication).await.unwrap(),
+        NativePublishOutcome::Stored(_)
+    ));
+    let cut = log.capture(&namespace).await.unwrap();
+    let objects = store.list("bounded-read").await.unwrap();
+    let data: Vec<_> = objects
+        .iter()
+        .filter(|key| key.contains("/data/"))
+        .collect();
+    assert_eq!(data.len(), 1);
+    store.delete(data[0]).await.unwrap();
+    assert!(matches!(
+        log.read_bounded(&cut, 0, payload.len() - 1).await,
+        Err(object_log::ObjectLogError::BudgetExceeded(_))
+    ));
+    assert!(matches!(
+        log.read_bounded(&cut, 0, payload.len()).await,
+        Err(object_log::ObjectLogError::Sequencer(_))
+    ));
     log.shutdown().await.unwrap();
 }

@@ -179,6 +179,15 @@ impl NativeRecord {
     pub fn bytes(&self) -> &[u8] {
         self.payload.bytes()
     }
+    /// Transfer payload without copying; every Bytes alias retains its admission.
+    pub fn into_bytes(self) -> bytes::Bytes {
+        bytes::Bytes::from_owner(self)
+    }
+}
+impl AsRef<[u8]> for NativeRecord {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
 }
 impl NativeReadCut {
     /// Opaque complete captured authority, without a mutable root interface.
@@ -553,6 +562,16 @@ impl NativeLog {
         cut: &NativeReadCut,
         offset: u64,
     ) -> Result<Option<NativeRecord>, ObjectLogError> {
+        self.read_bounded(cut, offset, self.owner.limits.group_bytes)
+            .await
+    }
+    /// Reject an oversized authenticated payload before issuing its data read.
+    pub async fn read_bounded(
+        &self,
+        cut: &NativeReadCut,
+        offset: u64,
+        max_payload_bytes: usize,
+    ) -> Result<Option<NativeRecord>, ObjectLogError> {
         self.check(&cut.origin)?;
         let read = RetainedRead {
             captured: cut.read.captured.clone(),
@@ -569,8 +588,10 @@ impl NativeLog {
                     .in_operation(physical)?
                     .for_binding(&read.binding)?;
                 let charge = pages.charge_output(std::mem::size_of::<NativeRecord>())?;
-                let Some((base, records, payload)) =
-                    read.captured.read_record(pages, offset).await?
+                let Some((base, records, payload)) = read
+                    .captured
+                    .read_record_bounded(pages, offset, max_payload_bytes)
+                    .await?
                 else {
                     return Ok(None);
                 };
@@ -595,6 +616,51 @@ fn invalid(message: &str) -> ObjectLogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn payload_byte_aliases_retain_credit_after_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = NativeLog::local(
+            crate::LocalBlobStore::new(directory.path()),
+            "byte-owner".into(),
+            NativeLimits {
+                workers: 1,
+                blocking_workers: 1,
+                operations: 2,
+                bytes: 4 << 20,
+                version_bytes: 4096,
+                binding_bytes: 4096,
+                group_entries: 1,
+                group_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
+        let before = log.owner.resources.bytes.available();
+        let namespace = log.provision_new(b"queue").await.unwrap();
+        let writer = log.acquire(&namespace).await.unwrap();
+        let publication = log
+            .prepare(
+                &writer,
+                &[NativeAppend {
+                    identity: "one",
+                    payload: b"retained",
+                    records: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        log.submit(&publication).await.unwrap();
+        let cut = log.capture(&namespace).await.unwrap();
+        let bytes = log.read(&cut, 0).await.unwrap().unwrap().into_bytes();
+        let alias = bytes.clone();
+        drop(bytes);
+        log.shutdown().await.unwrap();
+        drop((namespace, writer, publication, cut));
+        assert!(log.owner.resources.bytes.available() < before);
+        assert_eq!(alias.as_ref(), b"retained");
+        drop(alias);
+        assert_eq!(log.owner.resources.bytes.available(), before);
+    }
 
     #[tokio::test]
     async fn constructor_rejects_derived_page_allocation_minus_one_before_io() {

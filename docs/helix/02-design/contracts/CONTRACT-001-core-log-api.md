@@ -209,6 +209,10 @@ writer, publication, cut and payload allocations retain their byte credits until
 the corresponding owned bytes are destroyed. `shutdown` closes admission and
 drains physical work; retained byte-only handles may outlive it. Payload reads
 use one authenticated captured-root lookup for range and content validation.
+`read_bounded` rejects an authenticated payload length above the caller limit
+before identity-overflow or data reads. The caller must separately admit its own
+consumer allocation before invoking hydration. `NativeRecord::into_bytes` transfers
+the SDK owner without copying; byte aliases retain admission through final drop.
 The external append/reopen contract runs unchanged on Local and explicitly
 configured S3, with both S3 payload-signing modes. These checks do not establish
 provider durability, consumer semantic-index correctness or release throughput.

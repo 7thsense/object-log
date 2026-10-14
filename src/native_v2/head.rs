@@ -675,15 +675,21 @@ impl CapturedHead {
         self.head.encode()
     }
 
-    pub async fn read_record(
+    pub async fn read_record_bounded(
         &self,
         pages: Arc<super::page_store::PageStore>,
         offset: u64,
+        max_payload_bytes: usize,
     ) -> Result<Option<(u64, u32, OwnedPayload)>, ObjectLogError> {
         let Some(owned) = self.lookup(pages.clone(), offset).await? else {
             return Ok(None);
         };
         let entry = owned.entry();
+        if entry.byte_len as usize > max_payload_bytes {
+            return Err(ObjectLogError::BudgetExceeded(
+                "native payload exceeds caller read limit".into(),
+            ));
+        }
         let index = super::index::Index::new(pages.clone());
         let logical = index.literal_id(entry.logical_id).await?;
         let physical = index.object_id(entry.object_id).await?;
@@ -728,7 +734,7 @@ impl CapturedHead {
         offset: u64,
     ) -> Result<Option<OwnedPayload>, ObjectLogError> {
         Ok(self
-            .read_record(pages, offset)
+            .read_record_bounded(pages, offset, usize::MAX)
             .await?
             .map(|(_, _, payload)| payload))
     }
