@@ -121,10 +121,12 @@ pub struct IndexEntry {
 /// The engine calls it from its flush worker (a dedicated thread / blocking
 /// task), so a blocking implementation (a `Mutex`, a SQL transaction) is fine.
 ///
-/// Contract: [`commit`](Sequencer::commit) is **atomic across the whole slice**
-/// (all supplied batches commit together or not at all), and the engine
-/// presents batches for any single [`PartitionKey`] in arrival order and never
-/// splits one partition across concurrent `commit` calls.
+/// Publication scope belongs to the implementation. [`InMemorySequencer`]
+/// validates and commits the whole slice under one lock. Durable manifest
+/// publication linearizes each partition independently, so an error can follow
+/// a durable earlier partition; callers must not infer global rollback.
+/// The engine presents each [`PartitionKey`] in arrival order and never splits
+/// one partition across concurrent `commit` calls.
 pub trait Sequencer: Send + Sync {
     /// Sequencer-private per-batch metadata, forwarded uninterpreted by the
     /// engine. object-log's default sequencers use `()`; a Kafka coordinator uses
@@ -143,9 +145,9 @@ pub trait Sequencer: Send + Sync {
     /// receive several objects in one ordered call.
     /// Returns one [`CommitOutcome`] per input batch, in order.
     ///
-    /// On `Err`, nothing from this call was indexed. A [`CommitOutcome::Rejected`]
-    /// batch was not indexed either; earlier batches in the same call may already
-    /// be durable when the sequencer commits one partition at a time.
+    /// An `Err` may follow indexed earlier partitions; unacknowledged publication
+    /// remains ambiguous. A [`CommitOutcome::Rejected`] batch was not indexed,
+    /// while other batches in the same call may already be durable.
     fn commit(
         &self,
         batches: &[CommitBatch<'_, Self::Meta>],

@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+mod authority;
+
 #[derive(Debug)]
 struct ResponseStatus {
     status: std::sync::Arc<std::sync::atomic::AtomicU16>,
@@ -170,6 +172,7 @@ fn shared_s3_client(
 
 /// S3-compatible blob store.
 pub struct S3BlobStore {
+    authority_identity: std::sync::Arc<()>,
     client: Client,
     bucket: String,
     /// Objects larger than this use multipart upload.
@@ -193,6 +196,7 @@ impl S3BlobStore {
         secret_access_key: &str,
     ) -> Self {
         Self {
+            authority_identity: std::sync::Arc::new(()),
             client: shared_s3_client(endpoint_url, region, access_key_id, secret_access_key),
             bucket: bucket.to_string(),
             multipart_threshold: 16 * 1024 * 1024,

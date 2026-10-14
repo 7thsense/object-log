@@ -6,83 +6,85 @@ ddx:
     - adr-object-storage-log-engine-and-sequencer-seam
 ---
 
-# Contract
+# Object storage and bounded metadata authority
 
-**Contract ID**: CONTRACT-002  
-**Type**: boundary  
-**Version**: v2  
-**Status**: accepted  
-**Related**: CONTRACT-001 v2, ADR-002, PRD FR-1..FR-6, FR-26  
-**Supersedes**: CONTRACT-002 v1 (`ObjectStore` with `put_if_absent` / `compare_and_set` / `capabilities`)
+Contract ID: CONTRACT-002. Version: v3. Status: accepted.
 
-## Purpose
+The immutable data-object port remains `BlobStore`: durable put/put_chunks,
+get, range read, list, delete and media-operation accounting. Local publication
+writes a temporary file, syncs data, renames and syncs the parent directory.
+S3 success follows the selected provider's durable-write semantics; Memory is a
+test backend. These guarantees require provider/process-loss qualification.
 
-This contract defines the **BlobStore** storage port used by `LogEngine` and `ManifestSequencer`. It is intentionally smaller than a full object-store SDK. Conditional writes (CAS) are **not** required: the engine uses unique object keys per flush.
+Adapters preserve complete opaque bytes. `get` and range reads return `None` for
+missing objects, distinct from present empty bytes. Inverted or past-EOF ranges
+return `RangeOutOfBounds`; valid empty `n..n` ranges return empty bytes. Listing
+is complete for the requested prefix, including provider pagination; publication
+temporary keys may be omitted. Deleting a missing key succeeds. Optional media
+statistics snapshot and reset durable operation/byte counters; absent statistics
+use the engine's default one-operation-per-successful-put accounting.
 
-## Scope and Boundaries
+Object keys retain full literal identity and reject empty, NUL and `..` path
+segments. Payloads remain opaque. Unique data keys do not require conditional
+publication; the sequencer's mutable authority does. Legacy `BlobStore` CAS
+remains compatible, including its unsafe-for-native default read/put fallback.
+Native authority must never use that fallback.
 
-- **In scope**: string-keyed immutable object put/get/get_range/list/delete; durable-on-return semantics for production adapters; media-op stats for budget control; key validation rules.
-- **Out of scope**: authentication, bucket creation, lifecycle policies, provider-specific retries beyond adapter configuration, manifest CAS, put-if-absent as a required primitive.
-- **Owning system**: object-log storage adapter layer.
+## Bounded authority port
 
-## Normative Surface
+`BoundedMetadataStore` is a separate required storage port with no defaults.
+Local and S3 implement `read_metadata` and `swap_metadata`. Callers supply a
+positive payload budget and a physical lifetime owner before I/O. Oversized
+input is rejected without publication. A returned snapshot binds the exact
+adapter instance, literal key, observed version and bytes/absence; aliases
+retain payload ownership. Wrong-provider/key tokens fail before I/O.
 
-| Element | Type / Shape | Required | Rules | Notes |
-|---------|---------------|----------|-------|-------|
-| object key | non-empty `&str` | yes | MUST reject empty, NUL, and `..` path segments | Prevent prefix escape |
-| object value | `Bytes` / chunk list | yes | Adapter MUST preserve bytes exactly | Opaque to store |
-| `put(key, value)` | async | yes | Crash-durable adapters: durable-on-return on `Ok` | Memory is **not** crash-durable |
-| `put_chunks(key, chunks)` | async | yes (default ok) | Default may concat then `put`; Local/S3 SHOULD stream/multipart without full double materialization | Large objects |
-| `get(key)` | async | yes | Returns `None` if missing vs `Some(bytes)` | |
-| `get_range(key, range)` | async | yes | `None` if missing; `RangeOutOfBounds` if inverted or end &gt; len; empty `n..n` → empty bytes | No integrity check |
-| `list(prefix)` | async | yes | Keys under prefix; SHOULD be complete (paginate internally) | Temp keys MAY be omitted |
-| `delete(key)` | async | yes | Missing key is success (idempotent preferred) | |
-| `take_media_op_stats()` | sync | no | Snapshot+reset durable media ops/bytes; default `None` ⇒ engine counts 1 op per successful put | Budget controller |
+Local reads check regular-file size before allocation and reject changes during
+read. Conditional replacement compares file identity/version and complete bytes
+under the cross-process lock, then uses durable atomic publication. A stale
+version conflicts even when replacement bytes happen to match.
 
-### Adapter requirements
+S3 reads validate status, Content-Length and ETag before collecting a successful
+body. Unsupported transfer/content encoding is rejected. Missing responses and
+412 conflicts are classified before error-body collection. Only bounded 409
+bodies enter SDK parsing, preserving exact ConditionalRequestConflict semantics.
+Every conditional PUT has one attempt. Conflict rereads use the same bound;
+transport failure, malformed/truncated response or failed conflict reread remains
+unknown, including a lost reply after possible publication. HTTP 200 alone does
+not establish success when the SDK reports an embedded error.
 
-| Adapter | Crash-durable put | Notes |
-|---------|-------------------|-------|
-| `MemoryBlobStore` | no | Tests/dev only |
-| `LocalBlobStore` | yes | MUST: write temp → `sync_data`/`fdatasync` → rename → fsync parent dir (macOS may need `F_FULLFSYNC` for true device durability) |
-| `S3BlobStore` (feature `s3`) | yes (service semantics) | Path-style capable; multipart above size threshold; no CAS API required |
+Payload, token and upload aliases retain the supplied physical owner until their
+source bytes and version/key allocations are released. Local blocking closures
+retain it across caller/runtime cancellation. S3 source upload bytes retain it
+when the HTTP connection outlives the response future. This bounds admitted
+payloads; it does not certify all key/ETag/HTTP/TLS allocation or copied transport
+buffer lifetimes. Total resource and provider-effect qualification remain gates.
 
-## Precedence and Compatibility
+## Fixed-head qualification boundary
 
-- **Versioning**: v2 removes CAS/`capabilities` as required surface. Adapters must not claim CAS-based manifest commits as part of this port.
-- **Ordering**: engine seals unique keys; overwrite of an existing key is not part of the engine’s normal path and is adapter-defined if it occurs.
-- **Backward compatibility**: v1 `ObjectStore` CAS methods are removed. Callers use BlobStore only.
-- **Deprecation**: none within v2; additive optional methods allowed if defaulted.
+The test-internal head reader exercises the production port with an exact
+192-byte versioned/checksummed head: namespace and incarnation commitments,
+unsigned epoch, nonnegative signed-offset-compatible retained bounds, immutable
+index-root identity and an opaque semantic-anchor slot. Checked acquisition
+increments only epoch, preserving roots/bounds exactly. Missing known authority,
+legacy JSON, scope mismatch, corrupt bytes, regressed conflict observations and
+epoch exhaustion fail closed. It cannot create heads, migrate manifests, publish
+arbitrary roots or enable Fireweed prefix reuse.
 
-## Error Semantics
+A production native-v2 sequencer must subsequently own this component, publish
+immutable authenticated pages before its head CAS, and commit log and semantic
+roots together. Lazy open/refresh/acquire/install, bounded page proofs and explicit
+retention/reclamation are required; paging lookup alone is insufficient. Consumer
+semantics stay outside the SDK. Checksums detect corruption, not authenticated
+provenance or valid-record substitution.
 
-| Condition | Error / Outcome | Retry | Recovery Expectation |
-|-----------|------------------|-------|----------------------|
-| Invalid key | `InvalidObjectKey` | no | Fix key construction |
-| Transient I/O / service failure | `StorageUnavailable` | yes | Retry within caller/engine policy |
-| Range out of bounds | `RangeOutOfBounds` | no | Fix range |
-| Missing object on get/get_range | `Ok(None)` | n/a | Caller decides |
-| Missing object expected present (fetch path) | surfaced as `MissingObject` by engine | no | Repair |
+## Verification
 
-## Examples
-
-```text
-put("log/obj-01HZ...", <multiplexed batch bytes>)
-get_range("log/obj-01HZ...", 128..512) -> Some(<slice>)
-list("log/") -> ["log/obj-01HZ...", "log/manifest-..."]
-delete("log/obj-old...")
-```
-
-## Non-Normative Notes
-
-- Manifest CAS from CONTRACT-002 v1 is obsolete. `ManifestSequencer` writes new manifest object keys (or equivalent) with ordinary durable puts, amortized per group-commit.
-- Whole-object checksums are intentionally not part of this port so `get_range` remains valid; consumers that need integrity put checksums in their own framing.
-- At very large key counts, a streaming list API may be added later without breaking put/get semantics.
-
-## Validation Checklist
-
-- [x] Normative fields and rules are explicit.
-- [x] No CAS requirement remains.
-- [x] Error handling is explicit.
-- [x] Conformance tests can exercise Memory and Local (and optional S3).
-- [x] Non-normative notes cannot be mistaken for contract requirements.
+Native-head tests exercise actual Local I/O and the pinned S3 SDK transport,
+including exact/N-1 budgets, oversized reads/conflicts, malformed framing,
+competing and regressed fences, both signing modes, one-attempt lost replies,
+runtime shutdown during a physical Local write, panic/unlock, aliased result
+cleanup and backpressured upload cancellation. Hermetic HTTP controls prove the
+adapter protocol, not remote provider durability. The bounded CAS model covers
+root preservation, scope/budget admission, ambiguous outcomes and physical-owner
+release; its code mapping is documentary rather than a refinement proof.

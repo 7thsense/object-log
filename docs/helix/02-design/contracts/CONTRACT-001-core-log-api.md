@@ -10,7 +10,7 @@ ddx:
 
 **Contract ID**: CONTRACT-001  
 **Type**: library  
-**Version**: v2  
+**Version**: v3
 **Status**: accepted  
 **Related**: ADR-002, PRD FR-7..FR-30, TD-004  
 **Supersedes**: CONTRACT-001 v1 (Kafka-shaped `LogBackend` / `AckMode` / `EpochGuard` / record model)
@@ -52,7 +52,7 @@ This contract defines object-log’s normative **engine and sequencer** surface.
 | `CommitOutcome::Assigned` | `{ base_offset, record_count }` | yes | Fresh contiguous range | |
 | `CommitOutcome::Duplicate` | `{ base_offset }` | yes | Idempotent retry recognized by sequencer | Visibility unchanged |
 | `CommitOutcome::Rejected` | `{ reason }` | yes | Batch not indexed; others in the call may be | Engine reports `Sequencer::rejection_error` |
-| `Sequencer::commit` | sync | yes | Atomic across entire slice; one outcome per batch in order; `Err` commits nothing | Lin-point |
+| `Sequencer::commit` | sync | yes | One ordered outcome per batch; atomicity follows the implementation; Manifest publishes per partition and errors may follow earlier durable publications | Lin-point |
 | `Sequencer::lookup` | sync | yes | Entries covering `fetch_offset` onward | |
 | `Sequencer::high_watermark` | sync | yes | Next offset to assign (index-only) | |
 | `Sequencer::log_start_offset` | sync | yes | First readable offset | Advances on truncate |
@@ -66,7 +66,7 @@ This contract defines object-log’s normative **engine and sequencer** surface.
 1. **PUT before commit.** The engine MUST durable-put the sealed object before calling `commit`. A successful `lookup` entry implies its byte range is durably readable under a crash-durable BlobStore.
 2. **Unique object id, fresh on retry.** Each seal uses a unique object key; retries MUST NOT reuse a key from a failed or uncertain PUT.
 3. **In-order, un-split per partition.** For any single `PartitionKey`, batches are presented to `commit` in arrival order and never split across concurrent in-flight `commit` calls. Satisfied by a single flush worker, or by sharding concurrency on `PartitionKey` only (never on opaque Meta).
-4. **Atomic multiplex commit.** `commit` is all-or-nothing for every batch in the object; on `Err` the engine acks nothing for that seal.
+4. **Publication scope.** InMemory validates and commits the whole slice under its lock. Manifest publishes each partition independently; an error can follow a durable earlier partition. The engine may acknowledge nothing for that seal, which does not prove every publication had no effects.
 
 ## Precedence and Compatibility
 
@@ -74,6 +74,52 @@ This contract defines object-log’s normative **engine and sequencer** surface.
 - **Ordering**: per-partition produce arrival order is preserved through commit presentation; `Duplicate` takes precedence over assigning a new range when the sequencer recognizes a retry.
 - **Backward compatibility**: v1 Kafka-shaped types are **removed**, not deprecated. Callers must migrate to v2.
 - **Meta evolution**: consumers may change their `Meta` type without a contract major if engine bounds (`Send + Sync`) hold.
+
+## Native authority and owned replay
+
+Owned append is additive to ordinary produce: an opaque shared lifetime owner
+follows the existing budget/enqueue/flush path. Pending payloads drop before their
+owners; every started upload retains its sealed batch owners through terminal
+I/O. Engine failure can send an error before those uploads finish. Final-owner
+notification, not ACK, governs reservation release. Cleanup drops callbacks
+outside the engine lock. Embedders admit all retained copies/header capacity.
+
+Native conditional append requires Sequenced acknowledgement and original
+nonnegative next-offset conditions; insertion sequence and sparse hints are not
+log heads. Unsupported sequencers reject before legacy commit or upload. Ordered
+siblings advance a partition's tentative head only when accepted. All-rejected
+partitions do not publish. CAS conflicts reconcile exact location/base/count and
+re-evaluate original conditions. Partial reconciliation, unavailable retained
+identity, malformed authority and ambiguous replies remain unknown. Publication
+is per partition; no cross-partition transaction is promised.
+
+Fresh authoritative state contains epoch, retained start and next offset. Native
+acquisition checked-increments epoch and returns bounds from the same successful
+CAS. Neither operation falls back to cached getters or legacy fencing. State is
+a point-in-time target, not exclusivity or a pinned history session; subsequent
+writes still require conditional head and epoch checks. Known observed/catalog
+membership and ambiguous/malformed conflict evidence forbid recreating missing
+authority. A genuinely unseen namespace may report zero state. Uncertainty
+markers are failure knowledge, never synthetic durable success.
+
+`BoundedSequencer` is a separate required page port. Validate ordered contiguous
+positive ranges and boundary/tail coverage before installation; budget cloned
+entries, headers and complete object identifiers before allocation. Retention is
+checked under the same lock as page copying. `FetchPlan` binds sequencer/blob
+identity and reports metadata/selected byte lengths before payload I/O. First
+batch size may exceed a soft target; a distinct admitted hard bound applies.
+
+Strict range reads never fall back to whole-object reads. Unknown adapters reject;
+Local opens and reads the checked range, Memory can share a slice, and S3 verifies
+206 status, exact length and complete Content-Range before bounded collection.
+Empty reads use checked EOF/HEAD. Cancellation is not proof that independently
+started blocking work has ended; embedders retain ownership through completion.
+
+These ports preserve serialized legacy batch/outcome types. Full manifest
+residency/rewrite, paged source roots, total resource bounds, authenticated semantic
+proofs and provider/process-loss qualification remain obligations. The bounded
+metadata/fixed-head foundation is specified in CONTRACT-002; it does not activate
+Fireweed's public backend or permit trusting its serving projection.
 
 ## Error Semantics
 

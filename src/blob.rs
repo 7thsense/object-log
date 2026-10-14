@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod authority;
+pub use authority::{BoundedMetadataStore, MetadataSnapshot, MetadataSwap};
+
 /// Result of [`BlobStore::compare_and_swap`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CasOutcome {
@@ -333,6 +336,9 @@ impl BlobStore for MemoryBlobStore {
 /// dir `sync_all` is the intended contract.)
 #[derive(Clone)]
 pub struct LocalBlobStore {
+    authority_identity: Arc<()>,
+    #[cfg(test)]
+    authority_hook: Arc<Mutex<Option<Arc<authority::LocalMetadataHook>>>>,
     root: Arc<PathBuf>,
     media_ops: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
@@ -342,6 +348,9 @@ impl LocalBlobStore {
     /// Create a store rooted at `root` (created lazily on first write).
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
+            authority_identity: Arc::new(()),
+            #[cfg(test)]
+            authority_hook: Arc::new(Mutex::new(None)),
             root: Arc::new(root.into()),
             media_ops: Arc::new(AtomicU64::new(0)),
             bytes_written: Arc::new(AtomicU64::new(0)),

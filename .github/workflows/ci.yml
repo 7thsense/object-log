@@ -23,6 +23,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
+      - name: Native metadata authority model
+        run: python3 scripts/formal/check_native_head.py --self-test --output target/native-head-model.json
       - name: Package (dry-run)
         run: cargo publish --dry-run
 
