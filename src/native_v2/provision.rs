@@ -11,13 +11,23 @@ const MAGIC: &[u8; 8] = b"ONB2\0\0\0\x01";
 const HEADER: usize = 80;
 const DIGEST: usize = 32;
 
+pub(super) fn candidate_page_prefix_len(prefix_len: usize) -> Result<usize, ObjectLogError> {
+    prefix_len
+        .checked_add("/candidates/".len() + 64 + 1 + 64 + "/pages".len())
+        .ok_or_else(|| invalid("candidate key length overflow"))
+}
 pub(super) fn candidate_keys(prefix: &str, scope: Scope) -> (String, String) {
     let stem = format!(
         "{prefix}/candidates/{}/{}",
         hex(&scope.namespace),
         hex(&scope.incarnation)
     );
-    (format!("{stem}/head"), format!("{stem}/pages"))
+    let pages = format!("{stem}/pages");
+    debug_assert_eq!(
+        candidate_page_prefix_len(prefix.len()).ok(),
+        Some(pages.len())
+    );
+    (format!("{stem}/head"), pages)
 }
 
 pub(super) struct NamespaceContext {

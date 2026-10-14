@@ -207,6 +207,22 @@ impl PageStore {
         prefix: &str,
         limits: MetadataLimits,
     ) -> Result<usize, ObjectLogError> {
+        Self::planned_allocation_with(prefix, limits, |key_len, limits| {
+            store.page_source_scratch(key_len, limits)
+        })
+    }
+    pub(super) fn planned_allocation_with(
+        prefix: &str,
+        limits: MetadataLimits,
+        scratch: impl FnOnce(usize, MetadataLimits) -> Result<usize, ObjectLogError>,
+    ) -> Result<usize, ObjectLogError> {
+        Self::planned_allocation_for_len(prefix.len(), limits, scratch)
+    }
+    pub(super) fn planned_allocation_for_len(
+        prefix_len: usize,
+        limits: MetadataLimits,
+        scratch: impl FnOnce(usize, MetadataLimits) -> Result<usize, ObjectLogError>,
+    ) -> Result<usize, ObjectLogError> {
         // Config-owned prefix is shared. Reserve the complete generated key,
         // adapter key copy, encoded page, decoded capacity and source scratch.
         limits.validate()?;
@@ -215,12 +231,10 @@ impl PageStore {
                 "native metadata payload limit cannot hold a page".into(),
             ));
         }
-        let key_len = prefix
-            .len()
+        let key_len = prefix_len
             .checked_add(195)
             .ok_or_else(|| ObjectLogError::InvalidConfig("native key length overflow".into()))?;
-        let allocation = store
-            .page_source_scratch(key_len, limits)?
+        let allocation = scratch(key_len, limits)?
             .checked_add(PAGE_BYTES * 4)
             .ok_or_else(|| {
                 ObjectLogError::InvalidConfig("native page allocation overflow".into())

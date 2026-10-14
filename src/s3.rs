@@ -220,6 +220,14 @@ impl S3BlobStore {
         key_len: usize,
         version_bytes: usize,
     ) -> Result<usize, ObjectLogError> {
+        Self::planned_native_source_scratch(key_len, version_bytes, self.bucket.capacity())
+    }
+    #[cfg(any(test, feature = "native"))]
+    pub(crate) fn planned_native_source_scratch(
+        key_len: usize,
+        version_bytes: usize,
+        bucket_capacity: usize,
+    ) -> Result<usize, ObjectLogError> {
         key_len
             .checked_mul(8)
             .and_then(|n| {
@@ -228,8 +236,7 @@ impl S3BlobStore {
                     .and_then(|tokens| n.checked_add(tokens))
             })
             .and_then(|n| {
-                self.bucket
-                    .capacity()
+                bucket_capacity
                     .checked_mul(8)
                     .and_then(|bucket| n.checked_add(bucket))
             })

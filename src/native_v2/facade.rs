@@ -237,6 +237,37 @@ impl NativeLog {
     ) -> Result<Self, ObjectLogError> {
         Self::new(Arc::new(store), prefix, limits)
     }
+    /// Pure S3 native configuration validation before client/cache construction.
+    #[cfg(feature = "s3")]
+    pub fn preflight_s3(
+        prefix: &str,
+        bucket: &str,
+        limits: NativeLimits,
+    ) -> Result<(), ObjectLogError> {
+        limits.validate()?;
+        super::provision::validate_prefix(prefix)?;
+        let metadata = MetadataLimits {
+            payload_bytes: limits.binding_bytes.max(limits.group_bytes).max(4096),
+            version_bytes: limits.version_bytes,
+        };
+        let registry_len = prefix
+            .len()
+            .checked_add("/namespaces".len())
+            .ok_or_else(|| invalid("registry length overflow"))?;
+        let derived_len = super::provision::candidate_page_prefix_len(registry_len)?;
+        let required =
+            PageStore::planned_allocation_for_len(derived_len, metadata, |key_len, limits| {
+                crate::S3BlobStore::planned_native_source_scratch(
+                    key_len,
+                    limits.version_bytes,
+                    bucket.len(),
+                )
+            })?;
+        if required > limits.bytes as usize {
+            return Err(invalid("native configuration exceeds byte admission"));
+        }
+        Ok(())
+    }
     fn new(
         store: Arc<dyn NativeStore>,
         prefix: String,
@@ -248,19 +279,20 @@ impl NativeLog {
             payload_bytes: limits.binding_bytes.max(limits.group_bytes).max(4096),
             version_bytes: limits.version_bytes,
         };
-        let page_prefix = format!("{prefix}/wire-pages");
-        let registry_prefix = format!("{prefix}/namespaces");
-        let (_, derived_prefix) = super::provision::candidate_keys(
-            &registry_prefix,
-            Scope {
-                namespace: [1; 32],
-                incarnation: [1; 32],
-            },
-        );
-        let required = PageStore::planned_allocation(store.as_ref(), &derived_prefix, metadata)?;
+        let registry_len = prefix
+            .len()
+            .checked_add("/namespaces".len())
+            .ok_or_else(|| invalid("registry length overflow"))?;
+        let derived_len = super::provision::candidate_page_prefix_len(registry_len)?;
+        let required =
+            PageStore::planned_allocation_for_len(derived_len, metadata, |key_len, limits| {
+                store.page_source_scratch(key_len, limits)
+            })?;
         if required > limits.bytes as usize {
             return Err(invalid("native configuration exceeds byte admission"));
         }
+        let page_prefix = format!("{prefix}/wire-pages");
+        let registry_prefix = format!("{prefix}/namespaces");
         let resources = Resources::new(ExecutionConfig {
             workers: limits.workers,
             blocking_workers: limits.blocking_workers,
@@ -705,6 +737,63 @@ fn invalid(message: &str) -> ObjectLogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn pure_s3_preflight_matches_constructed_adapter_allocation() {
+        assert!(super::super::provision::candidate_page_prefix_len(usize::MAX).is_err());
+        let bucket = "preflight-β-bucket";
+        let prefix = "preflight/λ";
+        let metadata = MetadataLimits {
+            payload_bytes: 4096,
+            version_bytes: 4096,
+        };
+        let (_, derived) = super::super::provision::candidate_keys(
+            &format!("{prefix}/namespaces"),
+            Scope {
+                namespace: [1; 32],
+                incarnation: [1; 32],
+            },
+        );
+        let required = PageStore::planned_allocation_with(&derived, metadata, |key_len, limits| {
+            crate::S3BlobStore::planned_native_source_scratch(
+                key_len,
+                limits.version_bytes,
+                bucket.len(),
+            )
+        })
+        .unwrap();
+        let mut limits = NativeLimits {
+            workers: 1,
+            blocking_workers: 1,
+            operations: 1,
+            bytes: (required - 1).try_into().unwrap(),
+            version_bytes: 4096,
+            binding_bytes: 256,
+            group_entries: 1,
+            group_bytes: 4096,
+        };
+        assert!(NativeLog::preflight_s3(prefix, bucket, limits).is_err());
+        limits.bytes = required.try_into().unwrap();
+        NativeLog::preflight_s3(prefix, bucket, limits).unwrap();
+        let store = crate::S3BlobStore::new(
+            "http://127.0.0.1:1",
+            "us-east-1",
+            bucket,
+            "preflight-key",
+            "preflight-secret",
+        );
+        assert_eq!(
+            PageStore::planned_allocation(&store, &derived, metadata).unwrap(),
+            required
+        );
+        let log = NativeLog::s3(store, prefix.into(), limits).unwrap();
+        log.shutdown().await.unwrap();
+        limits.operations = 0;
+        assert!(NativeLog::preflight_s3(prefix, bucket, limits).is_err());
+        limits.operations = 1;
+        assert!(NativeLog::preflight_s3("invalid/../prefix", bucket, limits).is_err());
+    }
 
     #[tokio::test]
     async fn sealed_read_plan_retains_credit_after_drain() {
