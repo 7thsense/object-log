@@ -126,7 +126,11 @@ impl ManifestSequencer {
         for part in parts.values() {
             crate::bounded_lookup::validate_index(&part.entries, part.log_start, part.next_offset)?;
         }
-        let rt = Builder::new_current_thread()
+        // The same blob client is also used by the engine's upload runtime.
+        // Keep connection tasks and their I/O reactor driven between synchronous
+        // calls; a current-thread runtime strands pooled connection drivers.
+        let rt = Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .map_err(|e| ObjectLogError::StorageUnavailable(e.to_string()))?;
@@ -1309,6 +1313,121 @@ mod index_tests {
         ) -> Result<crate::CasOutcome, ObjectLogError> {
             self.inner.compare_and_swap(key, expected, new_value).await
         }
+    }
+
+    struct DriverRetired(std::sync::mpsc::Sender<()>);
+    impl Drop for DriverRetired {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    struct DriverProbe {
+        inner: MemoryBlobStore,
+        armed: std::sync::atomic::AtomicBool,
+        release: Arc<tokio::sync::Notify>,
+        completed: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        retired: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+    #[async_trait]
+    impl BlobStore for DriverProbe {
+        async fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectLogError> {
+            self.inner.put(key, value).await
+        }
+        async fn get(&self, key: &str) -> Result<Option<Bytes>, ObjectLogError> {
+            if self.armed.swap(false, Ordering::AcqRel) {
+                let release = self.release.clone();
+                let completed = self.completed.lock().unwrap().take().unwrap();
+                let retired = DriverRetired(self.retired.lock().unwrap().take().unwrap());
+                // Like a pooled HTTP connection, this task belongs to the
+                // runtime driving the request that first creates it.
+                tokio::spawn(async move {
+                    let _retired = retired;
+                    release.notified().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    let _ = completed.send(());
+                    std::future::pending::<()>().await;
+                });
+            }
+            self.inner.get(key).await
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Option<Bytes>, ObjectLogError> {
+            self.inner.get_range(key, range).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectLogError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectLogError> {
+            self.inner.delete(key).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Bytes>,
+            value: Bytes,
+        ) -> Result<CasOutcome, ObjectLogError> {
+            self.inner.compare_and_swap(key, expected, value).await
+        }
+    }
+    #[test]
+    fn synchronous_sequencer_keeps_connection_driver_progress_between_calls() {
+        let caller = Builder::new_current_thread().enable_all().build().unwrap();
+        let (completed, received) = std::sync::mpsc::channel();
+        let (retired, cleanup) = std::sync::mpsc::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let blob = Arc::new(DriverProbe {
+            inner: MemoryBlobStore::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            release: release.clone(),
+            completed: Mutex::new(Some(completed)),
+            retired: Mutex::new(Some(retired)),
+        });
+        let store: Arc<dyn BlobStore> = blob.clone();
+        let sequencer = Arc::new(
+            caller
+                .block_on(ManifestSequencer::open(store, "manifest/"))
+                .unwrap(),
+        );
+        // Initial open I/O belongs to the caller. Arm only the later owned
+        // synchronous sequencer runtime whose idle progress is under test.
+        blob.armed.store(true, Ordering::Release);
+        let state = on_thread(&sequencer, |seq| {
+            seq.authoritative_partition_state(&PartitionKey("new".into()))
+        })
+        .unwrap();
+        assert_eq!(
+            state,
+            AuthoritativePartitionState {
+                epoch: 0,
+                log_start: 0,
+                next_offset: 0
+            }
+        );
+        assert!(!blob.armed.load(Ordering::Acquire));
+        assert!(matches!(
+            received.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        // The synchronous call has returned. Never enter either runtime again
+        // while waiting: the owned worker/reactor must drive the gated task.
+        release.notify_one();
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("owned connection driver must progress between sequencer calls");
+        assert!(matches!(
+            cleanup.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(sequencer);
+        // shutdown_background is asynchronous; observe actual task retirement
+        // rather than treating Drop return as a worker join.
+        cleanup
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("owned connection driver retires after sequencer destruction");
+        drop(caller);
     }
 
     #[tokio::test]
