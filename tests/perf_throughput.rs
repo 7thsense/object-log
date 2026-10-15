@@ -5,12 +5,12 @@
 //! | **dd**   | Shell `dd conv=fdatasync` (host reference) |
 //! | **B0**   | Rust stream zeros → `sync_data` |
 //! | **B0d**  | B0 + parent dir `fsync` |
-//! | **B1**   | Warm `LocalBlobStore::put` flat key (median of N runs; alloc outside) |
+//! | **B1**   | Warm `LocalBlobStore::put` flat key (one per matched round) |
 //! | **B2**   | Prebuilt zero chunks → produce + flush (split: enqueue vs flush) |
 //!
 //! ```text
 //! OBJECT_LOG_PERF_BYTES=$((256*1024*1024)) \
-//!   cargo test --release --test perf_throughput honest -- --nocapture
+//!   cargo test --release --test perf_throughput honest -- --nocapture --test-threads=1
 //! ```
 
 use bytes::Bytes;
@@ -29,15 +29,7 @@ fn total_bytes() -> usize {
     std::env::var("OBJECT_LOG_PERF_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32 * 1024 * 1024)
-}
-
-fn b1_warm_runs() -> usize {
-    std::env::var("OBJECT_LOG_PERF_B1_RUNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5)
-        .max(2)
+        .unwrap_or(64 * 1024 * 1024)
 }
 
 fn perf_root() -> (PathBuf, Option<tempfile::TempDir>) {
@@ -52,7 +44,7 @@ fn perf_root() -> (PathBuf, Option<tempfile::TempDir>) {
 }
 
 fn mib_s(bytes: usize, elapsed: Duration) -> f64 {
-    (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64().max(1e-9)
+    (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
 }
 
 fn zeros(n: usize) -> Vec<u8> {
@@ -133,29 +125,95 @@ fn baseline_b0_dir(dir: &Path, total: usize) -> Duration {
     t0.elapsed()
 }
 
-/// Warm flat-key B1: median of `runs` puts (drop cold first). Alloc outside each timed put.
-async fn baseline_b1_warm(dir: &Path, total: usize, runs: usize) -> (Duration, Vec<Duration>) {
+async fn baseline_b1(dir: &Path, payload: &Bytes) -> Duration {
     let store = LocalBlobStore::new(dir);
-    // Warm mkdir / first put (not scored).
-    let warm_payload = Bytes::from(zeros(total.min(1024 * 1024)));
-    store.put("obj", warm_payload).await.unwrap();
-    let _ = store.delete("obj").await;
+    store
+        .put("warm", Bytes::from_static(b"warm"))
+        .await
+        .unwrap();
+    store.delete("warm").await.unwrap();
+    let start = Instant::now();
+    store.put("obj", payload.clone()).await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(store.get("obj").await.unwrap().unwrap(), *payload);
+    elapsed
+}
 
-    let payload = Bytes::from(zeros(total));
-    let mut samples = Vec::with_capacity(runs);
-    for i in 0..runs {
-        let key = format!("obj{i}");
-        // Ensure parent exists (flat keys under root).
-        let t0 = Instant::now();
-        store.put(&key, payload.clone()).await.unwrap();
-        samples.push(t0.elapsed());
-        let _ = store.delete(&key).await;
+const ORDERS: [[usize; 4]; 8] = [
+    [0, 1, 3, 2],
+    [1, 2, 0, 3],
+    [2, 3, 1, 0],
+    [3, 0, 2, 1],
+    [0, 1, 3, 2],
+    [1, 2, 0, 3],
+    [2, 3, 1, 0],
+    [3, 0, 2, 1],
+];
+
+fn median(mut values: Vec<f64>) -> f64 {
+    assert!(!values.is_empty() && values.iter().all(|v| v.is_finite() && *v > 0.0));
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
     }
-    // Median
-    let mut sorted = samples.clone();
-    sorted.sort();
-    let median = sorted[sorted.len() / 2];
-    (median, samples)
+}
+
+fn paired_ratios(samples: &[[Duration; 4]]) -> (f64, f64) {
+    let ratio = |arm: usize| {
+        median(
+            samples
+                .iter()
+                .map(|s| {
+                    assert!(s.iter().all(|d| !d.is_zero()));
+                    s[arm].as_secs_f64() / s[3].as_secs_f64()
+                })
+                .collect(),
+        )
+    };
+    (ratio(1), ratio(0))
+}
+
+fn qualifies(samples: &[[Duration; 4]]) -> bool {
+    let (dir, data) = paired_ratios(samples);
+    dir >= 0.70 || data >= 0.60
+}
+
+#[test]
+fn honest_paired_gate_controls() {
+    for position in 0..4 {
+        for label in 0..4 {
+            assert_eq!(ORDERS.iter().filter(|o| o[position] == label).count(), 2);
+        }
+    }
+    let ms = Duration::from_millis;
+    let boundary = [[ms(60), ms(70), ms(90), ms(100)]; 8];
+    assert!(qualifies(&boundary));
+    assert!(qualifies(&[[ms(59), ms(70), ms(90), ms(100)]; 8]));
+    assert!(qualifies(&[[ms(60), ms(69), ms(90), ms(100)]; 8]));
+    let below = [[ms(59), ms(69), ms(90), ms(100)]; 8];
+    assert!(!qualifies(&below));
+    let slowed = boundary.map(|mut s| {
+        s[3] *= 2;
+        s
+    });
+    assert!(!qualifies(&slowed));
+    // A short final flush cannot hide a slow enqueue interval.
+    let enqueue = ms(190);
+    let flush = ms(10);
+    assert!(!qualifies(&[[ms(60), ms(70), ms(90), enqueue + flush]; 8]));
+    let asymmetric = [
+        [ms(1), ms(1), ms(1), ms(1)],
+        [ms(100), ms(100), ms(1), ms(2)],
+        [ms(101), ms(101), ms(1), ms(1000)],
+    ];
+    assert_eq!(paired_ratios(&asymmetric), (1.0, 1.0));
+    assert_ne!(
+        median(vec![1.0, 100.0, 101.0]) / median(vec![1.0, 2.0, 1000.0]),
+        1.0
+    );
 }
 
 fn next_chunk_len(seed: &mut u64, min: usize, max: usize) -> usize {
@@ -205,10 +263,14 @@ struct B2Timing {
 }
 
 async fn baseline_b2_split(dir: &Path, chunks: &[Bytes]) -> B2Timing {
+    baseline_b2_timed(dir, chunks, Duration::ZERO).await
+}
+
+async fn baseline_b2_timed(dir: &Path, chunks: &[Bytes], enqueue_delay: Duration) -> B2Timing {
     let blob = Arc::new(LocalBlobStore::new(dir));
     // Warm store root.
-    blob.put("warm", Bytes::from(zeros(4096))).await.unwrap();
-    let _ = blob.delete("warm").await;
+    blob.put("b2/warm", Bytes::from(zeros(4096))).await.unwrap();
+    let _ = blob.delete("b2/warm").await;
 
     let engine = LogEngine::new(
         Arc::clone(&blob) as Arc<dyn BlobStore>,
@@ -219,6 +281,9 @@ async fn baseline_b2_split(dir: &Path, chunks: &[Bytes]) -> B2Timing {
     let partition = PartitionKey("p0".into());
 
     let t_enq0 = Instant::now();
+    if !enqueue_delay.is_zero() {
+        tokio::time::sleep(enqueue_delay).await;
+    }
     for c in chunks {
         engine
             .produce(partition.clone(), c.clone(), 1, (), Durability::Buffered)
@@ -230,17 +295,41 @@ async fn baseline_b2_split(dir: &Path, chunks: &[Bytes]) -> B2Timing {
     let t_fl0 = Instant::now();
     engine.flush().await.unwrap();
     let flush = t_fl0.elapsed();
+    let total = t_enq0.elapsed();
 
+    let stored = engine.fetch(&partition, 0, usize::MAX).await.unwrap();
+    assert_eq!(stored.len(), chunks.len());
+    for (batch, expected) in stored.iter().zip(chunks) {
+        assert_eq!(batch.payload, *expected);
+    }
     let objects = blob.list("b2/").await.unwrap().len() as u64;
+    assert!((1..=2).contains(&objects), "packed objects={objects}");
     let flushes = engine.pipeline_snapshot().flushes_total;
+    drop(engine); // Drop joins the owned committer before the next sample.
     B2Timing {
         enqueue,
         flush,
-        total: enqueue + flush,
+        total,
         objects,
         flushes,
         chunks: chunks.len(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn honest_actual_enqueue_delay_is_scored() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks = prebuild_chunks(1024 * 1024);
+    let delay = Duration::from_secs(1);
+    let timing = baseline_b2_timed(dir.path(), &chunks, delay).await;
+    assert!(timing.enqueue >= delay);
+    assert!(
+        timing.total >= timing.enqueue + timing.flush,
+        "total omitted enqueue: enqueue={:?} flush={:?} total={:?}",
+        timing.enqueue,
+        timing.flush,
+        timing.total
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -265,82 +354,58 @@ async fn honest_local_throughput_table() {
         eprintln!("  dd             (skipped)");
     }
 
-    let b0 = baseline_b0(&run, total);
-    print_row("B0", total, b0, "(Rust stream + sync_data)");
-
-    let b0d = baseline_b0_dir(&run, total);
-    print_row("B0d", total, b0d, "(B0 + dir fsync)");
-
-    let b1_dir = run.join("b1");
-    std::fs::create_dir_all(&b1_dir).unwrap();
-    let runs = b1_warm_runs();
-    let (b1_med, b1_samples) = baseline_b1_warm(&b1_dir, total, runs).await;
-    let b1_rates: Vec<f64> = b1_samples.iter().map(|d| mib_s(total, *d)).collect();
-    eprintln!(
-        "  {:<14} {:>8.1} MiB/s   {:>7.3}s   (Local put warm median n={runs}; samples_mib/s={b1_rates:?})",
-        "B1",
-        mib_s(total, b1_med),
-        b1_med.as_secs_f64(),
-    );
-
+    let payload = Bytes::from(zeros(total));
     let chunks = prebuild_chunks(total);
-    let b2_dir = run.join("b2");
-    std::fs::create_dir_all(&b2_dir).unwrap();
-    let b2 = baseline_b2_split(&b2_dir, &chunks).await;
-    eprintln!(
-        "  {:<14} {:>8.1} MiB/s   {:>7.3}s   (engine chunks={} objects={} flushes={})",
-        "B2",
-        mib_s(total, b2.total),
-        b2.total.as_secs_f64(),
-        b2.chunks,
-        b2.objects,
-        b2.flushes,
-    );
-    eprintln!(
-        "  {:<14} {:>8.1} MiB/s   {:>7.3}s   (enqueue only)",
-        "B2.enqueue",
-        mib_s(total, b2.enqueue),
-        b2.enqueue.as_secs_f64(),
-    );
-    eprintln!(
-        "  {:<14} {:>8.1} MiB/s   {:>7.3}s   (flush only ≈ durable put path)",
-        "B2.flush",
-        mib_s(total, b2.flush),
-        b2.flush.as_secs_f64(),
-    );
-
-    let r_b1_b0 = mib_s(total, b1_med) / mib_s(total, b0).max(0.1);
-    let r_b2_b1 = mib_s(total, b2.total) / mib_s(total, b1_med).max(0.1);
-    let r_b2_b0 = mib_s(total, b2.total) / mib_s(total, b0).max(0.1);
-    let r_flush_b0 = mib_s(total, b2.flush) / mib_s(total, b0).max(0.1);
-    // B0d includes parent-dir fsync — the fair baseline for LocalBlobStore puts.
-    let r_flush_b0d = mib_s(total, b2.flush) / mib_s(total, b0d).max(0.1);
-    eprintln!(
-        "  ratios         B1/B0={r_b1_b0:.2}  B2/B1={r_b2_b1:.2}  B2/B0={r_b2_b0:.2}  B2.flush/B0={r_flush_b0:.2}  B2.flush/B0d={r_flush_b0d:.2}"
-    );
-
-    assert!(
-        b2.objects <= 2,
-        "B2 bulk should pack into ≤2 objects, got {}",
-        b2.objects
-    );
-
-    // Ratio floor is a release-mode / explicit-assert gate. Debug builds often
-    // miss parity because the engine path is not optimized (see TD-004).
-    // Fair check: B2.flush vs B0d (both pay dir fsync). Loose B0 floor absorbs
-    // noisy GHA disks when B0 (no dir fsync) spikes.
-    //   cargo test --release --test perf_throughput honest -- --nocapture
-    //   OBJECT_LOG_PERF_ASSERT=1 cargo test --test perf_throughput honest
-    let assert_ratios = cfg!(not(debug_assertions))
-        || std::env::var("OBJECT_LOG_PERF_ASSERT").ok().as_deref() == Some("1");
-    if assert_ratios {
+    let mut samples = Vec::new();
+    for (round, order) in ORDERS.iter().enumerate() {
+        let mut times = [Duration::ZERO; 4];
+        eprintln!("round={round} order={order:?}");
+        for &label in order {
+            let dir = run.join(format!("round-{round}-sample-{label}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Warm the actual publication parent for every arm, outside timing.
+            let parent = if label == 3 {
+                dir.join("b2")
+            } else {
+                dir.clone()
+            };
+            std::fs::create_dir_all(&parent).unwrap();
+            let warm = parent.join("warm-parent");
+            File::create(&warm).unwrap().sync_data().unwrap();
+            std::fs::remove_file(warm).unwrap();
+            File::open(&parent).unwrap().sync_all().unwrap();
+            times[label] = match label {
+                0 => baseline_b0(&dir, total),
+                1 => baseline_b0_dir(&dir, total),
+                2 => baseline_b1(&dir, &payload).await,
+                3 => {
+                    let b2 = baseline_b2_split(&dir, &chunks).await;
+                    eprintln!(
+                        "round={round} enqueue={:?} flush={:?} objects={} flushes={} chunks={} bytes={total}",
+                        b2.enqueue, b2.flush, b2.objects, b2.flushes, b2.chunks
+                    );
+                    b2.total
+                }
+                _ => unreachable!(),
+            };
+            print_row(
+                ["B0", "B0d", "B1", "B2.total"][label],
+                total,
+                times[label],
+                &format!("round={round} ns={}", times[label].as_nanos()),
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        samples.push(times);
+    }
+    let (dir_ratio, data_ratio) = paired_ratios(&samples);
+    eprintln!("paired median B2.total/B0d={dir_ratio:.6} B2.total/B0={data_ratio:.6}");
+    if cfg!(not(debug_assertions))
+        || std::env::var("OBJECT_LOG_PERF_ASSERT").ok().as_deref() == Some("1")
+    {
         assert!(
-            r_flush_b0d >= 0.70 || r_flush_b0 >= 0.60,
-            "B2.flush should be near durable baseline: B2.flush/B0d={r_flush_b0d:.2} B2.flush/B0={r_flush_b0:.2}"
-        );
-    } else {
-        eprintln!(
-            "  (skipping B2.flush ratio assert in debug; use --release or OBJECT_LOG_PERF_ASSERT=1)"
+            qualifies(&samples),
+            "B2 end-to-end paired ratios below unchanged 0.70/0.60 floors: {dir_ratio}, {data_ratio}"
         );
     }
 

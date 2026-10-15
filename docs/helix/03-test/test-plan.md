@@ -92,7 +92,7 @@ ddx:
 | Requirement | Specification |
 |-------------|---------------|
 | Correctness gate | `cargo test --all-features` |
-| Perf evidence | CI job `perf`: `cargo test --release --test perf_throughput honest` with `OBJECT_LOG_PERF_BYTES=16MiB` |
+| Perf evidence | CI job `perf`: `cargo test --release --test perf_throughput honest` with `OBJECT_LOG_PERF_BYTES=64MiB`: eight balanced rounds, paired end-to-end ratios ≥0.70 versus B0d OR ≥0.60 versus B0; exact payload and arithmetic/slowdown controls |
 | Clippy | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Live S3 | CI `s3-minio`; operator `./scripts/s3-evidence.sh` (MinIO/Garage evidenced; AWS/R2 when creds available) |
 
@@ -111,7 +111,7 @@ ddx:
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
-cargo test --release --test perf_throughput honest -- --nocapture   # perf evidence
+cargo test --release --test perf_throughput honest -- --nocapture --test-threads=1   # perf evidence
 ```
 
 **Blocking gate**: all P0 named tests pass; docs do not claim Kafka-in-core, CAS ObjectStore, or live S3 without evidence.

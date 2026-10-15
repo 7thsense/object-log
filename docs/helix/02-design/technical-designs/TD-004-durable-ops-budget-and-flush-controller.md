@@ -7,9 +7,9 @@ ddx:
 
 # Technical Design: TD-004 Durable-Ops Budget and Adaptive Flush Controller
 
-**Status**: implemented (object-log 0.2.x)  
-**Related**: ADR-002, `LogEngine`, `BlobStore`, `FlushConfig`  
-**Consumers**: Fjord (first-class), Fireweed/Local, `ManifestSequencer` users  
+**Status**: implemented (object-log 0.2.x)
+**Related**: ADR-002, `LogEngine`, `BlobStore`, `FlushConfig`
+**Consumers**: Fjord (first-class), Fireweed/Local, `ManifestSequencer` users
 
 ## 1. Purpose
 
@@ -90,16 +90,18 @@ fsync(parent dir)
 | dd | shell `dd conv=fdatasync` |
 | B0 | Rust stream + `sync_data` |
 | B0d | B0 + dir fsync |
-| B1 | warm median flat-key `LocalBlobStore::put` |
+| B1 | warm flat-key `LocalBlobStore::put` |
 | B2 | prebuilt chunks → produce + flush (split enqueue vs flush) |
 
-Representative host result (256 MiB): **B2 ≈ 0.9× B0**, **objects = 1**, enqueue negligible vs flush.
+Eight fixed counterbalanced rounds measure every arm once per round with fresh files, warmed actual parent directories, and identical prebuilt bytes. CI uses 64 MiB per sample. All orders, durations, object counts and chunk counts are printed. The engine is dropped and its committer joined before cleanup and the next sample. Untimed reads verify every stored chunk and byte.
+
+The score is the median of paired duration ratios B0d/B2.total and B0/B2.total, computed separately; B2.total includes enqueue through completed flush. The unchanged numerical floors are **≥0.70 OR ≥0.60**, respectively. B0d is direct-write plus data and directory sync; Local publishes using temporary-file rename. These are comparable durable baselines with distinct publication work. dd is an unscored host reference. No samples are discarded or retried. Arithmetic boundary, balanced-order, uniform-slowdown and slow-enqueue controls exercise the classifier. Failed ratios require investigation, not threshold tuning.
 
 Run:
 
 ```bash
 OBJECT_LOG_PERF_BYTES=$((256*1024*1024)) \
-  cargo test --release --test perf_throughput honest -- --nocapture
+  cargo test --release --test perf_throughput honest -- --nocapture --test-threads=1
 ```
 
 ## 4. Non-goals
@@ -110,11 +112,11 @@ OBJECT_LOG_PERF_BYTES=$((256*1024*1024)) \
 
 ## 5. Acceptance (as-built gates)
 
-1. Bulk B2 with total ≪ `max_bytes`: **objects ≤ 2**.  
-2. B2.flush / B0 ≥ **0.70** (release, honest harness).  
-3. Warm B1 not systematically 3× slower than B0 (median of ≥3 runs).  
-4. Idle sequenced produce completes well under full linger after idle gap.  
-5. `cargo test --all-features` + clippy `-D warnings` green.  
+1. Bulk B2 with total ≪ `max_bytes`: **1 ≤ objects ≤ 2**, with exact chunk and payload verification.
+2. Paired median B2.total/B0d throughput ≥ **0.70** OR B2.total/B0 ≥ **0.60** (release).
+3. Warm B1 must not be systematically 3× slower than B0. Report all eight matched B1 samples; this qualification criterion is distinct from the automated B2 ratio gate.
+4. Idle sequenced produce completes well under full linger after idle gap.
+5. `cargo test --all-features` + clippy `-D warnings` green.
 6. Class A: no Durable/Sequenced ack before put (+ commit for Sequenced).
 
 ## 6. Implementation map

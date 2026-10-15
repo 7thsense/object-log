@@ -34,7 +34,7 @@ jobs:
       - name: Package (dry-run)
         run: cargo publish --dry-run
 
-  # Honest Local throughput ratio (B2.flush ≈ B0) only holds in --release.
+  # Eight counterbalanced end-to-end Local comparisons; unchanged paired ratio floors.
   perf:
     runs-on: ubuntu-latest
     steps:
@@ -44,11 +44,10 @@ jobs:
         with:
           shared-key: release-perf
       - name: Release perf_throughput (honest floor)
-        run: cargo test --release --test perf_throughput honest -- --nocapture
+        run: cargo test --release --test perf_throughput honest -- --nocapture --test-threads=1
         env:
           # Keep CI time bounded; ratio gate is what matters, not absolute MiB/s.
-          OBJECT_LOG_PERF_BYTES: "16777216"
-          OBJECT_LOG_PERF_B1_RUNS: "3"
+          OBJECT_LOG_PERF_BYTES: "67108864"
 
   # Live S3 transport and native authority against a checksum-pinned RustFS.
   s3-rustfs:
