@@ -632,6 +632,7 @@ async fn captured_head_checks_real_root_and_keeps_original_cut_after_head_change
                         byte_start: 0,
                         byte_len: 4,
                         payload_hash: [3; 32],
+                        frame_kind: crate::native_v2::codec::FrameKind::Legacy,
                     },
                 )
                 .await?;
@@ -879,7 +880,7 @@ async fn exercise_prepared_append(
                         .unwrap()
                         .as_ref()
                 )?
-                .payload,
+                .payload(),
                 b"actual bytes"
             );
             assert_eq!(
@@ -1946,3 +1947,5 @@ async fn fence_conflicts_preserve_shared_prefix_and_unreadable_higher_epoch() {
     }).await.unwrap();
     resources.close_and_drain().await.unwrap();
 }
+
+mod coupled;

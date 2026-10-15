@@ -92,8 +92,25 @@ impl Descriptor {
     }
 }
 
+/// Closed interpretation of the indexed certificate digest and data framing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FrameKind {
+    Legacy = 0,
+    Coupled = 1,
+}
+impl FrameKind {
+    fn decode(value: u8) -> Result<Self, ObjectLogError> {
+        match value {
+            0 => Ok(Self::Legacy),
+            1 => Ok(Self::Coupled),
+            _ => Err(invalid("unknown data frame kind")),
+        }
+    }
+}
+
 /// The entire physical identity is committed via the overflow graph, not a
-/// truncated key/hash equality substitute. Payload hash covers the exact indexed byte range.
+/// truncated key/hash equality substitute. Legacy hashes cover user bytes;
+/// coupled hashes cover the complete domain-separated versioned frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LeafEntry {
     pub object_id: Descriptor,
@@ -103,6 +120,7 @@ pub(super) struct LeafEntry {
     pub byte_start: u32,
     pub byte_len: u32,
     pub payload_hash: [u8; 32],
+    pub frame_kind: FrameKind,
 }
 impl LeafEntry {
     pub fn end(&self) -> Result<u64, ObjectLogError> {
@@ -253,6 +271,7 @@ impl Page {
                     slot[72..76].copy_from_slice(&entry.record_count.to_be_bytes());
                     slot[76..80].copy_from_slice(&entry.byte_start.to_be_bytes());
                     slot[80..84].copy_from_slice(&entry.byte_len.to_be_bytes());
+                    slot[84] = entry.frame_kind as u8;
                     slot[88..120].copy_from_slice(&entry.payload_hash);
                 }
             }
@@ -317,7 +336,7 @@ impl Page {
                 }
                 let mut entries = Vec::with_capacity(slots);
                 for slot in raw[HEADER..].as_chunks::<LEAF_BYTES>().0.iter() {
-                    if slot[84..88] != [0; 4] || slot[120..128] != [0; 8] {
+                    if slot[85..88] != [0; 3] || slot[120..128] != [0; 8] {
                         return Err(invalid("leaf reserved bytes"));
                     }
                     entries.push(LeafEntry {
@@ -328,6 +347,7 @@ impl Page {
                         byte_start: u32_at(slot, 76),
                         byte_len: u32_at(slot, 80),
                         payload_hash: slot[88..120].try_into().expect("fixed range"),
+                        frame_kind: FrameKind::decode(slot[84])?,
                     });
                 }
                 Self::Leaf(entries)
@@ -428,6 +448,7 @@ mod tests {
             byte_start: 0,
             byte_len: 4,
             payload_hash: Sha256::digest(b"data").into(),
+            frame_kind: FrameKind::Legacy,
         }
     }
     // Recommit malformed bytes to distinguish structural checks from hash checks.
@@ -518,9 +539,33 @@ mod tests {
     }
 
     #[test]
+    fn frame_kind_is_committed_closed_and_preserves_legacy_zero() {
+        let legacy = entry(0);
+        let (raw, descriptor) = Page::Leaf(vec![legacy]).encode(scope()).unwrap();
+        assert_eq!(raw[HEADER + 84], 0);
+        let coupled = LeafEntry {
+            frame_kind: FrameKind::Coupled,
+            ..legacy
+        };
+        let (coupled_raw, coupled_descriptor) = Page::Leaf(vec![coupled]).encode(scope()).unwrap();
+        assert_eq!(coupled_raw[HEADER + 84], 1);
+        assert_ne!(descriptor.hash, coupled_descriptor.hash);
+        assert_ne!(legacy, coupled);
+        assert_eq!(
+            Page::decode(&coupled_raw, coupled_descriptor, scope()).unwrap(),
+            Page::Leaf(vec![coupled])
+        );
+        for kind in [2, 127, 255] {
+            let mut bad = raw.clone();
+            bad[HEADER + 84] = kind;
+            assert!(Page::decode(&bad, recommit(&bad, descriptor), scope()).is_err());
+        }
+    }
+
+    #[test]
     fn recommitted_bad_lengths_counts_reserved_bytes_and_locations_fail() {
         let (raw, descriptor) = Page::Leaf(vec![entry(0)]).encode(scope()).unwrap();
-        for byte in [74, 108, HEADER + 84, HEADER + 120] {
+        for byte in [74, 108, HEADER + 85, HEADER + 120] {
             let mut corrupt = raw.clone();
             corrupt[byte] = 1;
             assert!(

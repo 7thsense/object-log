@@ -22,7 +22,7 @@ impl PageStore {
     // Codec-independent immutable storage. Callers own the operation admission
     // and a page reservation covering encoded, decoded and provider buffers.
     // Each codec still validates its own version, shape and child descriptors.
-    fn validate_immutable(
+    pub(super) fn validate_immutable(
         &self,
         raw: &[u8],
         hash: &[u8; 32],

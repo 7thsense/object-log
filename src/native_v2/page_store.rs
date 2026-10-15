@@ -10,6 +10,9 @@ use crate::{
 };
 use bytes::Bytes;
 mod immutable;
+mod scoped_bytes;
+mod transition_key;
+pub(super) use scoped_bytes::{EncodedBytes, RetainedBytes};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -563,7 +566,9 @@ impl PageStore {
             {
                 let expected = super::data::DataFrame::decode(&source)?;
                 let actual = super::data::DataFrame::decode(existing)?;
-                if actual.identity != expected.identity || actual.payload != expected.payload {
+                if actual.identity() != expected.identity()
+                    || actual.payload() != expected.payload()
+                {
                     return Err(ObjectLogError::Sequencer(
                         "immutable data identity differs".into(),
                     ));
@@ -1127,7 +1132,7 @@ mod data_namespace_tests {
                         super::super::data::DataFrame::decode(
                             &local.get(key.as_str()).await?.unwrap()
                         )?
-                        .payload,
+                        .payload(),
                         &[index as u8]
                     );
                     assert!(pages.read_head(key.as_str(), 240).await.is_err());

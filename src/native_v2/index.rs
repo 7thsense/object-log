@@ -394,6 +394,7 @@ mod tests {
                     byte_start: n as u32,
                     byte_len: 1,
                     payload_hash: Sha256::digest(&data[n..n + 1]).into(),
+                    frame_kind: crate::native_v2::codec::FrameKind::Legacy,
                 };
                 // Build a complete full one-level tree through bounded immutable writes.
                 let mut children = Vec::new();
@@ -695,6 +696,7 @@ mod extension_tests {
                     byte_start: 0,
                     byte_len: 1,
                     payload_hash: [3; 32],
+                    frame_kind: crate::native_v2::codec::FrameKind::Legacy,
                 };
                 let one = index.append(None, entry(0)).await?;
                 let two = index.append(Some(one), entry(1)).await?;

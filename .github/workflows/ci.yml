@@ -29,6 +29,8 @@ jobs:
         run: python3 scripts/formal/check_native_cow.py --self-test --output target/native-cow-model.json
       - name: Native namespace election model
         run: python3 scripts/formal/check_native_provision.py --self-test --output target/native-provision-model.json
+      - name: Native coupled semantic model
+        run: python3 scripts/formal/check_native_semantic.py --self-test --output target/native-semantic-model.json
       - name: Package (dry-run)
         run: cargo publish --dry-run
 
@@ -142,6 +144,32 @@ jobs:
           OBJECT_LOG_S3_KEY_ID: minioadmin
           OBJECT_LOG_S3_SECRET: minioadmin
         run: cargo test --features native,s3 --test native_facade external_s3_common_append_reopen_contract_both_signing_modes -- --ignored --exact
+
+      - name: Native coupled state and work provider qualification
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_REGION: us-east-1
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+        run: |
+          set -o pipefail
+          mkdir -p target
+          cargo test --features native,s3 --lib native_v2::head::tests::coupled::coupled_s3_atomic_state_work_orphans_and_lost_reply_both_signing_modes -- --ignored --exact 2>&1 | tee target/semantic-provider-result.log
+          python3 -c 'import pathlib,re,sys; text=pathlib.Path("target/semantic-provider-result.log").read_text(); sys.exit(0 if len(re.findall(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", text)) == 1 else "expected exactly one executed provider test")'
+
+      - name: Native public semantic scan provider qualification
+        env:
+          OBJECT_LOG_S3_ENDPOINT: http://127.0.0.1:9000
+          OBJECT_LOG_S3_REGION: us-east-1
+          OBJECT_LOG_S3_BUCKET: object-log-ci
+          OBJECT_LOG_S3_KEY_ID: minioadmin
+          OBJECT_LOG_S3_SECRET: minioadmin
+        run: |
+          set -o pipefail
+          mkdir -p target
+          cargo test --features native,s3 --test native_semantic public_semantic_s3_coupled_state_and_scan_both_signing_modes -- --ignored --exact 2>&1 | tee target/semantic-provider-result.log
+          python3 -c 'import pathlib,re,sys; text=pathlib.Path("target/semantic-provider-result.log").read_text(); sys.exit(0 if len(re.findall(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", text)) == 1 else "expected exactly one executed provider test")'
 
   docs:
     runs-on: ubuntu-latest

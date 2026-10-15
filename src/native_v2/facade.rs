@@ -14,6 +14,12 @@ use super::{
 use crate::{LocalBlobStore, MetadataLimits, ObjectLogError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+mod semantic;
+pub use semantic::{
+    NativeEditLimits, NativeScanLimits, NativeScanStatus, NativeSemanticContinuation,
+    NativeSemanticEdit, NativeSemanticRange, NativeSemanticRow, NativeSemanticScan,
+    NativeSemanticValue, NativeSemanticWork,
+};
 
 /// Explicit store-wide execution and owned-byte limits.
 #[derive(Clone, Copy, Debug)]
@@ -117,7 +123,7 @@ pub struct NativeAppend<'a> {
     pub identity: &'a str,
     /// Opaque checked consumer record bytes.
     pub payload: &'a [u8],
-    /// Number of logical records represented by this entry.
+    /// Logical records represented by this entry, from one through i32::MAX.
     pub records: u32,
 }
 struct OwnedAppend {
@@ -216,6 +222,15 @@ impl AsRef<[u8]> for NativeRecord {
     }
 }
 impl NativeReadCut {
+    fn retained(&self) -> RetainedRead {
+        RetainedRead {
+            captured: self.read.captured.clone(),
+            binding: self.read.binding.clone(),
+            knowledge: self.read.knowledge.clone(),
+            charge: self.read.charge.clone(),
+        }
+    }
+
     /// Opaque complete captured authority, without a mutable root interface.
     pub fn head(&self) -> NativeHead {
         self.read.captured.value()
@@ -488,6 +503,14 @@ impl NativeLog {
         writer: &NativeWriter,
         inputs: &[NativeAppend<'_>],
     ) -> Result<NativePublication, ObjectLogError> {
+        self.prepare_inner(writer, inputs, None).await
+    }
+    async fn prepare_inner(
+        &self,
+        writer: &NativeWriter,
+        inputs: &[NativeAppend<'_>],
+        semantic: Option<(&NativeReadCut, &[NativeSemanticEdit<'_>], NativeEditLimits)>,
+    ) -> Result<NativePublication, ObjectLogError> {
         self.check(&writer.origin)?;
         if inputs.is_empty() || inputs.len() > self.owner.limits.group_entries {
             return Err(invalid("native group entry limit"));
@@ -496,6 +519,7 @@ impl NativeLog {
         let mut allocation = std::mem::size_of::<Inputs>();
         for (i, input) in inputs.iter().enumerate() {
             if input.records == 0
+                || input.records > i32::MAX as u32
                 || input.identity.is_empty()
                 || input.identity.contains('\0')
                 || inputs[..i]
@@ -504,8 +528,13 @@ impl NativeLog {
             {
                 return Err(invalid("native append identity or count"));
             }
+            let length = if semantic.is_some() {
+                DataFrame::coupled_encoded_len(input.identity, input.payload.len())?
+            } else {
+                DataFrame::encoded_len(input.identity, input.payload.len())?
+            };
             framed = framed
-                .checked_add(DataFrame::encoded_len(input.identity, input.payload.len())?)
+                .checked_add(length)
                 .ok_or_else(|| invalid("native group bytes"))?;
             allocation = allocation
                 .checked_add(input.identity.len())
@@ -520,6 +549,15 @@ impl NativeLog {
         if framed > self.owner.limits.group_bytes {
             return Err(invalid("native group framed limit"));
         }
+        let semantic = semantic
+            .map(|(cut, edits, limits)| {
+                self.check(&cut.origin)?;
+                Ok::<_, ObjectLogError>((
+                    cut.retained(),
+                    semantic::SemanticInputs::copy(&self.owner.pages, edits, limits)?,
+                ))
+            })
+            .transpose()?;
         let charge = self.owner.pages.charge_output(allocation)?;
         let inputs = Inputs {
             entries: inputs
@@ -540,6 +578,13 @@ impl NativeLog {
                 let scoped = owner.pages.in_operation(physical)?;
                 let writer = writer.inner.lock().await;
                 let pages = scoped.for_binding(&writer.binding)?;
+                if let Some((expected, _)) = &semantic
+                    && !writer.writer.snapshot().same_cut(&expected.captured)
+                {
+                    return Err(invalid(
+                        "semantic edit cut differs from writer original authority",
+                    ));
+                }
                 let references: Vec<_> = inputs
                     .entries
                     .iter()
@@ -549,18 +594,35 @@ impl NativeLog {
                         records: i.records,
                     })
                     .collect();
-                let prepared = writer
-                    .writer
-                    .clone()
-                    .prepare_group(
-                        pages.clone(),
-                        &references,
-                        AppendGroupLimits {
-                            entries: owner.limits.group_entries,
-                            framed_bytes: owner.limits.group_bytes,
-                        },
-                    )
-                    .await?;
+                let limits = AppendGroupLimits {
+                    entries: owner.limits.group_entries,
+                    framed_bytes: owner.limits.group_bytes,
+                };
+                let prepared = if let Some((_, semantic)) = &semantic {
+                    let edits = semantic.references();
+                    let mut work = semantic.limits.work.budget();
+                    writer
+                        .writer
+                        .clone()
+                        .prepare_semantic_group(
+                            pages.clone(),
+                            &references,
+                            limits,
+                            super::head::SemanticEdits {
+                                edits: &edits,
+                                max_edits: semantic.limits.edits,
+                                max_input_bytes: semantic.limits.input_bytes,
+                                work: &mut work,
+                            },
+                        )
+                        .await?
+                } else {
+                    writer
+                        .writer
+                        .clone()
+                        .prepare_group(pages.clone(), &references, limits)
+                        .await?
+                };
                 let attempt = PublicationAttempt::new(
                     &pages,
                     prepared,

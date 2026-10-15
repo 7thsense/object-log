@@ -116,9 +116,9 @@ Empty reads use checked EOF/HEAD. Cancellation is not proof that independently
 started blocking work has ended; embedders retain ownership through completion.
 
 These ports preserve serialized legacy batch/outcome types. Full manifest
-residency/rewrite, paged source roots, total resource bounds, authenticated semantic
-proofs and provider/process-loss qualification remain obligations. The bounded
-metadata/fixed-head foundation is specified in CONTRACT-002; it does not activate
+residency/rewrite in the legacy engine, total resource bounds and provider/process-loss
+qualification remain obligations. The additive native paged index, coupled byte-map
+and sealed state/work proofs are specified in CONTRACT-002; it does not activate
 Fireweed's public backend or permit trusting its serving projection.
 
 ## Error Semantics

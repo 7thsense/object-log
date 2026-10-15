@@ -406,6 +406,7 @@ mod tests {
                     byte_start: 0,
                     byte_len: 4,
                     payload_hash: [3; 32],
+                    frame_kind: crate::native_v2::codec::FrameKind::Legacy,
                 };
                 let root = index.append(None, entry).await?;
                 let retained = index.lookup(Some(root), 0).await?.unwrap();

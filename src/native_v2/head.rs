@@ -19,6 +19,74 @@ enum SemanticCoverage {
     Uninitialized,
     Covered { through: u64, root: [u8; 32] },
 }
+async fn semantic_manifest(
+    pages: &super::page_store::PageStore,
+    head: NativeHead,
+    work: &mut super::semantic_map::WorkBudget,
+) -> Result<Option<([u8; 32], u64)>, ObjectLogError> {
+    match head.semantic_anchor {
+        SemanticCoverage::Uninitialized => Ok(None),
+        SemanticCoverage::Covered { root, through } => {
+            if through != head.next_offset {
+                return Err(invalid("semantic coverage differs from exact head cut"));
+            }
+            let index = head
+                .index_root
+                .ok_or_else(|| invalid("covered head has no append index"))?;
+            super::semantic_map::read_seal(pages, root, through, index, work)
+                .await
+                .map(Some)
+        }
+    }
+}
+// At most 63 skip levels exist below the signed log offset bound. This covers
+// both manifests/root envelopes and the complete binary ancestry proof.
+const SEMANTIC_LINEAGE_PAGES: u64 = 132;
+async fn proves_successor(
+    pages: Arc<super::page_store::PageStore>,
+    before: NativeHead,
+    after: NativeHead,
+) -> Result<bool, ObjectLogError> {
+    if after.epoch < before.epoch
+        || after.log_start != before.log_start
+        || after.next_offset < before.next_offset
+    {
+        return Ok(false);
+    }
+    // Preserve source-integrity errors for an observed higher fence before
+    // rejecting a structurally valid but forbidden zero-append root rewrite.
+    if let Some(root) = after.index_root {
+        drop(pages.read(root).await?);
+    }
+    if after.next_offset == before.next_offset
+        && (after.index_root != before.index_root
+            || after.semantic_anchor != before.semantic_anchor)
+    {
+        return Ok(false);
+    }
+    if let Some(before_root) = before.index_root {
+        let Some(after_root) = after.index_root else {
+            return Ok(false);
+        };
+        if !super::index::Index::new(pages.clone())
+            .proves_extension(before_root, after_root)
+            .await?
+        {
+            return Ok(false);
+        }
+    }
+    let mut work = super::semantic_map::WorkBudget::new(SEMANTIC_LINEAGE_PAGES, 0);
+    let before_anchor = semantic_manifest(&pages, before, &mut work).await?;
+    let after_anchor = semantic_manifest(&pages, after, &mut work).await?;
+    super::semantic_map::proves_head_extension(
+        &pages,
+        before_anchor,
+        after_anchor,
+        before.next_offset == 0 && before.index_root.is_none(),
+        &mut work,
+    )
+    .await
+}
 #[cfg(test)]
 fn metadata_owners(owner: AppendOwner) -> MetadataOwners {
     MetadataOwners {
@@ -144,7 +212,7 @@ impl NativeHead {
                     root.kind == Kind::Overflow || root.start != 0 || root.end != head.next_offset
                 }
             }
-            || matches!(head.semantic_anchor, SemanticCoverage::Covered { through, .. } if through > head.next_offset)
+            || matches!(head.semantic_anchor, SemanticCoverage::Covered { through, .. } if through != head.next_offset || through == 0)
         {
             return Err(invalid("native head scope, bounds or roots mismatch"));
         }
@@ -240,28 +308,10 @@ impl WriterLineage {
         // Seeing a higher valid fence revokes this lineage even if its root is
         // missing/corrupt or the attempted range cannot subsequently resolve.
         state.highest_epoch = state.highest_epoch.max(head.epoch);
-        if let Some(root) = head.index_root {
-            drop(pages.read(root).await?);
-        }
         let floor = state.floor;
-        if head.epoch < state.highest_epoch
-            || head.epoch < floor.epoch
-            || head.log_start != floor.log_start
-            || head.next_offset < floor.next_offset
-            || head.semantic_anchor != floor.semantic_anchor
+        if head.epoch < state.highest_epoch || !proves_successor(pages.clone(), floor, head).await?
         {
             return Ok(None);
-        }
-        if let Some(before) = floor.index_root {
-            let Some(after) = head.index_root else {
-                return Ok(None);
-            };
-            if !super::index::Index::new(pages.clone())
-                .proves_extension(before, after)
-                .await?
-            {
-                return Ok(None);
-            }
         }
         state.floor = head;
         Ok(Some(CapturedHead {
@@ -276,6 +326,12 @@ pub(super) struct AppendInput<'a> {
     pub object_id: &'a str,
     pub payload: &'a [u8],
     pub records: u32,
+}
+pub(super) struct SemanticEdits<'a, 'work> {
+    pub edits: &'a [super::semantic_map::Edit<'a>],
+    pub max_edits: u64,
+    pub max_input_bytes: u64,
+    pub work: &'work mut super::semantic_map::WorkBudget,
 }
 pub(super) struct AppendGroupLimits {
     pub entries: usize,
@@ -347,21 +403,8 @@ impl PreparedAppend {
         let Some(current) = self.lineage.observe(pages.clone(), key).await? else {
             return Ok(Resolution::Unknown);
         };
-        if current.head.epoch < self.original.head.epoch
-            || current.head.next_offset < self.original.head.next_offset
-            || current.head.log_start != self.original.head.log_start
-            || current.head.semantic_anchor != self.original.head.semantic_anchor
-        {
+        if !proves_successor(pages.clone(), self.original.head, current.head).await? {
             return Ok(Resolution::Unknown);
-        }
-        let index = super::index::Index::new(pages.clone());
-        if let Some(before) = self.original.head.index_root {
-            let Some(after) = current.head.index_root else {
-                return Ok(Resolution::Unknown);
-            };
-            if !index.proves_extension(before, after).await? {
-                return Ok(Resolution::Unknown);
-            }
         }
         if current.head.next_offset < self.next.next_offset {
             return Ok(Resolution::Unknown);
@@ -391,6 +434,9 @@ impl PreparedAppend {
                         && ordinal == self.certificates.entries.len()
                         && cursor == self.next.next_offset
                     {
+                        if !proves_successor(pages.clone(), self.next, current.head).await? {
+                            return Ok(Resolution::Unknown);
+                        }
                         Resolution::DurableContent
                     } else {
                         Resolution::Rejected
@@ -530,6 +576,25 @@ impl FencedHead {
         inputs: &[AppendInput<'_>],
         limits: AppendGroupLimits,
     ) -> Result<PreparedAppend, ObjectLogError> {
+        self.prepare_group_inner(pages, inputs, limits, None).await
+    }
+    pub async fn prepare_semantic_group(
+        self,
+        pages: Arc<super::page_store::PageStore>,
+        inputs: &[AppendInput<'_>],
+        limits: AppendGroupLimits,
+        semantic: SemanticEdits<'_, '_>,
+    ) -> Result<PreparedAppend, ObjectLogError> {
+        self.prepare_group_inner(pages, inputs, limits, Some(semantic))
+            .await
+    }
+    async fn prepare_group_inner(
+        self,
+        pages: Arc<super::page_store::PageStore>,
+        inputs: &[AppendInput<'_>],
+        limits: AppendGroupLimits,
+        mut semantic: Option<SemanticEdits<'_, '_>>,
+    ) -> Result<PreparedAppend, ObjectLogError> {
         if inputs.is_empty()
             || limits.entries == 0
             || limits.framed_bytes == 0
@@ -551,11 +616,27 @@ impl FencedHead {
         if !Arc::ptr_eq(&captured.identity, &pages.binding_identity()) {
             return Err(invalid("captured head belongs to another store binding"));
         }
-        if captured.head.semantic_anchor != SemanticCoverage::Uninitialized {
+        if semantic.is_none() && captured.head.semantic_anchor != SemanticCoverage::Uninitialized {
             return Err(invalid(
                 "append requires consumer semantic publication for covered heads",
             ));
         }
+        if semantic.is_some()
+            && captured.head.semantic_anchor == SemanticCoverage::Uninitialized
+            && (captured.head.next_offset != 0 || captured.head.index_root.is_some())
+        {
+            return Err(invalid(
+                "semantic bootstrap requires a genuinely empty original head",
+            ));
+        }
+        let coupled = semantic.is_some();
+        let frame_len = |input: &AppendInput<'_>| {
+            if coupled {
+                super::data::DataFrame::coupled_encoded_len(input.object_id, input.payload.len())
+            } else {
+                super::data::DataFrame::encoded_len(input.object_id, input.payload.len())
+            }
+        };
         let mut next_offset = captured.head.next_offset;
         let mut framed_bytes = 0usize;
         // Validate the entire group before the first immutable write.
@@ -567,8 +648,7 @@ impl FencedHead {
                 .checked_add(u64::from(input.records))
                 .filter(|next| *next <= i64::MAX as u64)
                 .ok_or_else(|| invalid("append offset overflow"))?;
-            let frame_len =
-                super::data::DataFrame::encoded_len(input.object_id, input.payload.len())?;
+            let frame_len = frame_len(input)?;
             pages.validate_data_limit(frame_len)?;
             framed_bytes = framed_bytes
                 .checked_add(frame_len)
@@ -594,20 +674,81 @@ impl FencedHead {
         // Resource probes include the permanently retained group certificates.
         // They are capacity checks, not reservations against concurrent work.
         for input in inputs {
-            let key = pages.data_key(input.object_id)?;
-            let frame_len =
-                super::data::DataFrame::encoded_len(input.object_id, input.payload.len())?;
+            let key = if coupled {
+                pages.transition_data_key(&[1; 32])?
+            } else {
+                pages.data_key(input.object_id)?
+            };
+            let frame_len = frame_len(input)?;
             let frame_charge = super::data::DataFrame::charge_frame(&pages, frame_len)?;
             pages.preflight_data(key.as_str(), frame_len)?;
             drop(frame_charge);
         }
+        let prepared_map = if let Some(semantic) = semantic.as_mut() {
+            let original_anchor = semantic_manifest(&pages, captured.head, semantic.work).await?;
+            let map = match original_anchor {
+                None => super::semantic_map::CapturedMap::empty(&pages)?,
+                Some((root, through)) => {
+                    super::semantic_map::CapturedMap::capture(&pages, root, through, semantic.work)
+                        .await?
+                }
+            };
+            let map = map
+                .prepare(
+                    &pages,
+                    semantic.edits,
+                    super::semantic_map::EditBounds {
+                        edits: semantic.max_edits,
+                        input_bytes: semantic.max_input_bytes,
+                    },
+                    next_offset,
+                    inputs.len() as u64,
+                    semantic.work,
+                )
+                .await?;
+            map.validate_binding(&pages)?;
+            if map.before_hash() != original_anchor.map_or([0; 32], |(hash, _)| hash)
+                || map.through() != next_offset
+            {
+                return Err(invalid(
+                    "prepared semantic map differs from exact original head",
+                ));
+            }
+            Some(map)
+        } else {
+            None
+        };
         let index = super::index::Index::new(pages.clone());
         let mut root = captured.head.index_root;
         let mut base = captured.head.next_offset;
-        for input in inputs {
-            let physical_key = pages.data_key(input.object_id)?;
-            let frame = super::data::DataFrame::encode(&pages, input.object_id, input.payload)?;
+        for (ordinal, input) in inputs.iter().enumerate() {
+            let frame = if let Some(map) = &prepared_map {
+                super::data::DataFrame::encode_coupled(
+                    &pages,
+                    input.object_id,
+                    input.payload,
+                    super::data::Transition {
+                        scope: pages.scope(),
+                        before: map.before_hash(),
+                        after: map.after_hash(),
+                        generation: map.generation(),
+                        group_start: captured.head.next_offset,
+                        group_end: next_offset,
+                        entry_count: inputs.len() as u64,
+                        ordinal: ordinal as u64,
+                        base,
+                        records: input.records,
+                    },
+                )?
+            } else {
+                super::data::DataFrame::encode(&pages, input.object_id, input.payload)?
+            };
             let view = super::data::DataFrame::decode(frame.bytes())?;
+            let physical_key = if coupled {
+                pages.transition_data_key(&view.certificate())?
+            } else {
+                pages.data_key(input.object_id)?
+            };
             let logical_id = index.store_literal_id(input.object_id).await?;
             let identity = index.store_object_id(physical_key.as_str()).await?;
             pages
@@ -618,18 +759,39 @@ impl FencedHead {
                 logical_id,
                 base,
                 record_count: input.records,
-                byte_start: view.byte_start,
+                byte_start: view.byte_start(),
                 byte_len: u32::try_from(input.payload.len())
                     .map_err(|_| invalid("append physical byte length"))?,
-                payload_hash: Sha256::digest(view.payload).into(),
+                payload_hash: view.certificate(),
+                frame_kind: if coupled {
+                    super::codec::FrameKind::Coupled
+                } else {
+                    super::codec::FrameKind::Legacy
+                },
             };
             root = Some(index.append(root, certificate).await?);
             base = certificate.end()?;
             certificates.entries.push(certificate);
         }
+        let semantic_anchor = if let Some(map) = &prepared_map {
+            let index_root =
+                root.ok_or_else(|| invalid("coupled publication has no append index"))?;
+            let work = &mut *semantic
+                .as_mut()
+                .expect("prepared map requires semantic input")
+                .work;
+            let seal = map.seal(&pages, index_root, work).await?;
+            SemanticCoverage::Covered {
+                through: map.through(),
+                root: seal,
+            }
+        } else {
+            captured.head.semantic_anchor
+        };
         let next = NativeHead {
             next_offset,
             index_root: root,
+            semantic_anchor,
             ..captured.head
         };
         Ok(PreparedAppend {
@@ -668,6 +830,27 @@ impl FencedHead {
     }
 }
 impl CapturedHead {
+    pub(super) fn same_cut(&self, other: &Self) -> bool {
+        self.head == other.head
+            && Arc::ptr_eq(&self.identity, &other.identity)
+            && Arc::ptr_eq(&self.observed.inner.owner, &other.observed.inner.owner)
+            && self.observed.inner.key == other.observed.inner.key
+            && self.observed.inner.version == other.observed.inner.version
+    }
+
+    pub async fn semantic_map(
+        &self,
+        pages: &super::page_store::PageStore,
+        work: &mut super::semantic_map::WorkBudget,
+    ) -> Result<super::semantic_map::CapturedMap, ObjectLogError> {
+        if !Arc::ptr_eq(&self.identity, &pages.binding_identity()) {
+            return Err(invalid("captured head belongs to another store binding"));
+        }
+        let Some((root, through)) = semantic_manifest(pages, self.head, work).await? else {
+            return Err(invalid("captured head has no semantic coverage"));
+        };
+        super::semantic_map::CapturedMap::capture(pages, root, through, work).await
+    }
     pub(super) fn value(&self) -> NativeHead {
         self.head
     }
@@ -703,7 +886,10 @@ impl CapturedHead {
         let index = super::index::Index::new(pages.clone());
         let logical = index.literal_id(entry.logical_id).await?;
         let physical = index.object_id(entry.object_id).await?;
-        let expected = pages.data_key(logical.as_str())?;
+        let expected = match entry.frame_kind {
+            super::codec::FrameKind::Legacy => pages.data_key(logical.as_str())?,
+            super::codec::FrameKind::Coupled => pages.transition_data_key(&entry.payload_hash)?,
+        };
         if expected.as_str() != physical.as_str() {
             return Err(invalid(
                 "indexed physical key differs from full logical identity mapping",
@@ -718,14 +904,27 @@ impl CapturedHead {
             .bytes()
             .ok_or_else(|| invalid("indexed immutable data is missing"))?;
         let frame = super::data::DataFrame::decode(raw)?;
-        if frame.identity != logical.as_str()
-            || frame.byte_start != entry.byte_start
-            || frame.payload.len() != entry.byte_len as usize
-            || <[u8; 32]>::from(Sha256::digest(frame.payload)) != entry.payload_hash
+        if frame.identity() != logical.as_str()
+            || frame.byte_start() != entry.byte_start
+            || frame.payload().len() != entry.byte_len as usize
+            || frame.certificate() != entry.payload_hash
+            || (entry.frame_kind == super::codec::FrameKind::Coupled)
+                != frame.transition().is_some()
         {
             return Err(invalid(
                 "indexed data identity, range or payload digest differs",
             ));
+        }
+        if let Some(transition) = frame.transition() {
+            if transition.base != entry.base || transition.records != entry.record_count {
+                return Err(invalid("indexed transition assigned record range differs"));
+            }
+            super::semantic_map::validate_transition(
+                &pages,
+                transition,
+                &mut super::semantic_map::WorkBudget::new(1, 0),
+            )
+            .await?;
         }
         Ok((
             entry.base,
@@ -764,6 +963,13 @@ impl CapturedHead {
         if let Some(root) = head.index_root {
             // Envelope decoding alone does not authorize an index root.
             drop(pages.read(root).await?);
+        }
+        let mut work = super::semantic_map::WorkBudget::new(SEMANTIC_LINEAGE_PAGES, 0);
+        let anchor = semantic_manifest(pages, head, &mut work).await?;
+        if !super::semantic_map::proves_head_extension(pages, anchor, anchor, false, &mut work)
+            .await?
+        {
+            return Err(invalid("captured semantic anchor is invalid"));
         }
         Ok(Self {
             head,

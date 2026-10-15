@@ -4,14 +4,32 @@ use crate::ObjectLogError;
 use std::sync::Arc;
 const MAGIC: &[u8; 8] = b"OND2\0\0\0\x01";
 const HEADER: usize = 24;
+mod coupled;
+pub(super) use coupled::Transition;
 pub(super) struct DataFrame {
     bytes: Vec<u8>,
     _charge: Arc<Charge>,
 }
 pub(super) struct DataView<'a> {
-    pub identity: &'a str,
-    pub payload: &'a [u8],
-    pub byte_start: u32,
+    raw: &'a [u8],
+    identity: &'a str,
+    payload: &'a [u8],
+    byte_start: u32,
+    transition: Option<Transition>,
+}
+impl<'a> DataView<'a> {
+    pub fn identity(&self) -> &'a str {
+        self.identity
+    }
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+    pub fn byte_start(&self) -> u32 {
+        self.byte_start
+    }
+    pub fn transition(&self) -> Option<Transition> {
+        self.transition
+    }
 }
 impl DataFrame {
     pub fn encoded_len(identity: &str, payload_bytes: usize) -> Result<usize, ObjectLogError> {
@@ -65,6 +83,9 @@ impl DataFrame {
         &self.bytes
     }
     pub fn decode(raw: &[u8]) -> Result<DataView<'_>, ObjectLogError> {
+        if raw.get(..8) == Some(coupled::MAGIC.as_slice()) {
+            return coupled::decode(raw);
+        }
         if raw.len() < HEADER || &raw[..8] != MAGIC {
             return Err(invalid());
         }
@@ -83,9 +104,11 @@ impl DataFrame {
             return Err(invalid());
         }
         Ok(DataView {
+            raw,
             identity,
             payload: &raw[start..],
             byte_start,
+            transition: None,
         })
     }
 }

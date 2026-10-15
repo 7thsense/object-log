@@ -79,9 +79,11 @@ pub use sequencer::{
 
 #[cfg(feature = "native")]
 pub use native_v2::facade::{
-    NativeAppend, NativeLimits, NativeLog, NativeNamespace, NativePublication,
+    NativeAppend, NativeEditLimits, NativeLimits, NativeLog, NativeNamespace, NativePublication,
     NativePublishOutcome, NativeReadCut, NativeReadPlan, NativeRecord, NativeResolution,
-    NativeWriter,
+    NativeScanLimits, NativeScanStatus, NativeSemanticContinuation, NativeSemanticEdit,
+    NativeSemanticRange, NativeSemanticRow, NativeSemanticScan, NativeSemanticValue,
+    NativeSemanticWork, NativeWriter,
 };
 #[cfg(feature = "native")]
 pub use native_v2::head::NativeHead;

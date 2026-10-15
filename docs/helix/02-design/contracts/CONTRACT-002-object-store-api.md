@@ -8,7 +8,7 @@ ddx:
 
 # Object storage and bounded metadata authority
 
-Contract ID: CONTRACT-002. Version: v4. Status: accepted.
+Contract ID: CONTRACT-002. Version: v5. Status: accepted.
 
 The immutable data-object port remains `BlobStore`: durable put/put_chunks,
 get, range read, list, delete and media-operation accounting. Local publication
@@ -78,10 +78,10 @@ unsigned epoch, append-only signed-offset-compatible bounds, a complete 64-byte
 immutable index descriptor, and explicitly tagged semantic coverage. An empty
 index uses only the canonical zero descriptor; nonempty roots cover exactly
 [0, next_offset). Uninitialized semantic coverage contains zero coverage/root
-bytes; covered state contains a nonzero root and coverage no greater than the
-head. Unknown tags, reserved bytes, mixed uninitialized fields, and the previous
-192-byte format fail closed. The first append-only implementation publishes
-uninitialized coverage until consumer semantic publication is implemented. Checked acquisition
+bytes; covered state contains a nonzero seal root and coverage exactly equal to
+the positive head next offset. Unknown tags, reserved bytes, mixed uninitialized
+fields, and the previous 192-byte format fail closed. Legacy append-only
+publication retains uninitialized coverage. Checked acquisition
 increments only epoch, preserving roots/bounds exactly. Missing known authority,
 legacy JSON, scope mismatch, corrupt bytes, regressed conflict observations and
 epoch exhaustion fail closed. It cannot create heads, migrate manifests, publish
@@ -90,10 +90,9 @@ arbitrary roots or enable Fireweed prefix reuse.
 The `native` feature owns the production head codec and authority core through
 `NativeLog`, publishes immutable authenticated pages before its head CAS, and
 provides lazy open, explicit refresh/acquire, fixed cuts and bounded page proofs.
-The separate head-reader harness remains test-internal. Coupled consumer log and
-semantic-root publication and explicit retention/reclamation remain required;
-paging lookup alone is insufficient. Consumer
-semantics stay outside the SDK. Checksums detect corruption, not authenticated
+The separate head-reader harness remains test-internal. Coupled log and ordered
+byte-map publication is available through the same authority core. Explicit
+retention/reclamation remains required. Consumer queue policy stays outside the SDK. Checksums detect corruption, not authenticated
 provenance or valid-record substitution.
 
 ## Captured index and immutable data
@@ -101,14 +100,19 @@ provenance or valid-record substitution.
 The native-v2 implementation exposed through the `native` feature uses 4096-byte versioned
 pages. Version 2 leaf slots are 192 bytes and separately commit complete physical
 and logical identity overflow graphs, positive logical ranges, exact physical byte
-ranges, and payload SHA-256. Fixed fanout and height bounds constrain page/path
+ranges, and a closed frame-kind tag. Legacy certificates hash the payload;
+coupled certificates hash the complete versioned frame, including its transition
+metadata and full literal identity. Unknown frame kinds fail closed. Fixed fanout and height bounds constrain page/path
 allocation; page reads verify the complete descriptor, scope, checksum and shape.
 A captured head validates its actual root page before authorizing index reads.
 Missing or corrupt touched pages fail closed; absence requires authenticated bounds.
 
 Physical data names are bounded within disjoint scoped page/data namespaces.
 Hashes select names; they do not establish identity equality. Versioned data frames
-contain the full UTF-8 literal identity and exact payload length. Reuse compares
+contain the full UTF-8 literal identity and exact payload length. Coupled frames
+add a fixed 224-byte extension committing scope, before/after manifest hashes,
+generation, group bounds, entry count, ordinal and assigned logical range. Their
+separate physical namespace derives names from the complete frame certificate. Reuse compares
 complete identity and content. Captured payload reads check both authenticated
 identities, derived physical key, exact frame range, and digest. Logical identity
 length does not expand the physical filename; configured prefix/provider limits
@@ -135,8 +139,9 @@ identity. Writer clones share serialized, monotonic knowledge of complete head
 prefixes and sticky revocation on a higher fence; refreshing does not reacquire
 or replace the original publication token.
 Committed and ambiguous pages remain retained; production reclamation and migration
-are unsupported. Semantic coverage is uninitialized until consumer publication is
-implemented; these index proofs do not authorize skipping Fireweed semantic replay.
+are unsupported. Legacy append refuses covered heads. A nonempty uninitialized
+head cannot be implicitly promoted; migration requires an explicitly verified
+consumer bootstrap. Index proofs alone do not authorize skipping Fireweed semantic replay.
 
 Namespace initialization creates a fresh candidate head before publishing its
 immutable full-literal namespace binding. Incarnations come from admitted OS
@@ -168,6 +173,51 @@ corrupt published authority, including empty heads. It assumes distinct fresh
 incarnations and does not prove entropy quality, Rust correspondence, physical
 durability, registry deletion detection, or a shared authority floor across
 separately opened handles and cold reopen.
+
+## Coupled state and work publication
+
+`prepare_with_edits` accepts an exact captured cut, a nonempty append group and
+sorted unique byte-key edits. Keys and values may contain arbitrary bytes; an
+empty value differs from deletion. The caller supplies resolved policy updates,
+not a replacement root. Preparation checks the complete cut, binding, provider
+owner, literal head key and original metadata version under the shared writer
+lock. Refreshing a writer alias cannot silently rebase edits prepared from an
+older cut. One original-token CAS publishes all state and work together.
+
+Publication order is map pages, manifest, coupled data frames, append-index
+pages, seal, then head CAS. A seal commits the exact complete append descriptor,
+manifest and next offset. Manifests commit the resulting map, generation, group
+bounds and canonical predecessor skip links. The links give logarithmic lineage
+proofs under the canonical committed-writer assumption; they do not replay every
+skipped edit. Same-offset refresh requires identical index and seal roots even
+when the epoch increases. Missing proof objects, insufficient work and malformed
+or mismatched roots cannot install a new authority floor. Higher observed epochs
+remain sticky even when their roots are unreadable.
+
+The ordered map uses scoped 4096-byte immutable pages and length-checked overflow
+chains, with no logical key/value truncation. Reads verify touched descriptors,
+ordered full keys and inherited bounds. `semantic_lookup` proves presence or
+absence at the supplied covered cut. Uninitialized coverage cannot prove either;
+a covered empty map can. Copy-on-write edits preserve untouched subtrees and
+publish children before parents. Failed preparation may leave immutable orphans,
+but cannot expose a partially updated map or append group.
+
+`semantic_scan` and its opaque continuation retain the original cut, range and
+last returned full key. Resumption is exclusive of that key and cannot move to a
+new head. `Complete` means verified exhaustion of the requested interval;
+`LimitReached` leaves exhaustion unproven. A row or byte limit is separate from
+source proof work. The authenticated value length is checked against output
+capacity before fetching overflow bytes. A first row that cannot fit fails;
+a returned prefix may carry a continuation. Missing/corrupt source or exhausted
+proof work fails the whole page, never producing a successful completion marker.
+Cancellation cannot mutate a retained input continuation.
+
+Semantic work limits count map/manifest/seal reads and hydrated bytes; append
+index preparation has its separately bounded group path. Input edit bytes,
+returned rows, copied bounds and continuations also hold shared byte admission.
+Returned values and tokens retain byte credits independently of physical permits.
+Cancellation after dispatch does not release physical ownership before accepted
+work finishes. These component bounds do not establish total transport residency.
 
 ## Verification
 
@@ -205,5 +255,16 @@ conditional write. Construction verifies the admitting store, selected binding
 and literal head key before allocating the carrier. Durable-content resolution
 proves the original complete bytes, not historical writer identity or a workflow
 business outcome. The `native` feature exposes this retained carrier as `NativePublication`. This
-SDK API exposure does not activate the Fireweed queue backend or qualify coupled
-semantic publication, registry deletion, reclamation or release performance.
+SDK API exposure does not activate the Fireweed queue backend or qualify its
+queue policy, registry deletion, reclamation or release performance.
+
+The coupled semantic gate exhausts 8000 finite competing-publication pairs and
+checks 17 completed witnesses against independent flat map and log ghosts. Its
+25 faulty variants require deterministically reproduced counterexamples; exploration exhaustion
+fails the gate. Nine seeded generations exercise independently computed exact
+and N-1 lineage budgets. Captured scans, stale cuts, sticky fences and retained
+resolution floors are checked in this protocol abstraction. Source-bound reports
+and stale-success controls qualify the gate itself; this is not a refinement
+proof of Rust, the page codec, providers, cancellation resources or performance.
+Actual Local and S3 tests separately exercise atomic state/work publication,
+response loss and original-cut scans in both signing modes.
