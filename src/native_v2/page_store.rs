@@ -9,6 +9,7 @@ use crate::{
     ObjectLogError,
 };
 use bytes::Bytes;
+mod immutable;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -695,33 +696,11 @@ impl PageStore {
             charge,
         )
     }
-    fn key(&self, descriptor: Descriptor) -> String {
-        use std::fmt::Write;
-        let mut key = String::with_capacity(self.prefix.len() + 195);
-        key.push_str(&self.prefix);
-        for identity in [
-            &self.scope.namespace,
-            &self.scope.incarnation,
-            &descriptor.hash,
-        ] {
-            key.push('/');
-            for byte in identity {
-                write!(&mut key, "{byte:02x}").expect("String formatting");
-            }
-        }
-        key
-    }
     pub async fn read(&self, descriptor: Descriptor) -> Result<OwnedPage, ObjectLogError> {
         descriptor.validate()?;
         let charge = self.budget.charge(self.allocation)?;
-        let key = self.key(descriptor);
         let observed = self
-            .store
-            .read_metadata(
-                &key,
-                self.metadata_limits(descriptor.encoded_len as usize),
-                self.owners(charge.clone() as AppendOwner),
-            )
+            .read_immutable(&descriptor.hash, descriptor.encoded_len as usize, &charge)
             .await?;
         let raw = observed
             .bytes()
@@ -746,52 +725,8 @@ impl PageStore {
         }
         // Encode under the existing page reservation, retaining both capacities.
         let (raw, descriptor) = page.page.encode(self.scope)?;
-        let key = self.key(descriptor);
-        let source = Bytes::from_owner(UploadedPage {
-            bytes: raw,
-            _charge: page._charge.clone(),
-        });
-        let observed = self
-            .store
-            .read_metadata(
-                &key,
-                self.metadata_limits(descriptor.encoded_len as usize),
-                self.owners(page._charge.clone() as AppendOwner),
-            )
+        self.write_immutable(raw, &descriptor.hash, &page._charge)
             .await?;
-        if let Some(existing) = observed.bytes() {
-            Page::decode(existing, descriptor, self.scope)?;
-            if existing != source.as_ref() {
-                return Err(ObjectLogError::Sequencer(
-                    "immutable page bytes differ".into(),
-                ));
-            }
-            return Ok(descriptor);
-        }
-        match self
-            .store
-            .swap_metadata(
-                &key,
-                observed,
-                source.clone(),
-                self.metadata_limits(descriptor.encoded_len as usize),
-                self.owners(page._charge.clone() as AppendOwner),
-            )
-            .await?
-        {
-            MetadataSwap::Stored => (),
-            MetadataSwap::Conflict(current) => {
-                let existing = current
-                    .bytes()
-                    .ok_or_else(|| ObjectLogError::MissingObject("native immutable page".into()))?;
-                Page::decode(existing, descriptor, self.scope)?;
-                if existing != source.as_ref() {
-                    return Err(ObjectLogError::Sequencer(
-                        "immutable page CAS conflict differs".into(),
-                    ));
-                }
-            }
-        }
         Ok(descriptor)
     }
 }
