@@ -20,6 +20,7 @@ pub(in crate::native_v2) struct GatedStore {
     read_armed: AtomicBool,
     read_completed: AtomicBool,
     read_owner: std::sync::Mutex<Option<std::sync::Weak<dyn std::any::Any + Send + Sync>>>,
+    reads: std::sync::Mutex<Vec<(String, usize)>>,
     entered: Semaphore,
     released: Semaphore,
 }
@@ -31,6 +32,7 @@ impl GatedStore {
             read_armed: AtomicBool::new(false),
             read_completed: AtomicBool::new(false),
             read_owner: std::sync::Mutex::new(None),
+            reads: std::sync::Mutex::new(Vec::new()),
             entered: Semaphore::new(0),
             released: Semaphore::new(0),
         })
@@ -39,6 +41,9 @@ impl GatedStore {
         self.read_completed.store(false, Ordering::Release);
         *self.read_owner.lock().unwrap() = None;
         self.read_armed.store(true, Ordering::Release);
+    }
+    pub fn take_reads(&self) -> Vec<(String, usize)> {
+        std::mem::take(&mut *self.reads.lock().unwrap())
     }
     pub fn armed_read_completed(&self) -> bool {
         self.read_completed.load(Ordering::Acquire)
@@ -105,6 +110,10 @@ impl BoundedMetadataStore for GatedStore {
         limits: MetadataLimits,
         owners: MetadataOwners,
     ) -> Result<MetadataSnapshot, ObjectLogError> {
+        self.reads
+            .lock()
+            .unwrap()
+            .push((key.to_owned(), limits.payload_bytes));
         if self.read_armed.swap(false, Ordering::AcqRel) {
             *self.read_owner.lock().unwrap() = Some(Arc::downgrade(&owners.physical));
             self.entered.add_permits(1);

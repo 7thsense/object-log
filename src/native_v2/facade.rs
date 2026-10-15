@@ -14,7 +14,9 @@ use super::{
 use crate::{LocalBlobStore, MetadataLimits, ObjectLogError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+mod read_requirements;
 mod semantic;
+pub use read_requirements::NativeReadRequirements;
 pub use semantic::{
     NativeEditLimits, NativeScanLimits, NativeScanStatus, NativeSemanticContinuation,
     NativeSemanticEdit, NativeSemanticRange, NativeSemanticRow, NativeSemanticScan,
@@ -176,6 +178,12 @@ pub struct NativeReadPlan {
     _charge: Arc<Charge>,
 }
 impl NativeReadPlan {
+    /// Return admission bounds from the authenticated entry without hydration.
+    /// The returned requirements describe this sealed plan only; see the type's
+    /// scope before treating these object-body bounds as transport or memory bounds.
+    pub fn requirements(&self) -> Result<NativeReadRequirements, ObjectLogError> {
+        NativeReadRequirements::from_entry(self.entry.entry())
+    }
     /// Exact authenticated payload length; excludes immutable frame headers.
     pub fn payload_bytes(&self) -> usize {
         self.entry.entry().byte_len as usize

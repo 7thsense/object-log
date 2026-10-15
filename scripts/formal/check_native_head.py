@@ -20,6 +20,8 @@ SOURCES = (
     'src/native_v2/facade.rs', 'tests/native_facade.rs', 'src/native_v2/page_store.rs', 'src/native_v2/page_store/immutable.rs', 'src/native_v2/index.rs', 'src/native_v2/provision.rs', 'src/native_v2/submission.rs',
     'src/native_v2/head/tests.rs', 'src/native_v2/head/tests/s3.rs',
     'src/native_v2/head/tests/coupled.rs',
+    'src/native_v2/facade/read_requirements.rs',
+    'src/native_v2/facade/read_requirements/tests.rs',
     'src/native_v2/facade/semantic.rs',
     'src/native_v2/facade/semantic/scan.rs',
     'src/native_v2/facade/semantic/tests.rs',
