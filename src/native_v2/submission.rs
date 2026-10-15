@@ -61,10 +61,11 @@ impl PublicationAttempt {
         self: &Arc<Self>,
         resources: &Arc<Resources>,
         base: Arc<PageStore>,
+        external_owner: Option<crate::AppendOwner>,
     ) -> Result<PublishOutcome, ObjectLogError> {
         let attempt = self.clone();
         resources
-            .run(move |physical| async move {
+            .run_with_owner(external_owner, move |physical| async move {
                 let mut prepared = attempt.prepared.lock().await;
                 let pages = base.in_operation(physical)?.for_binding(&attempt.binding)?;
                 let result = prepared.publish_outcome(pages, &attempt.head_key).await;
@@ -87,7 +88,7 @@ impl PublicationAttempt {
         resources: &Arc<Resources>,
         base: Arc<PageStore>,
     ) -> Result<super::head::NativeHead, ObjectLogError> {
-        match self.submit_outcome(resources, base).await? {
+        match self.submit_outcome(resources, base, None).await? {
             PublishOutcome::Stored(head) => Ok(head),
             PublishOutcome::Conflict => Err(ObjectLogError::Sequencer(
                 "original append authority changed".into(),
@@ -102,6 +103,7 @@ impl PublicationAttempt {
         resources: &Arc<Resources>,
         base: Arc<PageStore>,
         budget: ProofBudget,
+        external_owner: Option<crate::AppendOwner>,
     ) -> Result<Resolution, ObjectLogError> {
         if budget.entries == 0 {
             return Err(ObjectLogError::InvalidBatch(
@@ -110,7 +112,7 @@ impl PublicationAttempt {
         }
         let attempt = self.clone();
         resources
-            .run(move |physical| async move {
+            .run_with_owner(external_owner, move |physical| async move {
                 let prepared = attempt.prepared.lock().await;
                 let pages = base.in_operation(physical)?.for_binding(&attempt.binding)?;
                 prepared
@@ -271,7 +273,7 @@ mod tests {
         );
         assert_eq!(
             attempt
-                .resolve(&resources, base, ProofBudget { entries: 1 })
+                .resolve(&resources, base, ProofBudget { entries: 1 }, None)
                 .await
                 .unwrap(),
             Resolution::DurableContent
@@ -314,7 +316,7 @@ mod tests {
         attempt.submit(&resources, base.clone()).await.unwrap();
         assert_eq!(
             attempt
-                .resolve(&resources, base, ProofBudget { entries: 1 })
+                .resolve(&resources, base, ProofBudget { entries: 1 }, None)
                 .await
                 .unwrap(),
             Resolution::DurableContent
@@ -341,7 +343,7 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(
             attempt
-                .resolve(&resources, base.clone(), ProofBudget { entries: 1 })
+                .resolve(&resources, base.clone(), ProofBudget { entries: 1 }, None)
                 .await
                 .unwrap(),
             Resolution::DurableContent
@@ -370,7 +372,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             attempt
-                .resolve(&resources, base, ProofBudget { entries: 1 })
+                .resolve(&resources, base, ProofBudget { entries: 1 }, None)
                 .await
                 .unwrap(),
             Resolution::DurableContent
@@ -396,7 +398,7 @@ mod tests {
         assert!(attempt.submit(&resources, base.clone()).await.is_err());
         assert_eq!(
             attempt
-                .resolve(&resources, base, ProofBudget { entries: 1 })
+                .resolve(&resources, base, ProofBudget { entries: 1 }, None)
                 .await
                 .unwrap(),
             Resolution::Unknown
@@ -426,7 +428,7 @@ mod tests {
         assert!(attempt.submit(&resources, foreign).await.is_err());
         assert!(
             attempt
-                .resolve(&resources, base.clone(), ProofBudget { entries: 0 })
+                .resolve(&resources, base.clone(), ProofBudget { entries: 0 }, None)
                 .await
                 .is_err()
         );
@@ -444,7 +446,7 @@ mod tests {
         assert!(attempt.submit(&resources, base.clone()).await.is_err());
         assert_eq!(
             attempt
-                .resolve(&resources, base.clone(), ProofBudget { entries: 1 })
+                .resolve(&resources, base.clone(), ProofBudget { entries: 1 }, None)
                 .await
                 .unwrap(),
             Resolution::DurableContent

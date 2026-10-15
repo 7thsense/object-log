@@ -160,19 +160,17 @@ impl NativeLog {
             charge: cut.read.charge.clone(),
         };
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let pages = owner
-                    .pages
-                    .in_operation(physical)?
-                    .for_binding(&read.binding)?;
-                let map = read.captured.semantic_map(&pages, &mut work).await?;
-                map.lookup(&pages, &key.bytes, &mut work)
-                    .await
-                    .map(|value| value.map(|value| NativeSemanticValue { value }))
-            })
-            .await
+        self.run(move |physical| async move {
+            let pages = owner
+                .pages
+                .in_operation(physical)?
+                .for_binding(&read.binding)?;
+            let map = read.captured.semantic_map(&pages, &mut work).await?;
+            map.lookup(&pages, &key.bytes, &mut work)
+                .await
+                .map(|value| value.map(|value| NativeSemanticValue { value }))
+        })
+        .await
     }
 }
 

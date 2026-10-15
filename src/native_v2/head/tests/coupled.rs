@@ -612,7 +612,7 @@ async fn coupled_cancelled_head_cas_drains_and_retained_attempt_releases_credit(
     let owned = resources.clone();
     let root = base.clone();
     let retained = attempt.clone();
-    let caller = tokio::spawn(async move { retained.submit_outcome(&owned, root).await });
+    let caller = tokio::spawn(async move { retained.submit_outcome(&owned, root, None).await });
     tokio::task::spawn_blocking(move || {
         entered
             .recv_timeout(std::time::Duration::from_secs(30))

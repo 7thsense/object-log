@@ -158,89 +158,87 @@ impl NativeLog {
         mut work: WorkBudget,
     ) -> Result<NativeSemanticScan, ObjectLogError> {
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let pages = owner
-                    .pages
-                    .in_operation(physical)?
-                    .for_binding(&state.read.binding)?;
-                let charge = pages.charge_output(scan_allocation(limits.rows)?)?;
-                let mut rows = Vec::with_capacity(limits.rows);
-                let map = state.read.captured.semantic_map(&pages, &mut work).await?;
-                let lower = state
-                    .after
-                    .as_ref()
-                    .map(|key| (key.as_slice(), false))
-                    .or_else(|| {
-                        state
-                            .range
-                            .lower
-                            .as_ref()
-                            .map(|(key, inclusive)| (key.as_slice(), *inclusive))
-                    });
-                let upper = state
-                    .range
-                    .upper
-                    .as_ref()
-                    .map(|(key, inclusive)| (key.as_slice(), *inclusive));
-                let mut cursor = map.range(&pages, lower, upper, &mut work).await?;
-                let mut output = 0usize;
-                let mut status = NativeScanStatus::LimitReached;
-                for _ in 0..limits.rows {
-                    match cursor
-                        .next_bounded(&pages, &mut work, limits.output_bytes - output)
-                        .await
-                    {
-                        Ok(ScanStep::Row(item)) => {
-                            output = output
-                                .checked_add(item.key.as_slice().len())
-                                .and_then(|n| n.checked_add(item.value.as_slice().len()))
-                                .ok_or_else(|| invalid("semantic scan output overflow"))?;
-                            rows.push(NativeSemanticRow {
-                                key: item.key,
-                                value: item.value,
-                            });
-                        }
-                        Ok(ScanStep::End) => {
-                            status = NativeScanStatus::Complete;
-                            break;
-                        }
-                        Ok(ScanStep::OutputLimit { .. }) if !rows.is_empty() => break,
-                        Ok(ScanStep::OutputLimit { actual, limit }) => {
-                            return Err(ObjectLogError::ReadLimitExceeded { actual, limit });
-                        }
-                        Err(error) => return Err(error),
+        self.run(move |physical| async move {
+            let pages = owner
+                .pages
+                .in_operation(physical)?
+                .for_binding(&state.read.binding)?;
+            let charge = pages.charge_output(scan_allocation(limits.rows)?)?;
+            let mut rows = Vec::with_capacity(limits.rows);
+            let map = state.read.captured.semantic_map(&pages, &mut work).await?;
+            let lower = state
+                .after
+                .as_ref()
+                .map(|key| (key.as_slice(), false))
+                .or_else(|| {
+                    state
+                        .range
+                        .lower
+                        .as_ref()
+                        .map(|(key, inclusive)| (key.as_slice(), *inclusive))
+                });
+            let upper = state
+                .range
+                .upper
+                .as_ref()
+                .map(|(key, inclusive)| (key.as_slice(), *inclusive));
+            let mut cursor = map.range(&pages, lower, upper, &mut work).await?;
+            let mut output = 0usize;
+            let mut status = NativeScanStatus::LimitReached;
+            for _ in 0..limits.rows {
+                match cursor
+                    .next_bounded(&pages, &mut work, limits.output_bytes - output)
+                    .await
+                {
+                    Ok(ScanStep::Row(item)) => {
+                        output = output
+                            .checked_add(item.key.as_slice().len())
+                            .and_then(|n| n.checked_add(item.value.as_slice().len()))
+                            .ok_or_else(|| invalid("semantic scan output overflow"))?;
+                        rows.push(NativeSemanticRow {
+                            key: item.key,
+                            value: item.value,
+                        });
                     }
+                    Ok(ScanStep::End) => {
+                        status = NativeScanStatus::Complete;
+                        break;
+                    }
+                    Ok(ScanStep::OutputLimit { .. }) if !rows.is_empty() => break,
+                    Ok(ScanStep::OutputLimit { actual, limit }) => {
+                        return Err(ObjectLogError::ReadLimitExceeded { actual, limit });
+                    }
+                    Err(error) => return Err(error),
                 }
-                let continuation = if status == NativeScanStatus::LimitReached {
-                    let last = rows
-                        .last()
-                        .ok_or_else(|| invalid("semantic scan cannot make progress"))?;
-                    let after = OwnedBytes::copy(&pages, last.key(), &mut work)?;
-                    let charge = pages.charge_output(
-                        std::mem::size_of::<ScanState>() + 2 * std::mem::size_of::<usize>(),
-                    )?;
-                    Some(NativeSemanticContinuation {
-                        state: Arc::new(ScanState {
-                            read: retained(&state.read),
-                            range: state.range.clone(),
-                            after: Some(after),
-                            _charge: charge,
-                        }),
-                        origin: owner.identity.clone(),
-                    })
-                } else {
-                    None
-                };
-                Ok(NativeSemanticScan {
-                    rows,
-                    continuation,
-                    status,
-                    _charge: charge,
+            }
+            let continuation = if status == NativeScanStatus::LimitReached {
+                let last = rows
+                    .last()
+                    .ok_or_else(|| invalid("semantic scan cannot make progress"))?;
+                let after = OwnedBytes::copy(&pages, last.key(), &mut work)?;
+                let charge = pages.charge_output(
+                    std::mem::size_of::<ScanState>() + 2 * std::mem::size_of::<usize>(),
+                )?;
+                Some(NativeSemanticContinuation {
+                    state: Arc::new(ScanState {
+                        read: retained(&state.read),
+                        range: state.range.clone(),
+                        after: Some(after),
+                        _charge: charge,
+                    }),
+                    origin: owner.identity.clone(),
                 })
+            } else {
+                None
+            };
+            Ok(NativeSemanticScan {
+                rows,
+                continuation,
+                status,
+                _charge: charge,
             })
-            .await
+        })
+        .await
     }
 }
 fn scan_allocation(rows: usize) -> Result<usize, ObjectLogError> {

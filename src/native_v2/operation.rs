@@ -77,13 +77,19 @@ impl OperationCompletion {
     }
 }
 pub(super) struct Physical {
+    // Rust drops fields in declaration order, including when a token destructor
+    // unwinds. External capacity must retire before completion becomes visible.
+    _external_owner: Option<crate::AppendOwner>,
+    release: PhysicalRelease,
+}
+struct PhysicalRelease {
     completion: Arc<OperationCompletion>,
     resources: Arc<Resources>,
     permit: Option<OwnedSemaphorePermit>,
 }
 impl Physical {
     pub fn validate_budget(&self, budget: &Arc<ByteBudget>) -> Result<(), ObjectLogError> {
-        if !Arc::ptr_eq(&self.resources.bytes, budget) {
+        if !Arc::ptr_eq(&self.release.resources.bytes, budget) {
             return Err(invalid(
                 "native operation belongs to another resource owner",
             ));
@@ -91,7 +97,7 @@ impl Physical {
         Ok(())
     }
 }
-impl Drop for Physical {
+impl Drop for PhysicalRelease {
     fn drop(&mut self) {
         drop(self.permit.take());
         let mut state = self.resources.state.lock().unwrap();
@@ -188,7 +194,23 @@ impl Resources {
     // Output T must contain no Physical or operation-scoped PageStore: the
     // caller waits for their final release before receiving T. Public carriers
     // retain only byte admission and immutable binding/certificate ownership.
+    #[cfg(test)]
     pub async fn run<T, F, Fut>(self: &Arc<Self>, factory: F) -> Result<T, ObjectLogError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Physical>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, ObjectLogError>> + Send + 'static,
+    {
+        self.run_with_owner(None, factory).await
+    }
+
+    /// Keep caller admission with the final physical provider child, rather
+    /// than with the cancellable reply future or the main task alone.
+    pub async fn run_with_owner<T, F, Fut>(
+        self: &Arc<Self>,
+        external_owner: Option<crate::AppendOwner>,
+        factory: F,
+    ) -> Result<T, ObjectLogError>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Physical>) -> Fut + Send + 'static,
@@ -217,9 +239,12 @@ impl Resources {
             notify: Notify::new(),
         });
         let physical = Arc::new(Physical {
-            completion: completion.clone(),
-            resources: self.clone(),
-            permit: Some(permit),
+            _external_owner: external_owner,
+            release: PhysicalRelease {
+                completion: completion.clone(),
+                resources: self.clone(),
+                permit: Some(permit),
+            },
         });
         let owner = physical.clone();
         let (send, reply) = oneshot::channel();
@@ -301,6 +326,161 @@ mod tests {
             bytes: 65536,
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn external_owner_follows_provider_child_after_caller_cancel_and_task_panic() {
+        struct Signal(Arc<Notify>);
+        impl std::task::Wake for Signal {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
+        for panic in [false, true] {
+            let resources = resources();
+            let token: AppendOwner = Arc::new(AtomicBool::new(false));
+            let weak = Arc::downgrade(&token);
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let (retired_tx, retired_rx) = oneshot::channel();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let mut caller = Box::pin(resources.run_with_owner(
+                Some(token),
+                move |physical| async move {
+                    tokio::spawn(async move {
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        drop(physical);
+                        retired_tx.send(()).unwrap();
+                    });
+                    reply_rx.await.unwrap();
+                    assert!(!panic, "injected main operation panic");
+                    Err::<(), _>(invalid("injected main operation error"))
+                },
+            ));
+            let signal = Arc::new(Notify::new());
+            let waker = std::task::Waker::from(Arc::new(Signal(signal.clone())));
+            let mut context = Context::from_waker(&waker);
+            assert!(caller.as_mut().poll(&mut context).is_pending());
+            entered_rx.await.unwrap();
+            assert!(caller.as_mut().poll(&mut context).is_pending());
+            reply_tx.send(()).unwrap();
+            signal.notified().await;
+            // Consume the controlled error/panic reply. Only physical completion
+            // can now make this future ready; the provider child remains gated.
+            assert!(caller.as_mut().poll(&mut context).is_pending());
+            drop(caller);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(resources.state.lock().unwrap().physical, 1);
+            let drain = resources.close_and_drain();
+            tokio::pin!(drain);
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await
+            );
+            release_tx.send(()).unwrap();
+            retired_rx.await.unwrap();
+            drain.await.unwrap();
+            assert!(weak.upgrade().is_none());
+            assert_eq!(resources.state.lock().unwrap().physical, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_owner_survives_destruction_of_the_callers_runtime() {
+        let resources = resources();
+        let token: AppendOwner = Arc::new(AtomicBool::new(false));
+        let weak = Arc::downgrade(&token);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (retired_tx, retired_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (gone_tx, gone_rx) = oneshot::channel();
+        let caller_resources = resources.clone();
+        let caller = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::spawn(async move {
+                    caller_resources
+                        .run_with_owner(Some(token), move |physical| async move {
+                            tokio::spawn(async move {
+                                entered_tx.send(()).unwrap();
+                                release_rx.await.unwrap();
+                                drop(physical);
+                                retired_tx.send(()).unwrap();
+                            });
+                            Ok(())
+                        })
+                        .await
+                });
+                shutdown_rx.await.unwrap();
+            });
+            drop(runtime);
+            gone_tx.send(()).unwrap();
+        });
+        entered_rx.await.unwrap();
+        shutdown_tx.send(()).unwrap();
+        gone_rx.await.unwrap();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(resources.state.lock().unwrap().physical, 1);
+        release_tx.send(()).unwrap();
+        retired_rx.await.unwrap();
+        resources.close_and_drain().await.unwrap();
+        assert!(weak.upgrade().is_none());
+        caller.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_owner_retires_before_completion_even_when_its_drop_panics() {
+        struct BlockingOwner {
+            entered: Option<oneshot::Sender<()>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            panic: bool,
+        }
+        impl Drop for BlockingOwner {
+            fn drop(&mut self) {
+                self.entered.take().unwrap().send(()).unwrap();
+                // Disconnection also releases the worker after an assertion
+                // failure, so the negative control cannot strand the SDK host.
+                let _ = self.release.get_mut().unwrap().recv();
+                assert!(!self.panic, "injected external owner destructor panic");
+            }
+        }
+        for panic in [false, true] {
+            let resources = resources();
+            let (entered, started) = oneshot::channel();
+            let (release, resume) = std::sync::mpsc::channel();
+            let token = Arc::new(BlockingOwner {
+                entered: Some(entered),
+                release: Mutex::new(resume),
+                panic,
+            });
+            let caller = resources.run_with_owner(Some(token), |_| async { Ok(()) });
+            tokio::pin!(caller);
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(caller.as_mut().poll(cx).is_pending())).await
+            );
+            started.await.unwrap();
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(caller.as_mut().poll(cx).is_pending())).await
+            );
+            let drain = resources.close_and_drain();
+            tokio::pin!(drain);
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await
+            );
+            assert_eq!(resources.state.lock().unwrap().physical, 1);
+            assert_eq!(resources.slots.available_permits(), 0);
+            release.send(()).unwrap();
+            caller.await.unwrap();
+            drain.await.unwrap();
+            assert_eq!(resources.state.lock().unwrap().physical, 0);
+        }
     }
 
     #[tokio::test]

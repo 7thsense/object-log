@@ -83,6 +83,7 @@ impl Owner {
 #[derive(Clone)]
 pub struct NativeLog {
     owner: Arc<Owner>,
+    external_owner: Option<crate::AppendOwner>,
 }
 /// Validated namespace identity with shared monotonic authority knowledge.
 #[derive(Clone)]
@@ -237,6 +238,35 @@ impl NativeReadCut {
     }
 }
 impl NativeLog {
+    /// Return an operation-scoped view retaining caller-owned admission.
+    ///
+    /// This view shares the exact identity, executor, limits and storage of this
+    /// log. The original handle is unchanged. This replaces any prior owner on
+    /// the returned view; existing views and in-flight operations are unaffected.
+    /// Every physical operation started
+    /// through the view retains a clone until its last provider child retires,
+    /// including after caller cancellation, runtime destruction or task panic.
+    /// Keeping this view also keeps the owner alive. Returned namespace, cut and
+    /// publication carriers do not retain it; fund retained outputs separately.
+    pub fn with_operation_owner(&self, owner: crate::AppendOwner) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            external_owner: Some(owner),
+        }
+    }
+
+    async fn run<T, F, Fut>(&self, factory: F) -> Result<T, ObjectLogError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Physical>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, ObjectLogError>> + Send + 'static,
+    {
+        self.owner
+            .resources
+            .run_with_owner(self.external_owner.clone(), factory)
+            .await
+    }
+
     /// Configure a local native log without contacting storage.
     pub fn local(
         store: LocalBlobStore,
@@ -334,6 +364,7 @@ impl NativeLog {
                 limits,
                 identity: Arc::new(()),
             }),
+            external_owner: None,
         })
     }
     fn check(&self, origin: &Arc<()>) -> Result<(), ObjectLogError> {
@@ -366,49 +397,45 @@ impl NativeLog {
     pub async fn open(&self, literal: &[u8]) -> Result<Option<NativeNamespace>, ObjectLogError> {
         let literal = self.literal(literal)?;
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let context = owner.context(physical)?;
-                let Some(known) = context.open(&literal.bytes).await? else {
-                    return Ok(None);
-                };
-                let charge = owner.pages.charge_output(
-                    std::mem::size_of::<NamespaceState>() + 2 * std::mem::size_of::<usize>(),
-                )?;
-                Ok(Some(NativeNamespace {
-                    state: Arc::new(NamespaceState {
-                        known: Mutex::new(known),
-                        _charge: charge,
-                    }),
-                    origin: owner.identity.clone(),
-                }))
-            })
-            .await
+        self.run(move |physical| async move {
+            let context = owner.context(physical)?;
+            let Some(known) = context.open(&literal.bytes).await? else {
+                return Ok(None);
+            };
+            let charge = owner.pages.charge_output(
+                std::mem::size_of::<NamespaceState>() + 2 * std::mem::size_of::<usize>(),
+            )?;
+            Ok(Some(NativeNamespace {
+                state: Arc::new(NamespaceState {
+                    known: Mutex::new(known),
+                    _charge: charge,
+                }),
+                origin: owner.identity.clone(),
+            }))
+        })
+        .await
     }
     /// Explicitly publish a new empty namespace candidate; this does not provision a queue.
     pub async fn provision_new(&self, literal: &[u8]) -> Result<NativeNamespace, ObjectLogError> {
         let literal = self.literal(literal)?;
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let context = owner.context(physical)?;
-                let charge = owner.pages.charge_output(
-                    std::mem::size_of::<NamespaceState>() + 2 * std::mem::size_of::<usize>(),
-                )?;
-                let mut attempt = context.attempt(&literal.bytes).await?;
-                attempt.prepare_candidate().await?;
-                let known = attempt.publish().await?;
-                Ok(NativeNamespace {
-                    state: Arc::new(NamespaceState {
-                        known: Mutex::new(known),
-                        _charge: charge,
-                    }),
-                    origin: owner.identity.clone(),
-                })
+        self.run(move |physical| async move {
+            let context = owner.context(physical)?;
+            let charge = owner.pages.charge_output(
+                std::mem::size_of::<NamespaceState>() + 2 * std::mem::size_of::<usize>(),
+            )?;
+            let mut attempt = context.attempt(&literal.bytes).await?;
+            attempt.prepare_candidate().await?;
+            let known = attempt.publish().await?;
+            Ok(NativeNamespace {
+                state: Arc::new(NamespaceState {
+                    known: Mutex::new(known),
+                    _charge: charge,
+                }),
+                origin: owner.identity.clone(),
             })
-            .await
+        })
+        .await
     }
     /// Validate fresh authority and retain its knowledge before delivering a fixed cut.
     pub async fn capture(
@@ -418,19 +445,17 @@ impl NativeLog {
         self.check(&namespace.origin)?;
         let namespace = namespace.clone();
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let context = owner.context(physical)?;
-                let mut known = namespace.state.known.lock().await;
-                let current = context.capture_known(known.duplicate(&context)?).await?;
-                *known = current;
-                Ok(NativeReadCut {
-                    read: known.retained_read()?,
-                    origin: owner.identity.clone(),
-                })
+        self.run(move |physical| async move {
+            let context = owner.context(physical)?;
+            let mut known = namespace.state.known.lock().await;
+            let current = context.capture_known(known.duplicate(&context)?).await?;
+            *known = current;
+            Ok(NativeReadCut {
+                read: known.retained_read()?,
+                origin: owner.identity.clone(),
             })
-            .await
+        })
+        .await
     }
     /// Fence the exact retained observation; no hidden fresh capture precedes CAS.
     pub async fn acquire(
@@ -440,28 +465,26 @@ impl NativeLog {
         self.check(&namespace.origin)?;
         let namespace = namespace.clone();
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let context = owner.context(physical)?;
-                let known = namespace.state.known.lock().await;
-                let selected = known.duplicate(&context)?;
-                let charged_key = selected.charged_head_key(
-                    &context,
-                    std::mem::size_of::<Mutex<WriterBinding>>() + 2 * std::mem::size_of::<usize>(),
-                )?;
-                let (writer, binding) = selected.into_writer(&context).await?;
-                Ok(NativeWriter {
-                    inner: Arc::new(Mutex::new(WriterBinding {
-                        writer,
-                        binding,
-                        head_key: charged_key.key,
-                        _charge: charged_key.charge,
-                    })),
-                    origin: owner.identity.clone(),
-                })
+        self.run(move |physical| async move {
+            let context = owner.context(physical)?;
+            let known = namespace.state.known.lock().await;
+            let selected = known.duplicate(&context)?;
+            let charged_key = selected.charged_head_key(
+                &context,
+                std::mem::size_of::<Mutex<WriterBinding>>() + 2 * std::mem::size_of::<usize>(),
+            )?;
+            let (writer, binding) = selected.into_writer(&context).await?;
+            Ok(NativeWriter {
+                inner: Arc::new(Mutex::new(WriterBinding {
+                    writer,
+                    binding,
+                    head_key: charged_key.key,
+                    _charge: charged_key.charge,
+                })),
+                origin: owner.identity.clone(),
             })
-            .await
+        })
+        .await
     }
     /// Explicitly refresh a writer in its acquired epoch, without another fence.
     /// The fresh observation is retained before the response is delivered.
@@ -472,29 +495,27 @@ impl NativeLog {
         self.check(&writer.origin)?;
         let writer = writer.clone();
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let pages = owner.pages.in_operation(physical)?;
-                let mut writer = writer.inner.lock().await;
-                let selected = pages.for_binding(&writer.binding)?;
-                let current = writer
-                    .writer
-                    .clone()
-                    .refresh(selected, &writer.head_key)
-                    .await?;
-                writer.writer = current;
-                Ok(NativeReadCut {
-                    read: RetainedRead {
-                        captured: writer.writer.snapshot().clone(),
-                        binding: writer.binding.clone(),
-                        knowledge: writer.writer.knowledge(),
-                        charge: writer._charge.clone(),
-                    },
-                    origin: owner.identity.clone(),
-                })
+        self.run(move |physical| async move {
+            let pages = owner.pages.in_operation(physical)?;
+            let mut writer = writer.inner.lock().await;
+            let selected = pages.for_binding(&writer.binding)?;
+            let current = writer
+                .writer
+                .clone()
+                .refresh(selected, &writer.head_key)
+                .await?;
+            writer.writer = current;
+            Ok(NativeReadCut {
+                read: RetainedRead {
+                    captured: writer.writer.snapshot().clone(),
+                    binding: writer.binding.clone(),
+                    knowledge: writer.writer.knowledge(),
+                    charge: writer._charge.clone(),
+                },
+                origin: owner.identity.clone(),
             })
-            .await
+        })
+        .await
     }
 
     /// Prepare immutable group objects without publishing the authoritative head.
@@ -572,69 +593,67 @@ impl NativeLog {
         };
         let writer = writer.clone();
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let scoped = owner.pages.in_operation(physical)?;
-                let writer = writer.inner.lock().await;
-                let pages = scoped.for_binding(&writer.binding)?;
-                if let Some((expected, _)) = &semantic
-                    && !writer.writer.snapshot().same_cut(&expected.captured)
-                {
-                    return Err(invalid(
-                        "semantic edit cut differs from writer original authority",
-                    ));
-                }
-                let references: Vec<_> = inputs
-                    .entries
-                    .iter()
-                    .map(|i| AppendInput {
-                        object_id: &i.identity,
-                        payload: &i.payload,
-                        records: i.records,
-                    })
-                    .collect();
-                let limits = AppendGroupLimits {
-                    entries: owner.limits.group_entries,
-                    framed_bytes: owner.limits.group_bytes,
-                };
-                let prepared = if let Some((_, semantic)) = &semantic {
-                    let edits = semantic.references();
-                    let mut work = semantic.limits.work.budget();
-                    writer
-                        .writer
-                        .clone()
-                        .prepare_semantic_group(
-                            pages.clone(),
-                            &references,
-                            limits,
-                            super::head::SemanticEdits {
-                                edits: &edits,
-                                max_edits: semantic.limits.edits,
-                                max_input_bytes: semantic.limits.input_bytes,
-                                work: &mut work,
-                            },
-                        )
-                        .await?
-                } else {
-                    writer
-                        .writer
-                        .clone()
-                        .prepare_group(pages.clone(), &references, limits)
-                        .await?
-                };
-                let attempt = PublicationAttempt::new(
-                    &pages,
-                    prepared,
-                    writer.binding.clone(),
-                    &writer.head_key,
-                )?;
-                Ok(NativePublication {
-                    attempt,
-                    origin: owner.identity.clone(),
+        self.run(move |physical| async move {
+            let scoped = owner.pages.in_operation(physical)?;
+            let writer = writer.inner.lock().await;
+            let pages = scoped.for_binding(&writer.binding)?;
+            if let Some((expected, _)) = &semantic
+                && !writer.writer.snapshot().same_cut(&expected.captured)
+            {
+                return Err(invalid(
+                    "semantic edit cut differs from writer original authority",
+                ));
+            }
+            let references: Vec<_> = inputs
+                .entries
+                .iter()
+                .map(|i| AppendInput {
+                    object_id: &i.identity,
+                    payload: &i.payload,
+                    records: i.records,
                 })
+                .collect();
+            let limits = AppendGroupLimits {
+                entries: owner.limits.group_entries,
+                framed_bytes: owner.limits.group_bytes,
+            };
+            let prepared = if let Some((_, semantic)) = &semantic {
+                let edits = semantic.references();
+                let mut work = semantic.limits.work.budget();
+                writer
+                    .writer
+                    .clone()
+                    .prepare_semantic_group(
+                        pages.clone(),
+                        &references,
+                        limits,
+                        super::head::SemanticEdits {
+                            edits: &edits,
+                            max_edits: semantic.limits.edits,
+                            max_input_bytes: semantic.limits.input_bytes,
+                            work: &mut work,
+                        },
+                    )
+                    .await?
+            } else {
+                writer
+                    .writer
+                    .clone()
+                    .prepare_group(pages.clone(), &references, limits)
+                    .await?
+            };
+            let attempt = PublicationAttempt::new(
+                &pages,
+                prepared,
+                writer.binding.clone(),
+                &writer.head_key,
+            )?;
+            Ok(NativePublication {
+                attempt,
+                origin: owner.identity.clone(),
             })
-            .await
+        })
+        .await
     }
     /// Submit the retained original transition once; errors require original resolution.
     pub async fn submit(
@@ -645,7 +664,11 @@ impl NativeLog {
         Ok(
             match publication
                 .attempt
-                .submit_outcome(&self.owner.resources, self.owner.pages.clone())
+                .submit_outcome(
+                    &self.owner.resources,
+                    self.owner.pages.clone(),
+                    self.external_owner.clone(),
+                )
                 .await?
             {
                 PublishOutcome::Stored(head) => NativePublishOutcome::Stored(head),
@@ -667,6 +690,7 @@ impl NativeLog {
                     &self.owner.resources,
                     self.owner.pages.clone(),
                     ProofBudget { entries },
+                    self.external_owner.clone(),
                 )
                 .await?
             {
@@ -690,25 +714,23 @@ impl NativeLog {
             charge: cut.read.charge.clone(),
         };
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let pages = owner
-                    .pages
-                    .in_operation(physical)?
-                    .for_binding(&read.binding)?;
-                let charge = pages.charge_output(std::mem::size_of::<NativeReadPlan>())?;
-                let Some(entry) = read.captured.lookup(pages, offset).await? else {
-                    return Ok(None);
-                };
-                Ok(Some(NativeReadPlan {
-                    entry,
-                    binding: read.binding.clone(),
-                    origin: owner.identity.clone(),
-                    _charge: charge,
-                }))
-            })
-            .await
+        self.run(move |physical| async move {
+            let pages = owner
+                .pages
+                .in_operation(physical)?
+                .for_binding(&read.binding)?;
+            let charge = pages.charge_output(std::mem::size_of::<NativeReadPlan>())?;
+            let Some(entry) = read.captured.lookup(pages, offset).await? else {
+                return Ok(None);
+            };
+            Ok(Some(NativeReadPlan {
+                entry,
+                binding: read.binding.clone(),
+                origin: owner.identity.clone(),
+                _charge: charge,
+            }))
+        })
+        .await
     }
     /// Hydrate the exact sealed entry after the consumer admits its actual length.
     pub async fn read_planned(
@@ -718,28 +740,23 @@ impl NativeLog {
     ) -> Result<NativeRecord, ObjectLogError> {
         self.check(&plan.origin)?;
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let pages = owner
-                    .pages
-                    .in_operation(physical)?
-                    .for_binding(&plan.binding)?;
-                let charge = pages.charge_output(std::mem::size_of::<NativeRecord>())?;
-                let (base, records, payload) = super::head::CapturedHead::hydrate_record(
-                    pages,
-                    &plan.entry,
-                    max_payload_bytes,
-                )
-                .await?;
-                Ok(NativeRecord {
-                    base,
-                    records,
-                    payload,
-                    _charge: charge,
-                })
+        self.run(move |physical| async move {
+            let pages = owner
+                .pages
+                .in_operation(physical)?
+                .for_binding(&plan.binding)?;
+            let charge = pages.charge_output(std::mem::size_of::<NativeRecord>())?;
+            let (base, records, payload) =
+                super::head::CapturedHead::hydrate_record(pages, &plan.entry, max_payload_bytes)
+                    .await?;
+            Ok(NativeRecord {
+                base,
+                records,
+                payload,
+                _charge: charge,
             })
-            .await
+        })
+        .await
     }
     /// Read only the original authenticated cut; validate touched pages and frame bytes.
     pub async fn read(
@@ -765,29 +782,27 @@ impl NativeLog {
             charge: cut.read.charge.clone(),
         };
         let owner = self.owner.clone();
-        self.owner
-            .resources
-            .run(move |physical| async move {
-                let pages = owner
-                    .pages
-                    .in_operation(physical)?
-                    .for_binding(&read.binding)?;
-                let charge = pages.charge_output(std::mem::size_of::<NativeRecord>())?;
-                let Some((base, records, payload)) = read
-                    .captured
-                    .read_record_bounded(pages, offset, max_payload_bytes)
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                Ok(Some(NativeRecord {
-                    base,
-                    records,
-                    payload,
-                    _charge: charge,
-                }))
-            })
-            .await
+        self.run(move |physical| async move {
+            let pages = owner
+                .pages
+                .in_operation(physical)?
+                .for_binding(&read.binding)?;
+            let charge = pages.charge_output(std::mem::size_of::<NativeRecord>())?;
+            let Some((base, records, payload)) = read
+                .captured
+                .read_record_bounded(pages, offset, max_payload_bytes)
+                .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(NativeRecord {
+                base,
+                records,
+                payload,
+                _charge: charge,
+            }))
+        })
+        .await
     }
     /// Close admission and drain actual owned work; retained byte-only handles may survive.
     pub async fn shutdown(&self) -> Result<(), ObjectLogError> {

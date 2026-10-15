@@ -239,6 +239,15 @@ fixed-cut entry with its exact payload length without identity/payload hydration
 The consumer admits actual bytes, then consumes that same entry with `read_planned`;
 no fresh head observation or second index lookup replaces the plan. `NativeRecord::into_bytes` transfers
 the SDK owner without copying; byte aliases retain admission through final drop.
+`with_operation_owner(AppendOwner)` returns a scoped log view sharing the same
+identity, executor and limits. It replaces the returned view's prior owner without
+changing other views or in-flight work. Each dispatched operation retains that
+owner through its final physical provider child and retires it before terminal
+notification, including cancellation, caller-runtime destruction and panic.
+Keeping the view keeps its owner alive. Returned namespace, writer, publication,
+cut and payload carriers do not retain this operation token; callers must fund
+retained outputs separately.
+
 The external append/reopen contract runs unchanged on Local and explicitly
 configured S3, with both S3 payload-signing modes. These checks do not establish
 provider durability, consumer semantic-index correctness or release throughput.
