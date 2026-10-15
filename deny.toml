@@ -21,6 +21,11 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# Mozilla certificate data bundled by the explicit owned TLS trust store.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 # Allow multiple versions (transitive duplicates are common); flag nothing here
 # by default. Tighten if dependency bloat becomes a concern.

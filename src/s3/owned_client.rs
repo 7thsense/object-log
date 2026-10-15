@@ -132,13 +132,14 @@ fn validate_owned_configuration(
 }
 fn validate_additional_ca(pem: &[u8]) -> Result<(), ObjectLogError> {
     let invalid = || ObjectLogError::InvalidConfig("invalid owned S3 trust configuration".into());
+    use rustls::pki_types::pem::{PemObject, SectionKind};
     let mut roots = rustls::RootCertStore::empty();
     let mut count = 0usize;
-    for item in rustls_pemfile::read_all(&mut std::io::Cursor::new(pem)) {
-        let rustls_pemfile::Item::X509Certificate(cert) = item.map_err(|_| invalid())? else {
+    for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
+        let (SectionKind::Certificate, cert) = item.map_err(|_| invalid())? else {
             return Err(invalid());
         };
-        roots.add(cert).map_err(|_| invalid())?;
+        roots.add(cert.into()).map_err(|_| invalid())?;
         count += 1;
     }
     if count == 0 {

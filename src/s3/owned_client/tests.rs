@@ -95,6 +95,15 @@ fn owned_configuration_bounds_and_errors_are_redacted() {
     }
 }
 #[test]
+fn additional_trust_rejects_a_private_key_even_after_a_valid_certificate() {
+    let generated = rcgen::generate_simple_self_signed(vec!["fixture".into()]).unwrap();
+    let certificate = generated.cert.pem();
+    assert!(validate_additional_ca(certificate.as_bytes()).is_ok());
+    let mixed = format!("{certificate}{}", generated.key_pair.serialize_pem());
+    assert!(validate_additional_ca(mixed.as_bytes()).is_err());
+}
+
+#[test]
 fn malformed_or_oversized_trust_is_rejected_before_client_activity() {
     for pem in [
         b"not PEM".as_slice(),

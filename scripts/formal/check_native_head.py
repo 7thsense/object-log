@@ -42,7 +42,7 @@ SOURCES = (
     'scripts/formal/native_head_model.py', 'scripts/formal/check_native_head.py',
     'docs/helix/02-design/contracts/CONTRACT-002-object-store-api.md',
     'docs/helix/02-design/contracts/CONTRACT-001-core-log-api.md',
-    '.github/workflows/ci.yml',
+    '.github/workflows/ci.yml', 'scripts/ci/native_s3.py', 'scripts/ci/native_s3_controls.py', 'deny.toml',
 )
 CODE_MAPPING = {
     'scope': 'MetadataSnapshot::validate provider/key tokens',
