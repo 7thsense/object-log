@@ -76,9 +76,15 @@ async fn advanced_writer_appends_without_refresh_and_reads_back() {
             (0, n + 1)
         );
         // The head is written once, and only after everything it references.
-        let writes = store.take().writes;
+        let calls = store.take();
+        let writes = calls.writes;
         assert_eq!(writes.iter().filter(|k| k.ends_with("/head")).count(), 1);
         assert!(writes.last().unwrap().ends_with("/head"));
+        if n > 0 {
+            // Every read is the probe before one immutable write: the index
+            // position is retained, so none of them reads the right spine.
+            assert_eq!(calls.reads.len(), writes.len() - 1, "append {n}");
+        }
     }
     let cut = log.capture(&namespace).await.unwrap();
     assert_eq!(cut.head().bounds(), (0, 60));

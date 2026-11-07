@@ -108,8 +108,8 @@ impl PublicationAttempt {
                 "publication belongs to another writer binding".into(),
             ));
         }
-        let prepared = self.prepared.lock().await;
-        writer.adopt(&prepared).await
+        let mut prepared = self.prepared.lock().await;
+        writer.adopt(&mut prepared).await
     }
 
     /// Resolution always observes storage using the retained original cut and

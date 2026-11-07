@@ -183,6 +183,14 @@ impl OwnedPage {
     }
 }
 
+/// An encoded immutable page awaiting its create-only upload.
+pub(super) struct PendingPage {
+    raw: Vec<u8>,
+    hash: [u8; 32],
+    // Released only after the upload completes.
+    charge: Arc<Charge>,
+}
+
 struct UploadedPage {
     bytes: Vec<u8>,
     // Drop the complete source allocation before its reservation.
@@ -727,7 +735,9 @@ impl PageStore {
             _charge: charge,
         })
     }
-    pub async fn write(&self, page: OwnedPage) -> Result<Descriptor, ObjectLogError> {
+    /// Encode a page without I/O. The pending page keeps the page's reservation
+    /// until it is uploaded, even after the page itself is dropped or mutated.
+    pub fn seal(&self, page: &OwnedPage) -> Result<(Descriptor, PendingPage), ObjectLogError> {
         if !Arc::ptr_eq(&page.store_identity, &self.identity) {
             return Err(ObjectLogError::InvalidConfig(
                 "page belongs to another store binding".into(),
@@ -735,8 +745,22 @@ impl PageStore {
         }
         // Encode under the existing page reservation, retaining both capacities.
         let (raw, descriptor) = page.page.encode(self.scope)?;
-        self.write_immutable(raw, &descriptor.hash, &page._charge)
-            .await?;
+        Ok((
+            descriptor,
+            PendingPage {
+                raw,
+                hash: descriptor.hash,
+                charge: page._charge.clone(),
+            },
+        ))
+    }
+    pub async fn upload(&self, pending: PendingPage) -> Result<(), ObjectLogError> {
+        self.write_immutable(pending.raw, &pending.hash, &pending.charge)
+            .await
+    }
+    pub async fn write(&self, page: OwnedPage) -> Result<Descriptor, ObjectLogError> {
+        let (descriptor, pending) = self.seal(&page)?;
+        self.upload(pending).await?;
         Ok(descriptor)
     }
 }

@@ -603,7 +603,7 @@ impl NativeLog {
         let owner = self.owner.clone();
         self.run(move |physical| async move {
             let scoped = owner.pages.in_operation(physical)?;
-            let writer = writer.inner.lock().await;
+            let mut writer = writer.inner.lock().await;
             let pages = scoped.for_binding(&writer.binding)?;
             if let Some((expected, _)) = &semantic
                 && !writer.writer.snapshot().same_cut(&expected.captured)
@@ -630,7 +630,7 @@ impl NativeLog {
                 let mut work = semantic.limits.work.budget();
                 writer
                     .writer
-                    .clone()
+                    .take_for_prepare()
                     .prepare_semantic_group(
                         pages.clone(),
                         &references,
@@ -646,7 +646,7 @@ impl NativeLog {
             } else {
                 writer
                     .writer
-                    .clone()
+                    .take_for_prepare()
                     .prepare_group(pages.clone(), &references, limits)
                     .await?
             };

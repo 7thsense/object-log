@@ -352,6 +352,8 @@ pub(super) struct PreparedAppend {
     attempted: bool,
     /// What the original conditional write stored, once it definitely did.
     stored: Option<MetadataSnapshot>,
+    /// The index position that reaches `next`, for the writer that publishes it.
+    spine: Option<super::index::Spine>,
     certificates: OwnedCertificates,
     lineage: Arc<WriterLineage>,
 }
@@ -538,12 +540,31 @@ impl OwnedPayload {
     }
 }
 /// Writer authority is constructed only by a successful fence and exact recapture.
-#[derive(Clone)]
 pub(super) struct FencedHead {
     captured: CapturedHead,
     lineage: Arc<WriterLineage>,
+    /// The writer's position in the index, once an append has built it. It never
+    /// outlives an acquisition or refresh and a clone does not share it.
+    spine: Option<super::index::Spine>,
+}
+impl Clone for FencedHead {
+    fn clone(&self) -> Self {
+        Self {
+            captured: self.captured.clone(),
+            lineage: self.lineage.clone(),
+            spine: None,
+        }
+    }
 }
 impl FencedHead {
+    /// The writer for one prepare, moving the spine into it. If that prepare
+    /// fails the writer has no spine and the next append rebuilds it by reading.
+    pub(super) fn take_for_prepare(&mut self) -> Self {
+        Self {
+            spine: self.spine.take(),
+            ..self.clone()
+        }
+    }
     pub(super) fn knowledge(&self) -> Arc<AuthorityKnowledge> {
         self.lineage._knowledge.clone()
     }
@@ -555,7 +576,7 @@ impl FencedHead {
     /// head, from this same writer family, in its acquired epoch, can be adopted.
     pub(super) async fn adopt(
         &mut self,
-        prepared: &PreparedAppend,
+        prepared: &mut PreparedAppend,
     ) -> Result<NativeHead, ObjectLogError> {
         let stored = prepared
             .stored
@@ -584,6 +605,10 @@ impl FencedHead {
             observed: stored.clone(),
             identity: self.captured.identity.clone(),
         };
+        self.spine = prepared
+            .spine
+            .take()
+            .filter(|spine| Some(spine.root()) == prepared.next.index_root);
         Ok(prepared.next)
     }
     #[cfg(test)]
@@ -758,6 +783,7 @@ impl FencedHead {
             None
         };
         let index = super::index::Index::new(pages.clone());
+        let mut spine = self.spine;
         let mut root = captured.head.index_root;
         let mut base = captured.head.next_offset;
         for (ordinal, input) in inputs.iter().enumerate() {
@@ -808,7 +834,12 @@ impl FencedHead {
                     super::codec::FrameKind::Legacy
                 },
             };
-            root = Some(index.append(root, certificate).await?);
+            let appended = index.append_spine(root, spine.take(), certificate).await?;
+            for page in appended.uploads {
+                pages.upload(page).await?;
+            }
+            root = Some(appended.root);
+            spine = Some(appended.spine);
             base = certificate.end()?;
             certificates.entries.push(certificate);
         }
@@ -838,6 +869,7 @@ impl FencedHead {
             next,
             attempted: false,
             stored: None,
+            spine,
             certificates,
             lineage,
         })
@@ -866,6 +898,7 @@ impl FencedHead {
         Ok(Self {
             captured: current,
             lineage: self.lineage.clone(),
+            spine: None,
         })
     }
 }
@@ -1123,6 +1156,7 @@ impl CapturedHead {
         Ok(FencedHead {
             captured: current,
             lineage,
+            spine: None,
         })
     }
     pub async fn lookup(
