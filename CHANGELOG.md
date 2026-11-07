@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `NativeLog::advance_writer` adopts the head a stored publication wrote as the
+  writer's captured head without any storage request, so a single-owner writer
+  appends without `refresh_writer`. It refuses a publication that was not
+  stored, does not directly extend the captured head, or belongs to another
+  writer.
+- The native writer keeps its right index spine across appends. With it, a
+  healthy single-entry append makes no storage read (it previously made
+  `2h + 6`) and `h + 5` writes. After `acquire` or `refresh_writer` the first
+  append reads the spine (`h + 1` pages) once.
+- `NativeLog::plan_range` plans consecutive entries of a cut with one
+  root-to-leaf walk, for rebuilds that fetch payloads in parallel.
+
 - `s3_engine_produce_fetch_round_trip` live test; `scripts/s3-evidence.sh`
   operator evidence runner (MinIO/Garage/AWS/R2).
 - Garage operator evidence recorded (path-style multipart + engine path).
@@ -17,6 +29,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking:** `MetadataSwap::Stored` is now `MetadataSwap::Stored(MetadataSnapshot)`,
+  the snapshot of what was stored with its new version token (the local store's
+  file identity, or the ETag of the conditional PUT response). A successful S3
+  PUT reply with no ETag is now an error (outcome unknown), never a reread.
+  Implementers of `BoundedMetadataStore` and code matching on `Stored` must
+  update.
+- Native immutable pages and data frames are created with a conditional write
+  first and read only if the store rejects it, still validated byte for byte.
+- One native append uploads its immutable objects with up to eight concurrent
+  writes and returns only when all are stored; the head is written afterwards.
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
 
