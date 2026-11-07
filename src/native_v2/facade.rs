@@ -762,6 +762,49 @@ impl NativeLog {
         })
         .await
     }
+    /// Authenticate consecutive entries of a fixed cut with one root-to-leaf walk.
+    ///
+    /// Returns plans for the entries from the one covering `offset` through the
+    /// end of that leaf, at most `max_entries`; call again from the next entry's
+    /// offset to continue. Empty at or past the cut's end. Each plan is hydrated
+    /// with `read_planned` exactly as one from `plan_read`, so payloads can be
+    /// fetched concurrently. `max_entries` must be nonzero.
+    pub async fn plan_range(
+        &self,
+        cut: &NativeReadCut,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<NativeReadPlan>, ObjectLogError> {
+        self.check(&cut.origin)?;
+        if max_entries == 0 {
+            return Err(ObjectLogError::InvalidConfig(
+                "native plan range needs at least one entry".into(),
+            ));
+        }
+        let read = cut.retained();
+        let owner = self.owner.clone();
+        self.run(move |physical| async move {
+            let pages = owner
+                .pages
+                .in_operation(physical)?
+                .for_binding(&read.binding)?;
+            let entries = read
+                .captured
+                .lookup_run(pages.clone(), offset, max_entries)
+                .await?;
+            let mut plans = Vec::with_capacity(entries.len());
+            for entry in entries {
+                plans.push(NativeReadPlan {
+                    entry,
+                    binding: read.binding.clone(),
+                    origin: owner.identity.clone(),
+                    _charge: pages.charge_output(std::mem::size_of::<NativeReadPlan>())?,
+                });
+            }
+            Ok(plans)
+        })
+        .await
+    }
     /// Hydrate the exact sealed entry after the consumer admits its actual length.
     pub async fn read_planned(
         &self,

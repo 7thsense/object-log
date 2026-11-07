@@ -482,6 +482,23 @@ async fn advancing_writer_contract(log: &NativeLog, other: &NativeLog) {
         let record = log.read(&cut, n).await.unwrap().unwrap();
         assert_eq!(record.bytes(), format!("payload-{n}").as_bytes());
     }
+    // The same records through run planning, hydrated concurrently.
+    let mut offset = 0;
+    let mut seen = 0u64;
+    while offset < 45 {
+        let plans = log.plan_range(&cut, offset, 1000).await.unwrap();
+        assert!(!plans.is_empty());
+        for plan in plans {
+            let payload = plan.payload_bytes();
+            let record = log.read_planned(plan, payload).await.unwrap();
+            assert_eq!(record.base_offset(), seen);
+            assert_eq!(record.bytes(), format!("payload-{seen}").as_bytes());
+            seen += 1;
+            offset = seen;
+        }
+    }
+    assert_eq!(seen, 45);
+    assert!(log.plan_range(&cut, 45, 4).await.unwrap().is_empty());
     // A newer writer family changes the head; the advanced writer's token is stale.
     let other_namespace = other.open(b"advance\0queue").await.unwrap().unwrap();
     let _newer = other.acquire(&other_namespace).await.unwrap();

@@ -57,7 +57,8 @@ pub(super) struct Appended {
     pub uploads: Vec<PendingPage>,
 }
 pub(super) struct OwnedEntry {
-    page: OwnedPage,
+    // Entries of one run share their leaf, which keeps its single reservation.
+    page: Arc<OwnedPage>,
     slot: usize,
 }
 impl OwnedEntry {
@@ -154,27 +155,45 @@ impl Index {
         root: Option<Descriptor>,
         offset: u64,
     ) -> Result<Option<OwnedEntry>, ObjectLogError> {
+        Ok(self.lookup_run(root, offset, 1).await?.pop())
+    }
+
+    /// One root-to-leaf walk, then up to `max_entries` consecutive entries from the
+    /// one covering `offset` to the end of its leaf. Empty at or past the root's end.
+    pub async fn lookup_run(
+        &self,
+        root: Option<Descriptor>,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<OwnedEntry>, ObjectLogError> {
         let Some(mut cursor) = root else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         cursor.validate()?;
         if cursor.kind == Kind::Overflow || offset < cursor.start {
             return Err(invalid("offset root or retained range"));
         }
         if offset >= cursor.end {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         for _ in 0..=MAX_HEIGHT {
             let page = self.pages.read(cursor).await?;
             match page.view() {
                 PageView::Leaf(entries) => {
-                    let slot = entries
+                    let first = entries
                         .iter()
                         .position(|entry| {
                             entry.base <= offset && entry.end().is_ok_and(|end| offset < end)
                         })
                         .ok_or_else(|| invalid("leaf does not cover requested offset"))?;
-                    return Ok(Some(OwnedEntry { page, slot }));
+                    let last = entries.len().min(first.saturating_add(max_entries));
+                    let page = Arc::new(page);
+                    return Ok((first..last)
+                        .map(|slot| OwnedEntry {
+                            page: page.clone(),
+                            slot,
+                        })
+                        .collect());
                 }
                 PageView::Branch { children, .. } => {
                     cursor = *children

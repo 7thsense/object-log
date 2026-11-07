@@ -1174,6 +1174,20 @@ impl CapturedHead {
             spine: None,
         })
     }
+    pub async fn lookup_run(
+        &self,
+        pages: Arc<super::page_store::PageStore>,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<super::index::OwnedEntry>, ObjectLogError> {
+        pages.require_operation()?;
+        if !Arc::ptr_eq(&self.identity, &pages.binding_identity()) {
+            return Err(invalid("captured head belongs to another store binding"));
+        }
+        super::index::Index::new(pages)
+            .lookup_run(self.head.index_root, offset, max_entries)
+            .await
+    }
     pub async fn lookup(
         &self,
         pages: Arc<super::page_store::PageStore>,
