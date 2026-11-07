@@ -9,9 +9,11 @@ use crate::{
     ObjectLogError,
 };
 use bytes::Bytes;
+mod batch;
 mod immutable;
 mod scoped_bytes;
 mod transition_key;
+pub(super) use batch::{Upload, UploadBatch};
 pub(super) use scoped_bytes::{EncodedBytes, RetainedBytes};
 use std::sync::{
     Arc,
@@ -758,10 +760,12 @@ impl PageStore {
             },
         ))
     }
+    #[cfg(test)]
     pub async fn upload(&self, pending: PendingPage) -> Result<(), ObjectLogError> {
         self.write_immutable(pending.raw, &pending.hash, &pending.charge)
             .await
     }
+    #[cfg(test)]
     pub async fn write(&self, page: OwnedPage) -> Result<Descriptor, ObjectLogError> {
         let (descriptor, pending) = self.seal(&page)?;
         self.upload(pending).await?;

@@ -7,8 +7,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
+
+type KeyMatcher = Box<dyn Fn(&str) -> bool + Send>;
 
 /// Calls observed since the previous `take`.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -22,16 +27,40 @@ pub(in crate::native_v2) struct Calls {
 pub(in crate::native_v2) struct CountingStore {
     inner: Arc<LocalBlobStore>,
     calls: Mutex<Calls>,
+    swap_delay_ms: AtomicU64,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    fail_swap: Mutex<Option<KeyMatcher>>,
 }
 impl CountingStore {
     pub fn new(inner: Arc<LocalBlobStore>) -> Arc<Self> {
         Arc::new(Self {
             inner,
             calls: Mutex::new(Calls::default()),
+            swap_delay_ms: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            fail_swap: Mutex::new(None),
         })
     }
     pub fn take(&self) -> Calls {
         std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+    /// Hold every conditional write for this long so overlapping writes are observable.
+    pub fn delay_swaps(&self, millis: u64) {
+        self.swap_delay_ms.store(millis, Ordering::Release);
+    }
+    /// Highest number of conditional writes executing at once; resets when read.
+    pub fn take_max_concurrent_swaps(&self) -> usize {
+        self.max_in_flight.swap(0, Ordering::AcqRel)
+    }
+    /// Conditional writes executing right now.
+    pub fn swaps_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+    /// Fail the next conditional write whose key matches, before any effect.
+    pub fn fail_next_swap(&self, matching: impl Fn(&str) -> bool + Send + 'static) {
+        *self.fail_swap.lock().unwrap() = Some(Box::new(matching));
     }
     fn read(&self, key: &str) {
         self.calls.lock().unwrap().reads.push(key.to_owned());
@@ -104,9 +133,32 @@ impl BoundedMetadataStore for CountingStore {
         owners: MetadataOwners,
     ) -> Result<MetadataSwap, ObjectLogError> {
         self.write(key);
-        self.inner
-            .swap_metadata(key, observed, value, limits, owners)
-            .await
+        let injected = {
+            let mut armed = self.fail_swap.lock().unwrap();
+            if armed.as_ref().is_some_and(|matching| matching(key)) {
+                armed.take();
+                true
+            } else {
+                false
+            }
+        };
+        let now = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::AcqRel);
+        let delay = self.swap_delay_ms.load(Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        let result = if injected {
+            Err(ObjectLogError::StorageUnavailable(
+                "injected immutable upload failure".into(),
+            ))
+        } else {
+            self.inner
+                .swap_metadata(key, observed, value, limits, owners)
+                .await
+        };
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        result
     }
 }
 impl NativeStore for CountingStore {

@@ -784,6 +784,7 @@ impl FencedHead {
         };
         let index = super::index::Index::new(pages.clone());
         let mut spine = self.spine;
+        let mut uploads = super::page_store::UploadBatch::new();
         let mut root = captured.head.index_root;
         let mut base = captured.head.next_offset;
         for (ordinal, input) in inputs.iter().enumerate() {
@@ -814,10 +815,11 @@ impl FencedHead {
             } else {
                 pages.data_key(input.object_id)?
             };
-            let logical_id = index.store_literal_id(input.object_id).await?;
-            let identity = index.store_object_id(physical_key.as_str()).await?;
-            pages
-                .upload_data(physical_key.as_str(), frame.bytes())
+            let logical_id = index
+                .stage_literal_id(input.object_id, &mut uploads)
+                .await?;
+            let identity = index
+                .stage_object_id(physical_key.as_str(), &mut uploads)
                 .await?;
             let certificate = super::codec::LeafEntry {
                 object_id: identity,
@@ -834,15 +836,28 @@ impl FencedHead {
                     super::codec::FrameKind::Legacy
                 },
             };
+            uploads
+                .push(
+                    &pages,
+                    super::page_store::Upload::Data {
+                        key: physical_key,
+                        frame,
+                    },
+                )
+                .await?;
             let appended = index.append_spine(root, spine.take(), certificate).await?;
             for page in appended.uploads {
-                pages.upload(page).await?;
+                uploads
+                    .push(&pages, super::page_store::Upload::Page(page))
+                    .await?;
             }
             root = Some(appended.root);
             spine = Some(appended.spine);
             base = certificate.end()?;
             certificates.entries.push(certificate);
         }
+        // Every object this group references is durable before the head can name it.
+        uploads.finish(&pages).await?;
         let semantic_anchor = if let Some(map) = &prepared_map {
             let index_root =
                 root.ok_or_else(|| invalid("coupled publication has no append index"))?;

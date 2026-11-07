@@ -4,7 +4,7 @@ use super::codec::{
     BRANCH_SLOTS, DESCRIPTOR_BYTES, Descriptor, HEADER, Kind, LEAF_SLOTS, LeafEntry, MAX_HEIGHT,
     PAGE_BYTES,
 };
-use super::page_store::{Charge, OwnedPage, PageStore, PageView, PendingPage};
+use super::page_store::{Charge, OwnedPage, PageStore, PageView, PendingPage, Upload, UploadBatch};
 use crate::ObjectLogError;
 use std::sync::Arc;
 
@@ -189,11 +189,27 @@ impl Index {
     }
 
     /// Input is borrowed; reserve complete identity capacity before chunk copies.
+    #[cfg(test)]
     pub async fn store_object_id(&self, value: &str) -> Result<Descriptor, ObjectLogError> {
-        validate_object_id(value)?;
-        self.store_literal_id(value).await
+        let mut batch = UploadBatch::new();
+        let descriptor = self.stage_object_id(value, &mut batch).await?;
+        batch.finish(&self.pages).await?;
+        Ok(descriptor)
     }
-    pub async fn store_literal_id(&self, value: &str) -> Result<Descriptor, ObjectLogError> {
+    pub async fn stage_object_id(
+        &self,
+        value: &str,
+        batch: &mut UploadBatch,
+    ) -> Result<Descriptor, ObjectLogError> {
+        validate_object_id(value)?;
+        self.stage_literal_id(value, batch).await
+    }
+    /// Encode the identity's chunk pages, queueing each for the batch's upload.
+    pub async fn stage_literal_id(
+        &self,
+        value: &str,
+        batch: &mut UploadBatch,
+    ) -> Result<Descriptor, ObjectLogError> {
         if value.is_empty() || value.contains('\0') {
             return Err(invalid("literal identity"));
         }
@@ -211,7 +227,9 @@ impl Index {
         {
             start -= bytes.len();
             let page = self.pages.overflow(start as u64, bytes, next)?;
-            next = Some(self.pages.write(page).await?);
+            let (descriptor, pending) = self.pages.seal(&page)?;
+            batch.push(&self.pages, Upload::Page(pending)).await?;
+            next = Some(descriptor);
         }
         next.ok_or_else(|| invalid("empty physical object identity"))
     }

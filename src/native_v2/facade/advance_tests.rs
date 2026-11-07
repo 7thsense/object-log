@@ -292,3 +292,104 @@ async fn advanced_groups_of_many_entries_read_nothing_and_read_back() {
     }
     log.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn one_appends_immutable_objects_upload_together_before_the_head() {
+    let directory = tempfile::tempdir().unwrap();
+    let inner = Arc::new(LocalBlobStore::new(directory.path()));
+    let store = CountingStore::new(inner.clone());
+    let log = NativeLog::new(store.clone(), "concurrent".into(), limits()).unwrap();
+    let before = log.owner.resources.bytes.available();
+    let namespace = log.provision_new(b"queue").await.unwrap();
+    let writer = log.acquire(&namespace).await.unwrap();
+    append_one(&log, &writer, 0).await.unwrap();
+    store.take();
+    store.take_max_concurrent_swaps();
+    store.delay_swaps(40);
+    let bytes = payload(1);
+    let publication = log
+        .prepare(
+            &writer,
+            &[NativeAppend {
+                identity: "record-one",
+                payload: &bytes,
+                records: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    // Prepare returns only when every object is stored, and never writes the head.
+    let calls = store.take();
+    let overlap = store.take_max_concurrent_swaps();
+    assert!((2..=8).contains(&overlap), "{overlap} uploads overlapped");
+    assert_eq!(store.swaps_in_flight(), 0);
+    assert_eq!(calls.writes.len(), 4);
+    assert!(calls.writes.iter().all(|key| !key.ends_with("/head")));
+    for key in &calls.writes {
+        assert!(inner.get(key).await.unwrap().is_some(), "{key} not durable");
+    }
+    // Reservations are held through the retained publication, then fully returned.
+    assert!(log.owner.resources.bytes.available() < before);
+    store.delay_swaps(0);
+    log.submit(&publication).await.unwrap();
+    assert_eq!(store.take_max_concurrent_swaps(), 1);
+    log.advance_writer(&writer, &publication).await.unwrap();
+    drop((publication, writer, namespace));
+    log.shutdown().await.unwrap();
+    assert_eq!(log.owner.resources.bytes.available(), before);
+}
+
+type KeyFilter = fn(&str) -> bool;
+
+#[tokio::test]
+async fn any_upload_failure_fails_the_prepare_and_leaves_the_writer_usable() {
+    // A data frame, then an identity or index page.
+    let kinds: [(&str, KeyFilter); 2] = [
+        ("data", |key| key.contains("/data/")),
+        ("page", |key| {
+            !key.contains("/data/") && !key.ends_with("/head")
+        }),
+    ];
+    for (needle, matching) in kinds {
+        let directory = tempfile::tempdir().unwrap();
+        let (log, store) = counting_log(directory.path(), "failure");
+        let before = log.owner.resources.bytes.available();
+        let namespace = log.provision_new(b"queue").await.unwrap();
+        let writer = log.acquire(&namespace).await.unwrap();
+        for n in 0..3 {
+            append_one(&log, &writer, n).await.unwrap();
+        }
+        let key = head_key(directory.path(), "failure").await;
+        let head = LocalBlobStore::new(directory.path())
+            .get(&key)
+            .await
+            .unwrap();
+        store.fail_next_swap(matching);
+        let bytes = payload(3);
+        let input = [NativeAppend {
+            identity: "record-three",
+            payload: &bytes,
+            records: 1,
+        }];
+        assert!(log.prepare(&writer, &input).await.is_err(), "{needle}");
+        assert_eq!(
+            LocalBlobStore::new(directory.path())
+                .get(&key)
+                .await
+                .unwrap(),
+            head
+        );
+        // The writer lost its retained position, not its place: the next
+        // append rebuilds it by reading and still succeeds.
+        store.take();
+        append_one(&log, &writer, 3).await.unwrap();
+        assert!(!store.take().reads.is_empty());
+        append_one(&log, &writer, 4).await.unwrap();
+        assert!(store.take().reads.is_empty());
+        let cut = log.capture(&namespace).await.unwrap();
+        assert_eq!(cut.head().bounds(), (0, 5));
+        drop((cut, writer, namespace));
+        log.shutdown().await.unwrap();
+        assert_eq!(log.owner.resources.bytes.available(), before);
+    }
+}
