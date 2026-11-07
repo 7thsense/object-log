@@ -96,6 +96,19 @@ impl aws_sdk_s3::config::Intercept for MetadataResponse {
     }
 }
 impl S3BlobStore {
+    /// An observation of absence made without I/O. Its conditional write is sent
+    /// with `If-None-Match: *`, so it conflicts if the key exists.
+    pub(crate) fn absent_metadata(&self, key: &str, retained: AppendOwner) -> MetadataSnapshot {
+        MetadataSnapshot {
+            inner: Arc::new(crate::blob::authority::MetadataObservation {
+                _retained: retained,
+                owner: Arc::clone(&self.authority_identity),
+                key: key.to_owned(),
+                bytes: None,
+                version: MetadataVersion::S3(None),
+            }),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn lose_next_metadata_reply(&self, key: &str) -> Arc<AtomicU64> {
         let counter = Arc::new(AtomicU64::new(0));

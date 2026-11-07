@@ -24,6 +24,8 @@ pub(super) trait NativeStore: BlobStore + BoundedMetadataStore {
         key_len: usize,
         limits: MetadataLimits,
     ) -> Result<usize, ObjectLogError>;
+    /// Observe absence of `key` without I/O, for a create-only conditional write.
+    fn absent(&self, key: &str, retained: AppendOwner) -> crate::MetadataSnapshot;
 }
 impl NativeStore for crate::LocalBlobStore {
     fn page_source_scratch(
@@ -33,6 +35,9 @@ impl NativeStore for crate::LocalBlobStore {
     ) -> Result<usize, ObjectLogError> {
         limits.validate_local()?;
         self.native_page_source_scratch(key_len)
+    }
+    fn absent(&self, key: &str, retained: AppendOwner) -> crate::MetadataSnapshot {
+        self.absent_metadata(key, retained)
     }
 }
 
@@ -45,6 +50,9 @@ impl NativeStore for crate::S3BlobStore {
     ) -> Result<usize, ObjectLogError> {
         limits.validate()?;
         self.native_page_source_scratch(key_len, limits.version_bytes)
+    }
+    fn absent(&self, key: &str, retained: AppendOwner) -> crate::MetadataSnapshot {
+        self.absent_metadata(key, retained)
     }
 }
 
@@ -569,14 +577,27 @@ impl PageStore {
             bytes: raw.to_vec(),
             _charge: charge.clone(),
         });
-        let observed = self
+        // Create first: an existing object is read only after the store rejects
+        // the create, and must then match this frame exactly.
+        let absent = self.store.absent(key, charge.clone() as AppendOwner);
+        match self
             .store
-            .read_metadata(key, limits, self.owners(charge.clone() as AppendOwner))
-            .await?;
-        if let Some(existing) = observed.bytes() {
-            // Framed data reuse requires exact literal identity and payload;
-            // no physical-key digest can substitute for this comparison.
-            {
+            .swap_metadata(
+                key,
+                absent,
+                source.clone(),
+                limits,
+                self.owners(charge as AppendOwner),
+            )
+            .await?
+        {
+            MetadataSwap::Stored(_) => Ok(()),
+            MetadataSwap::Conflict(current) => {
+                let existing = current.bytes().ok_or_else(|| {
+                    ObjectLogError::Sequencer("immutable data publication conflicts".into())
+                })?;
+                // Framed data reuse requires exact literal identity and payload;
+                // no physical-key digest can substitute for this comparison.
                 let expected = super::data::DataFrame::decode(&source)?;
                 let actual = super::data::DataFrame::decode(existing)?;
                 if actual.identity() != expected.identity()
@@ -586,30 +607,13 @@ impl PageStore {
                         "immutable data identity differs".into(),
                     ));
                 }
+                if existing == source.as_ref() {
+                    return Ok(());
+                }
+                Err(ObjectLogError::Sequencer(
+                    "immutable data location differs".into(),
+                ))
             }
-            if existing == source.as_ref() {
-                return Ok(());
-            }
-            return Err(ObjectLogError::Sequencer(
-                "immutable data location differs".into(),
-            ));
-        }
-        match self
-            .store
-            .swap_metadata(
-                key,
-                observed,
-                source.clone(),
-                limits,
-                self.owners(charge as AppendOwner),
-            )
-            .await?
-        {
-            MetadataSwap::Stored(_) => Ok(()),
-            MetadataSwap::Conflict(current) if current.bytes() == Some(source.as_ref()) => Ok(()),
-            MetadataSwap::Conflict(_) => Err(ObjectLogError::Sequencer(
-                "immutable data publication conflicts".into(),
-            )),
         }
     }
     pub async fn swap_head(

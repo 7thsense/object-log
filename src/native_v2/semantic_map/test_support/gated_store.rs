@@ -150,4 +150,7 @@ impl NativeStore for GatedStore {
     ) -> Result<usize, ObjectLogError> {
         NativeStore::page_source_scratch(self.inner.as_ref(), key_len, limits)
     }
+    fn absent(&self, key: &str, retained: crate::AppendOwner) -> MetadataSnapshot {
+        NativeStore::absent(self.inner.as_ref(), key, retained)
+    }
 }

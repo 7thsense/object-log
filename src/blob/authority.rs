@@ -255,6 +255,21 @@ fn read_local(
         }),
     })
 }
+impl LocalBlobStore {
+    /// An observation of absence made without I/O. A conditional write against it
+    /// is create-only: it conflicts, with the current object, if the key exists.
+    pub(crate) fn absent_metadata(&self, key: &str, retained: AppendOwner) -> MetadataSnapshot {
+        MetadataSnapshot {
+            inner: Arc::new(MetadataObservation {
+                _retained: retained,
+                owner: Arc::clone(&self.authority_identity),
+                key: key.to_owned(),
+                bytes: None,
+                version: MetadataVersion::Local(None),
+            }),
+        }
+    }
+}
 #[async_trait]
 impl BoundedMetadataStore for LocalBlobStore {
     async fn read_metadata(

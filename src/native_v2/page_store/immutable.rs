@@ -90,28 +90,14 @@ impl PageStore {
             bytes: raw,
             _charge: charge.clone(),
         });
-        let observed = self
-            .store
-            .read_metadata(
-                &key,
-                self.metadata_limits(len),
-                self.owners(charge.clone() as AppendOwner),
-            )
-            .await?;
-        if let Some(existing) = observed.bytes() {
-            self.validate_immutable(existing, hash, len, charge)?;
-            if existing != source.as_ref() {
-                return Err(ObjectLogError::Sequencer(
-                    "immutable page bytes differ".into(),
-                ));
-            }
-            return Ok(());
-        }
+        // Create first. The store reports an existing object only by rejecting the
+        // create, and what it holds must then match these bytes exactly.
+        let absent = self.store.absent(&key, charge.clone() as AppendOwner);
         if let MetadataSwap::Conflict(current) = self
             .store
             .swap_metadata(
                 &key,
-                observed,
+                absent,
                 source.clone(),
                 self.metadata_limits(len),
                 self.owners(charge.clone() as AppendOwner),
@@ -124,7 +110,7 @@ impl PageStore {
             self.validate_immutable(existing, hash, len, charge)?;
             if existing != source.as_ref() {
                 return Err(ObjectLogError::Sequencer(
-                    "immutable page CAS conflict differs".into(),
+                    "immutable page bytes differ".into(),
                 ));
             }
         }
@@ -268,5 +254,97 @@ mod tests {
         ));
         drop(charge);
         assert_eq!(budget.available(), 1 << 20);
+    }
+
+    #[tokio::test]
+    async fn create_only_writes_do_not_read_first_and_validate_what_they_find() {
+        use crate::native_v2::{
+            data::DataFrame,
+            operation::{ExecutionConfig, Resources},
+            semantic_map::TestCountingStore as CountingStore,
+        };
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalBlobStore::new(root.path()));
+        let counting = CountingStore::new(local.clone());
+        let resources = Resources::new(ExecutionConfig {
+            workers: 2,
+            blocking_workers: 2,
+            operations: 1,
+            bytes: 1 << 20,
+        })
+        .unwrap();
+        let pages = PageStore::new(
+            counting.clone(),
+            "pages".into(),
+            scope(),
+            resources.bytes.clone(),
+            crate::MetadataLimits {
+                payload_bytes: PAGE_BYTES,
+                version_bytes: 56,
+            },
+        )
+        .unwrap();
+        resources
+            .run(move |physical| async move {
+                let pages = pages.in_operation(physical)?;
+                let charge = pages.charge_output(pages.allocation())?;
+                let page = |tail: [u8; 4]| {
+                    let mut raw = vec![0; 76];
+                    raw[..8].copy_from_slice(b"MAPTEST1");
+                    raw[8..40].copy_from_slice(&scope().namespace);
+                    raw[40..72].copy_from_slice(&scope().incarnation);
+                    raw[72..].copy_from_slice(&tail);
+                    let hash: [u8; 32] = Sha256::digest(&raw).into();
+                    (raw, hash)
+                };
+                let (raw, hash) = page([0, 255, 0, 1]);
+                counting.take();
+                pages.write_immutable(raw.clone(), &hash, &charge).await?;
+                let calls = counting.take();
+                assert_eq!((calls.reads.len(), calls.writes.len()), (0, 1));
+                // Identical bytes already stored: the create is rejected and accepted.
+                pages.write_immutable(raw.clone(), &hash, &charge).await?;
+                let calls = counting.take();
+                assert_eq!((calls.reads.len(), calls.writes.len()), (0, 1));
+                // Different bytes under the same name never succeed.
+                let (_, other_hash) = page([9, 9, 9, 9]);
+                let (other_raw, _) = page([9, 9, 9, 9]);
+                let key = pages.immutable_key(&other_hash);
+                let mut wrong = other_raw.clone();
+                wrong[75] ^= 1;
+                local.put(&key, Bytes::from(wrong)).await?;
+                assert!(
+                    pages
+                        .write_immutable(other_raw, &other_hash, &charge)
+                        .await
+                        .is_err()
+                );
+                // The same discipline for framed data objects.
+                let frame = DataFrame::encode(&pages, "logical/id", b"payload")?;
+                pages.upload_data("data/one", frame.bytes()).await?;
+                pages.upload_data("data/one", frame.bytes()).await?;
+                let calls = counting.take();
+                assert_eq!(calls.reads.len(), 0);
+                let same_identity = DataFrame::encode(&pages, "logical/id", b"different")?;
+                assert!(
+                    pages
+                        .upload_data("data/one", same_identity.bytes())
+                        .await
+                        .is_err()
+                );
+                let other_identity = DataFrame::encode(&pages, "another/id", b"payload")?;
+                assert!(
+                    pages
+                        .upload_data("data/one", other_identity.bytes())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(local.get("data/one").await?.unwrap(), frame.bytes());
+                assert_eq!(counting.take().reads.len(), 0);
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }

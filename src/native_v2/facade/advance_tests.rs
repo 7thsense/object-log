@@ -81,9 +81,7 @@ async fn advanced_writer_appends_without_refresh_and_reads_back() {
         assert_eq!(writes.iter().filter(|k| k.ends_with("/head")).count(), 1);
         assert!(writes.last().unwrap().ends_with("/head"));
         if n > 0 {
-            // Every read is the probe before one immutable write: the index
-            // position is retained, so none of them reads the right spine.
-            assert_eq!(calls.reads.len(), writes.len() - 1, "append {n}");
+            assert_eq!(calls.reads, Vec::<String>::new(), "append {n}");
         }
     }
     let cut = log.capture(&namespace).await.unwrap();
@@ -202,5 +200,95 @@ async fn conflicting_publish_and_stale_writer_store_no_head_and_cannot_advance()
         fenced
     );
     other.shutdown().await.unwrap();
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_thousand_advanced_appends_make_zero_reads_and_exact_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let (log, store) = counting_log(directory.path(), "zero-read");
+    let namespace = log.provision_new(b"queue").await.unwrap();
+    let writer = log.acquire(&namespace).await.unwrap();
+    // The first append builds the writer's position; it has no tree to read yet.
+    append_one(&log, &writer, 0).await.unwrap();
+    store.take();
+    let mut per_append = std::collections::BTreeMap::<usize, usize>::new();
+    for n in 1..=1000u64 {
+        append_one(&log, &writer, n).await.unwrap();
+        let calls = store.take();
+        assert_eq!(calls.reads, Vec::<String>::new(), "append {n}");
+        // Two identity pages, one data frame, the index pages that changed
+        // (one leaf; a split adds the new leaf and the rewritten parent), one head.
+        let index_pages = if n < LEAF_SLOTS_PER_PAGE { 1 } else { 2 };
+        assert_eq!(calls.writes.len(), 3 + index_pages + 1, "append {n}");
+        assert!(calls.writes.last().unwrap().ends_with("/head"));
+        *per_append.entry(calls.writes.len()).or_default() += 1;
+    }
+    eprintln!("writes per append (writes -> appends): {per_append:?}");
+    // The tree crossed a leaf split, root growth and many more splits.
+    let cut = log.capture(&namespace).await.unwrap();
+    assert_eq!(cut.head().bounds(), (0, 1001));
+    assert_eq!(cut.head().index_root().unwrap().height, 1);
+    // A new acquisition has no position: its first append reads the right
+    // spine, h + 1 pages, and the rest are read-free again.
+    let writer = log.acquire(&namespace).await.unwrap();
+    store.take();
+    append_one(&log, &writer, 1001).await.unwrap();
+    assert_eq!(store.take().reads.len(), 2);
+    for n in 1002..1010 {
+        append_one(&log, &writer, n).await.unwrap();
+        assert_eq!(store.take().reads, Vec::<String>::new());
+    }
+    log.shutdown().await.unwrap();
+}
+const LEAF_SLOTS_PER_PAGE: u64 = super::super::codec::LEAF_SLOTS as u64;
+
+#[tokio::test]
+async fn advanced_groups_of_many_entries_read_nothing_and_read_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let (log, store) = counting_log(directory.path(), "groups");
+    let namespace = log.provision_new(b"queue").await.unwrap();
+    let writer = log.acquire(&namespace).await.unwrap();
+    let mut next = 0u64;
+    let mut expected = Vec::new();
+    for round in 0..30u64 {
+        let width = 1 + (round % 5) as usize;
+        let identities: Vec<_> = (0..width).map(|i| format!("group-{round}-{i}")).collect();
+        let payloads: Vec<_> = (0..width)
+            .map(|i| format!("payload-{round}-{i}").into_bytes())
+            .collect();
+        let inputs: Vec<_> = (0..width)
+            .map(|i| NativeAppend {
+                identity: &identities[i],
+                payload: &payloads[i],
+                records: 1 + (i % 2) as u32,
+            })
+            .collect();
+        store.take();
+        let publication = log.prepare(&writer, &inputs).await.unwrap();
+        assert!(matches!(
+            log.submit(&publication).await.unwrap(),
+            NativePublishOutcome::Stored(_)
+        ));
+        log.advance_writer(&writer, &publication).await.unwrap();
+        if round > 0 {
+            assert_eq!(store.take().reads, Vec::<String>::new(), "round {round}");
+        }
+        for input in &inputs {
+            expected.push((next, input.records, input.payload.to_vec()));
+            next += u64::from(input.records);
+        }
+    }
+    let cut = log.capture(&namespace).await.unwrap();
+    assert_eq!(cut.head().bounds(), (0, next));
+    for (base, records, payload) in expected {
+        for offset in base..base + u64::from(records) {
+            let record = log.read(&cut, offset).await.unwrap().unwrap();
+            assert_eq!(
+                (record.base_offset(), record.record_count(), record.bytes()),
+                (base, records, &payload[..])
+            );
+        }
+    }
     log.shutdown().await.unwrap();
 }
