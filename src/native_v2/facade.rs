@@ -663,6 +663,28 @@ impl NativeLog {
         })
         .await
     }
+    /// Adopt the head that `publication` stored as the writer's captured head,
+    /// making no storage request, so the next `prepare` needs no refresh.
+    ///
+    /// Fails unless `publication` was stored by this writer family and directly
+    /// extends the writer's current captured head in its acquired epoch. After an
+    /// error the writer is unchanged; use `resolve` and `refresh_writer`.
+    pub async fn advance_writer(
+        &self,
+        writer: &NativeWriter,
+        publication: &NativePublication,
+    ) -> Result<NativeHead, ObjectLogError> {
+        self.check(&writer.origin)?;
+        self.check(&publication.origin)?;
+        let mut writer = writer.inner.lock().await;
+        let WriterBinding {
+            writer: fenced,
+            binding,
+            head_key,
+            ..
+        } = &mut *writer;
+        publication.attempt.adopt(fenced, binding, head_key).await
+    }
     /// Submit the retained original transition once; errors require original resolution.
     pub async fn submit(
         &self,
@@ -820,6 +842,9 @@ impl NativeLog {
 fn invalid(message: &str) -> ObjectLogError {
     ObjectLogError::InvalidBatch(message.into())
 }
+
+#[cfg(test)]
+mod advance_tests;
 
 #[cfg(test)]
 mod tests {

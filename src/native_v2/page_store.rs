@@ -213,6 +213,11 @@ pub(super) struct PageBinding {
     allocation: usize,
     _binding_charge: Arc<Charge>,
 }
+impl PageBinding {
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
 pub(super) struct PageStore {
     store: Arc<dyn NativeStore>,
     identity: Arc<()>,
@@ -592,7 +597,7 @@ impl PageStore {
             )
             .await?
         {
-            MetadataSwap::Stored => Ok(()),
+            MetadataSwap::Stored(_) => Ok(()),
             MetadataSwap::Conflict(current) if current.bytes() == Some(source.as_ref()) => Ok(()),
             MetadataSwap::Conflict(_) => Err(ObjectLogError::Sequencer(
                 "immutable data publication conflicts".into(),

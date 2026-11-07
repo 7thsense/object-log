@@ -31,6 +31,7 @@ SELECTORS = (
     ("--lib", "native_v2::head::tests::real_s3_lost_response_processing_resolves_after_later_append_without_resubmission"),
     ("--lib", "native_v2::head::tests::coupled::coupled_s3_atomic_state_work_orphans_and_lost_reply_both_signing_modes"),
     ("--test", "native_facade", "external_s3_common_append_reopen_contract_both_signing_modes"),
+    ("--test", "native_facade", "external_s3_advancing_writer_chains_etags_both_signing_modes"),
     ("--test", "native_semantic", "public_semantic_s3_coupled_state_and_scan_both_signing_modes"),
 )
 
@@ -200,7 +201,7 @@ def main():
                         test(["cargo", "test", "--features", "native,s3", *selector,
                               "--", "--ignored", "--exact"], env, 1)
                     require(server.poll() is None, "owned RustFS exited during qualification")
-                    print("PASS: 3 S3 adapter tests and 9 mandatory native provider selectors", flush=True)
+                    print("PASS: 3 S3 adapter tests and 10 mandatory native provider selectors", flush=True)
                 except BaseException:
                     log.flush()
                     log.seek(0, os.SEEK_END)

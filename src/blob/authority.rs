@@ -126,8 +126,10 @@ impl MetadataSnapshot {
 /// durable publication and must never be interpreted as definite rejection.
 #[derive(Debug)]
 pub enum MetadataSwap {
-    /// The proposed bytes were durably stored.
-    Stored,
+    /// The proposed bytes were durably stored. The snapshot is exactly what was
+    /// stored, carrying the new version token, so a caller can issue its next
+    /// conditional write without rereading.
+    Stored(MetadataSnapshot),
     /// The observed version did not match; contains a bounded fresh observation.
     Conflict(MetadataSnapshot),
 }
@@ -354,12 +356,23 @@ impl BoundedMetadataStore for LocalBlobStore {
                     hook.release.lock().unwrap().recv().unwrap();
                     assert!(!hook.panic, "injected physical metadata panic");
                 }
-                LocalBlobStore::durable_publish_chunks(path, vec![new_value], &key)?;
-                Ok(MetadataSwap::Stored)
+                let stored = new_value.clone();
+                LocalBlobStore::durable_publish_chunks(path.clone(), vec![new_value], &key)?;
+                // Still under the CAS lock: this stat is the version a reread would see.
+                let version = LocalVersion::from(&std::fs::metadata(&path)?);
+                Ok(MetadataSwap::Stored(MetadataSnapshot {
+                    inner: Arc::new(crate::blob::authority::MetadataObservation {
+                        _retained: Arc::clone(&_physical.retained),
+                        owner: current.inner.owner.clone(),
+                        key,
+                        bytes: Some(stored),
+                        version: MetadataVersion::Local(Some(version)),
+                    }),
+                }))
             })
             .await
             .map_err(|error| ObjectLogError::StorageUnavailable(error.to_string()))??;
-        if matches!(result, MetadataSwap::Stored) {
+        if matches!(result, MetadataSwap::Stored(_)) {
             self.record_put(size);
             #[cfg(test)]
             if lose_reply {

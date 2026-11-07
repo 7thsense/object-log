@@ -49,6 +49,8 @@ impl WorkBudget {
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+pub(super) use test_support::CountingStore as TestCountingStore;
+#[cfg(test)]
 pub(super) use test_support::GatedStore as TestGatedStore;
 #[cfg(test)]
 mod tests;

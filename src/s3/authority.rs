@@ -232,6 +232,7 @@ impl BoundedMetadataStore for S3BlobStore {
             }
         };
         let size = new_value.len() as u64;
+        let stored_bytes = new_value.clone();
         let request =
             self.client
                 .put_object()
@@ -266,9 +267,24 @@ impl BoundedMetadataStore for S3BlobStore {
             request.send().await
         };
         match result {
-            Ok(_) => {
+            Ok(output) => {
                 self.record_media(1, size);
-                Ok(MetadataSwap::Stored)
+                // The write is durable but unusable as a version without its
+                // ETag. That is an unknown outcome for the caller, never a read.
+                let etag = output
+                    .e_tag()
+                    .filter(|s| !s.is_empty() && s.len() <= limits.version_bytes)
+                    .ok_or_else(|| unavailable("stored metadata response lacks version"))?
+                    .to_owned();
+                Ok(MetadataSwap::Stored(MetadataSnapshot {
+                    inner: Arc::new(crate::blob::authority::MetadataObservation {
+                        _retained: Arc::clone(&owners.retained),
+                        owner: Arc::clone(&self.authority_identity),
+                        key: key.to_owned(),
+                        bytes: Some(stored_bytes),
+                        version: MetadataVersion::S3(Some(etag)),
+                    }),
+                }))
             }
             Err(error)
                 if status.load(Ordering::Relaxed) == 412 || s3_precondition_failed(&error) =>

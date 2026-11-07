@@ -36,7 +36,7 @@ async fn sdk_metadata_token_exact_budget_preserves_opaque_quotes_and_rejects_bef
     for token_bytes in [token.len(), token.len() - 1] {
         let (endpoint, stop, worker) = server(
             response("200 OK", b"old!", Some(&token)),
-            Some(response("200 OK", b"", None)),
+            Some(response("200 OK", b"", Some("\"stored\""))),
             response("200 OK", b"new!", Some(&token)),
         );
         let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
@@ -75,7 +75,7 @@ async fn sdk_metadata_token_exact_budget_preserves_opaque_quotes_and_rejects_bef
                     )
                     .await
                     .unwrap(),
-                MetadataSwap::Stored
+                MetadataSwap::Stored(_)
             ));
         } else {
             assert!(observed.is_err());
@@ -187,7 +187,7 @@ async fn sdk_put_success_token_exact_limit_or_ambiguous_after_one_write() {
                 )
                 .await;
             if version_bytes == token.len() {
-                assert!(matches!(result.unwrap(), MetadataSwap::Stored));
+                assert!(matches!(result.unwrap(), MetadataSwap::Stored(_)));
             } else {
                 assert!(
                     result.is_err(),
@@ -245,6 +245,8 @@ fn scripted_server(
                 }
                 Err(e) => panic!("{e}"),
             };
+            // Accepted sockets inherit the listener's nonblocking mode on some platforms.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -301,7 +303,7 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
         let initial = response("200 OK", b"old!", Some("\"version-one\""));
         let (endpoint, stop, worker) = server(
             initial,
-            Some(response("200 OK", b"", None)),
+            Some(response("200 OK", b"", Some("\"stored\""))),
             response("200 OK", b"new!", Some("\"version-two\"")),
         );
         let store = owned_store(&endpoint, "us-east-1", "bucket", "key", "secret");
@@ -363,7 +365,7 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
                     )
                     .await
                     .unwrap(),
-                MetadataSwap::Stored
+                MetadataSwap::Stored(_)
             ));
         } else {
             assert!(observed.is_err());
@@ -434,7 +436,7 @@ async fn sdk_bounded_metadata_exact_budget_tokens_and_conflict_rereads() {
 #[tokio::test]
 async fn sdk_native_head_root_preservation_missing_and_lost_reply() {
     let initial = head();
-    for put in [Some(response("200 OK", b"", None)), None] {
+    for put in [Some(response("200 OK", b"", Some("\"stored\""))), None] {
         let success = put.is_some();
         let (endpoint, stop, worker) = server(
             response("200 OK", &initial.encode(), Some("\"old\"")),
@@ -495,7 +497,7 @@ async fn sdk_native_head_root_preservation_missing_and_lost_reply() {
     }
     let (endpoint, stop, worker) = server(
         response("404 Not Found", &xml("NoSuchKey"), None),
-        Some(response("200 OK", b"", None)),
+        Some(response("200 OK", b"", Some("\"stored\""))),
         response("404 Not Found", b"", None),
     );
     let reader = NativeHeadReader::new_known(
@@ -548,7 +550,7 @@ async fn sdk_native_head_conflict_floor_and_higher_fence_preserve_roots() {
             response("200 OK", &initial.encode(), Some("\"old\"")),
             vec![
                 Some(response("412 Precondition Failed", b"", None)),
-                Some(response("200 OK", b"", None)),
+                Some(response("200 OK", b"", Some("\"stored\""))),
             ],
             response("200 OK", &current.encode(), Some("\"winner\"")),
         );
@@ -708,7 +710,7 @@ async fn sdk_metadata_rejects_unsupported_framing_before_waiting_for_bodies() {
 async fn sdk_bounded_writes_classify_single_attempt_in_both_signing_modes() {
     for disabled in [false, true] {
         for put in [
-            Some(response("200 OK", b"", None)),
+            Some(response("200 OK", b"", Some("\"stored\""))),
             None,
             Some(response(
                 "409 Conflict",
@@ -717,10 +719,14 @@ async fn sdk_bounded_writes_classify_single_attempt_in_both_signing_modes() {
             )),
             Some(response("409 Conflict", &xml("OtherConflict"), None)),
             Some(response("200 OK", &xml("InternalError"), None)),
+            // A durable-looking reply without a version cannot be used: unknown outcome.
+            Some(response("200 OK", b"", None)),
         ] {
-            let success = put
-                .as_ref()
-                .is_some_and(|r| r.starts_with(b"HTTP/1.1 200") && r.ends_with(b"\r\n\r\n"));
+            let success = put.as_ref().is_some_and(|r| {
+                r.starts_with(b"HTTP/1.1 200")
+                    && r.ends_with(b"\r\n\r\n")
+                    && r.windows(5).any(|w| w == b"ETag:")
+            });
             let conflict = put
                 .as_ref()
                 .is_some_and(|r| r.windows(26).any(|w| w == b"ConditionalRequestConflict"));
@@ -745,7 +751,10 @@ async fn sdk_bounded_writes_classify_single_attempt_in_both_signing_modes() {
                 )
                 .await;
             if success {
-                assert!(matches!(result, Ok(MetadataSwap::Stored)));
+                let Ok(MetadataSwap::Stored(stored)) = result else {
+                    panic!("expected stored")
+                };
+                assert_eq!(stored.bytes(), Some(&b"next"[..]));
             } else if conflict {
                 assert!(matches!(result, Ok(MetadataSwap::Conflict(_))));
             } else {

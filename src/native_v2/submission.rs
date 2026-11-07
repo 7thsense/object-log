@@ -96,6 +96,22 @@ impl PublicationAttempt {
         }
     }
 
+    /// Adopt this attempt's stored head as the writer's captured head, without I/O.
+    pub async fn adopt(
+        &self,
+        writer: &mut super::head::FencedHead,
+        binding: &PageBinding,
+        head_key: &str,
+    ) -> Result<super::head::NativeHead, ObjectLogError> {
+        if !self.binding.same(binding) || self.head_key != head_key {
+            return Err(ObjectLogError::Sequencer(
+                "publication belongs to another writer binding".into(),
+            ));
+        }
+        let prepared = self.prepared.lock().await;
+        writer.adopt(&prepared).await
+    }
+
     /// Resolution always observes storage using the retained original cut and
     /// ordered certificates. DurableContent is content proof, not writer identity.
     pub async fn resolve(
@@ -188,7 +204,7 @@ mod tests {
                     pages
                         .swap_head("namespace/head", empty, &NativeHead::empty(scope).encode())
                         .await?,
-                    MetadataSwap::Stored
+                    MetadataSwap::Stored(_)
                 ));
                 let captured = CapturedHead::capture(&pages, "namespace/head").await?;
                 let writer = captured

@@ -8,7 +8,9 @@ use crate::{
     },
 };
 use std::sync::Arc;
+mod counting_store;
 mod gated_store;
+pub(in crate::native_v2) use counting_store::CountingStore;
 pub(in crate::native_v2) use gated_store::GatedStore;
 pub(super) fn scope() -> Scope {
     Scope {

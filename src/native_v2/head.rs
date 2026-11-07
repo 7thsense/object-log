@@ -350,6 +350,8 @@ pub(super) struct PreparedAppend {
     original: CapturedHead,
     next: NativeHead,
     attempted: bool,
+    /// What the original conditional write stored, once it definitely did.
+    stored: Option<MetadataSnapshot>,
     certificates: OwnedCertificates,
     lineage: Arc<WriterLineage>,
 }
@@ -476,7 +478,8 @@ impl PreparedAppend {
             .swap_head(key, self.original.observed.clone(), &self.next.encode())
             .await?
         {
-            MetadataSwap::Stored => {
+            MetadataSwap::Stored(stored) => {
+                self.stored = Some(stored);
                 lineage.floor = self.next;
                 Ok(PublishOutcome::Stored(self.next))
             }
@@ -546,6 +549,42 @@ impl FencedHead {
     }
     pub fn snapshot(&self) -> &CapturedHead {
         &self.captured
+    }
+    /// Adopt, without I/O, the head that `prepared` definitely stored as this
+    /// writer's captured head. Only the direct successor of the current captured
+    /// head, from this same writer family, in its acquired epoch, can be adopted.
+    pub(super) async fn adopt(
+        &mut self,
+        prepared: &PreparedAppend,
+    ) -> Result<NativeHead, ObjectLogError> {
+        let stored = prepared
+            .stored
+            .as_ref()
+            .ok_or_else(|| invalid("publication was not stored"))?;
+        if !Arc::ptr_eq(&prepared.lineage, &self.lineage) {
+            return Err(invalid("publication belongs to another writer"));
+        }
+        if !self.captured.same_cut(&prepared.original) {
+            return Err(invalid(
+                "publication does not extend the writer's captured head",
+            ));
+        }
+        if !Arc::ptr_eq(&stored.inner.owner, &self.captured.observed.inner.owner)
+            || stored.inner.key != self.captured.observed.inner.key
+            || stored.bytes() != Some(prepared.next.encode().as_slice())
+        {
+            return Err(invalid("stored head differs from the prepared transition"));
+        }
+        let state = self.lineage.gate.lock().await;
+        if state.highest_epoch > self.lineage.acquired_epoch || state.floor != prepared.next {
+            return Err(invalid("writer authority changed before adoption"));
+        }
+        self.captured = CapturedHead {
+            head: prepared.next,
+            observed: stored.clone(),
+            identity: self.captured.identity.clone(),
+        };
+        Ok(prepared.next)
     }
     #[cfg(test)]
     pub async fn prepare_append(
@@ -798,6 +837,7 @@ impl FencedHead {
             original: captured,
             next,
             attempted: false,
+            stored: None,
             certificates,
             lineage,
         })
@@ -1015,7 +1055,7 @@ impl CapturedHead {
             .swap_head(key, self.observed.clone(), &fenced.encode())
             .await?
         {
-            MetadataSwap::Stored => Ok(fenced),
+            MetadataSwap::Stored(_) => Ok(fenced),
             MetadataSwap::Conflict(_) => Err(invalid("captured head changed before acquisition")),
         }
     }
@@ -1057,7 +1097,7 @@ impl CapturedHead {
             .swap_head(key, self.observed.clone(), &fenced.encode())
             .await?
         {
-            MetadataSwap::Stored => {}
+            MetadataSwap::Stored(_) => {}
             MetadataSwap::Conflict(observed) => {
                 WriterLineage::validate(&mut state, pages.clone(), observed).await?;
                 return Err(invalid("captured head changed before acquisition"));
@@ -1313,7 +1353,7 @@ impl Owner {
                 )
                 .await?
             {
-                MetadataSwap::Stored => return Ok(head),
+                MetadataSwap::Stored(_) => return Ok(head),
                 MetadataSwap::Conflict(current) => observed = current,
             }
         }

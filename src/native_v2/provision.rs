@@ -279,7 +279,7 @@ impl NativeProvisionAttempt {
             .swap_head(&self.head_key, observed, &expected.encode())
             .await?
         {
-            MetadataSwap::Stored => {}
+            MetadataSwap::Stored(_) => {}
             MetadataSwap::Conflict(_) => return Err(invalid("incarnation collision")),
         }
         let captured = CapturedHead::capture(&self.pages, &self.head_key).await?;
