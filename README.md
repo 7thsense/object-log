@@ -37,7 +37,7 @@ Prints dd / B0 / B1 / B2 (zeros, fair timers). See TD-004.
 
 ```toml
 [dependencies]
-object-log = "0.3"
+object-log = "0.4"
 ```
 
 ```rust
