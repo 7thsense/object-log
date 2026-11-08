@@ -9,9 +9,11 @@ use crate::{
     ObjectLogError,
 };
 use bytes::Bytes;
+mod batch;
 mod immutable;
 mod scoped_bytes;
 mod transition_key;
+pub(super) use batch::{Upload, UploadBatch};
 pub(super) use scoped_bytes::{EncodedBytes, RetainedBytes};
 use std::sync::{
     Arc,
@@ -24,6 +26,8 @@ pub(super) trait NativeStore: BlobStore + BoundedMetadataStore {
         key_len: usize,
         limits: MetadataLimits,
     ) -> Result<usize, ObjectLogError>;
+    /// Observe absence of `key` without I/O, for a create-only conditional write.
+    fn absent(&self, key: &str, retained: AppendOwner) -> crate::MetadataSnapshot;
 }
 impl NativeStore for crate::LocalBlobStore {
     fn page_source_scratch(
@@ -33,6 +37,9 @@ impl NativeStore for crate::LocalBlobStore {
     ) -> Result<usize, ObjectLogError> {
         limits.validate_local()?;
         self.native_page_source_scratch(key_len)
+    }
+    fn absent(&self, key: &str, retained: AppendOwner) -> crate::MetadataSnapshot {
+        self.absent_metadata(key, retained)
     }
 }
 
@@ -45,6 +52,9 @@ impl NativeStore for crate::S3BlobStore {
     ) -> Result<usize, ObjectLogError> {
         limits.validate()?;
         self.native_page_source_scratch(key_len, limits.version_bytes)
+    }
+    fn absent(&self, key: &str, retained: AppendOwner) -> crate::MetadataSnapshot {
+        self.absent_metadata(key, retained)
     }
 }
 
@@ -183,6 +193,14 @@ impl OwnedPage {
     }
 }
 
+/// An encoded immutable page awaiting its create-only upload.
+pub(super) struct PendingPage {
+    raw: Vec<u8>,
+    hash: [u8; 32],
+    // Released only after the upload completes.
+    charge: Arc<Charge>,
+}
+
 struct UploadedPage {
     bytes: Vec<u8>,
     // Drop the complete source allocation before its reservation.
@@ -212,6 +230,11 @@ pub(super) struct PageBinding {
     scope: Scope,
     allocation: usize,
     _binding_charge: Arc<Charge>,
+}
+impl PageBinding {
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
 }
 pub(super) struct PageStore {
     store: Arc<dyn NativeStore>,
@@ -556,14 +579,27 @@ impl PageStore {
             bytes: raw.to_vec(),
             _charge: charge.clone(),
         });
-        let observed = self
+        // Create first: an existing object is read only after the store rejects
+        // the create, and must then match this frame exactly.
+        let absent = self.store.absent(key, charge.clone() as AppendOwner);
+        match self
             .store
-            .read_metadata(key, limits, self.owners(charge.clone() as AppendOwner))
-            .await?;
-        if let Some(existing) = observed.bytes() {
-            // Framed data reuse requires exact literal identity and payload;
-            // no physical-key digest can substitute for this comparison.
-            {
+            .swap_metadata(
+                key,
+                absent,
+                source.clone(),
+                limits,
+                self.owners(charge as AppendOwner),
+            )
+            .await?
+        {
+            MetadataSwap::Stored(_) => Ok(()),
+            MetadataSwap::Conflict(current) => {
+                let existing = current.bytes().ok_or_else(|| {
+                    ObjectLogError::Sequencer("immutable data publication conflicts".into())
+                })?;
+                // Framed data reuse requires exact literal identity and payload;
+                // no physical-key digest can substitute for this comparison.
                 let expected = super::data::DataFrame::decode(&source)?;
                 let actual = super::data::DataFrame::decode(existing)?;
                 if actual.identity() != expected.identity()
@@ -573,30 +609,13 @@ impl PageStore {
                         "immutable data identity differs".into(),
                     ));
                 }
+                if existing == source.as_ref() {
+                    return Ok(());
+                }
+                Err(ObjectLogError::Sequencer(
+                    "immutable data location differs".into(),
+                ))
             }
-            if existing == source.as_ref() {
-                return Ok(());
-            }
-            return Err(ObjectLogError::Sequencer(
-                "immutable data location differs".into(),
-            ));
-        }
-        match self
-            .store
-            .swap_metadata(
-                key,
-                observed,
-                source.clone(),
-                limits,
-                self.owners(charge as AppendOwner),
-            )
-            .await?
-        {
-            MetadataSwap::Stored => Ok(()),
-            MetadataSwap::Conflict(current) if current.bytes() == Some(source.as_ref()) => Ok(()),
-            MetadataSwap::Conflict(_) => Err(ObjectLogError::Sequencer(
-                "immutable data publication conflicts".into(),
-            )),
         }
     }
     pub async fn swap_head(
@@ -722,7 +741,9 @@ impl PageStore {
             _charge: charge,
         })
     }
-    pub async fn write(&self, page: OwnedPage) -> Result<Descriptor, ObjectLogError> {
+    /// Encode a page without I/O. The pending page keeps the page's reservation
+    /// until it is uploaded, even after the page itself is dropped or mutated.
+    pub fn seal(&self, page: &OwnedPage) -> Result<(Descriptor, PendingPage), ObjectLogError> {
         if !Arc::ptr_eq(&page.store_identity, &self.identity) {
             return Err(ObjectLogError::InvalidConfig(
                 "page belongs to another store binding".into(),
@@ -730,8 +751,24 @@ impl PageStore {
         }
         // Encode under the existing page reservation, retaining both capacities.
         let (raw, descriptor) = page.page.encode(self.scope)?;
-        self.write_immutable(raw, &descriptor.hash, &page._charge)
-            .await?;
+        Ok((
+            descriptor,
+            PendingPage {
+                raw,
+                hash: descriptor.hash,
+                charge: page._charge.clone(),
+            },
+        ))
+    }
+    #[cfg(test)]
+    pub async fn upload(&self, pending: PendingPage) -> Result<(), ObjectLogError> {
+        self.write_immutable(pending.raw, &pending.hash, &pending.charge)
+            .await
+    }
+    #[cfg(test)]
+    pub async fn write(&self, page: OwnedPage) -> Result<Descriptor, ObjectLogError> {
+        let (descriptor, pending) = self.seal(&page)?;
+        self.upload(pending).await?;
         Ok(descriptor)
     }
 }

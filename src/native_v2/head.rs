@@ -350,6 +350,10 @@ pub(super) struct PreparedAppend {
     original: CapturedHead,
     next: NativeHead,
     attempted: bool,
+    /// What the original conditional write stored, once it definitely did.
+    stored: Option<MetadataSnapshot>,
+    /// The index position that reaches `next`, for the writer that publishes it.
+    spine: Option<super::index::Spine>,
     certificates: OwnedCertificates,
     lineage: Arc<WriterLineage>,
 }
@@ -476,7 +480,8 @@ impl PreparedAppend {
             .swap_head(key, self.original.observed.clone(), &self.next.encode())
             .await?
         {
-            MetadataSwap::Stored => {
+            MetadataSwap::Stored(stored) => {
+                self.stored = Some(stored);
                 lineage.floor = self.next;
                 Ok(PublishOutcome::Stored(self.next))
             }
@@ -535,17 +540,76 @@ impl OwnedPayload {
     }
 }
 /// Writer authority is constructed only by a successful fence and exact recapture.
-#[derive(Clone)]
 pub(super) struct FencedHead {
     captured: CapturedHead,
     lineage: Arc<WriterLineage>,
+    /// The writer's position in the index, once an append has built it. It never
+    /// outlives an acquisition or refresh and a clone does not share it.
+    spine: Option<super::index::Spine>,
+}
+impl Clone for FencedHead {
+    fn clone(&self) -> Self {
+        Self {
+            captured: self.captured.clone(),
+            lineage: self.lineage.clone(),
+            spine: None,
+        }
+    }
 }
 impl FencedHead {
+    /// The writer for one prepare, moving the spine into it. If that prepare
+    /// fails the writer has no spine and the next append rebuilds it by reading.
+    pub(super) fn take_for_prepare(&mut self) -> Self {
+        Self {
+            spine: self.spine.take(),
+            ..self.clone()
+        }
+    }
     pub(super) fn knowledge(&self) -> Arc<AuthorityKnowledge> {
         self.lineage._knowledge.clone()
     }
     pub fn snapshot(&self) -> &CapturedHead {
         &self.captured
+    }
+    /// Adopt, without I/O, the head that `prepared` definitely stored as this
+    /// writer's captured head. Only the direct successor of the current captured
+    /// head, from this same writer family, in its acquired epoch, can be adopted.
+    pub(super) async fn adopt(
+        &mut self,
+        prepared: &mut PreparedAppend,
+    ) -> Result<NativeHead, ObjectLogError> {
+        let stored = prepared
+            .stored
+            .as_ref()
+            .ok_or_else(|| invalid("publication was not stored"))?;
+        if !Arc::ptr_eq(&prepared.lineage, &self.lineage) {
+            return Err(invalid("publication belongs to another writer"));
+        }
+        if !self.captured.same_cut(&prepared.original) {
+            return Err(invalid(
+                "publication does not extend the writer's captured head",
+            ));
+        }
+        if !Arc::ptr_eq(&stored.inner.owner, &self.captured.observed.inner.owner)
+            || stored.inner.key != self.captured.observed.inner.key
+            || stored.bytes() != Some(prepared.next.encode().as_slice())
+        {
+            return Err(invalid("stored head differs from the prepared transition"));
+        }
+        let state = self.lineage.gate.lock().await;
+        if state.highest_epoch > self.lineage.acquired_epoch || state.floor != prepared.next {
+            return Err(invalid("writer authority changed before adoption"));
+        }
+        self.captured = CapturedHead {
+            head: prepared.next,
+            observed: stored.clone(),
+            identity: self.captured.identity.clone(),
+        };
+        self.spine = prepared
+            .spine
+            .take()
+            .filter(|spine| Some(spine.root()) == prepared.next.index_root);
+        Ok(prepared.next)
     }
     #[cfg(test)]
     pub async fn prepare_append(
@@ -719,6 +783,8 @@ impl FencedHead {
             None
         };
         let index = super::index::Index::new(pages.clone());
+        let mut spine = self.spine;
+        let mut uploads = super::page_store::UploadBatch::new();
         let mut root = captured.head.index_root;
         let mut base = captured.head.next_offset;
         for (ordinal, input) in inputs.iter().enumerate() {
@@ -749,10 +815,11 @@ impl FencedHead {
             } else {
                 pages.data_key(input.object_id)?
             };
-            let logical_id = index.store_literal_id(input.object_id).await?;
-            let identity = index.store_object_id(physical_key.as_str()).await?;
-            pages
-                .upload_data(physical_key.as_str(), frame.bytes())
+            let logical_id = index
+                .stage_literal_id(input.object_id, &mut uploads)
+                .await?;
+            let identity = index
+                .stage_object_id(physical_key.as_str(), &mut uploads)
                 .await?;
             let certificate = super::codec::LeafEntry {
                 object_id: identity,
@@ -769,10 +836,28 @@ impl FencedHead {
                     super::codec::FrameKind::Legacy
                 },
             };
-            root = Some(index.append(root, certificate).await?);
+            uploads
+                .push(
+                    &pages,
+                    super::page_store::Upload::Data {
+                        key: physical_key,
+                        frame,
+                    },
+                )
+                .await?;
+            let appended = index.append_spine(root, spine.take(), certificate).await?;
+            for page in appended.uploads {
+                uploads
+                    .push(&pages, super::page_store::Upload::Page(page))
+                    .await?;
+            }
+            root = Some(appended.root);
+            spine = Some(appended.spine);
             base = certificate.end()?;
             certificates.entries.push(certificate);
         }
+        // Every object this group references is durable before the head can name it.
+        uploads.finish(&pages).await?;
         let semantic_anchor = if let Some(map) = &prepared_map {
             let index_root =
                 root.ok_or_else(|| invalid("coupled publication has no append index"))?;
@@ -798,6 +883,8 @@ impl FencedHead {
             original: captured,
             next,
             attempted: false,
+            stored: None,
+            spine,
             certificates,
             lineage,
         })
@@ -826,6 +913,7 @@ impl FencedHead {
         Ok(Self {
             captured: current,
             lineage: self.lineage.clone(),
+            spine: None,
         })
     }
 }
@@ -1015,7 +1103,7 @@ impl CapturedHead {
             .swap_head(key, self.observed.clone(), &fenced.encode())
             .await?
         {
-            MetadataSwap::Stored => Ok(fenced),
+            MetadataSwap::Stored(_) => Ok(fenced),
             MetadataSwap::Conflict(_) => Err(invalid("captured head changed before acquisition")),
         }
     }
@@ -1057,7 +1145,7 @@ impl CapturedHead {
             .swap_head(key, self.observed.clone(), &fenced.encode())
             .await?
         {
-            MetadataSwap::Stored => {}
+            MetadataSwap::Stored(_) => {}
             MetadataSwap::Conflict(observed) => {
                 WriterLineage::validate(&mut state, pages.clone(), observed).await?;
                 return Err(invalid("captured head changed before acquisition"));
@@ -1083,7 +1171,22 @@ impl CapturedHead {
         Ok(FencedHead {
             captured: current,
             lineage,
+            spine: None,
         })
+    }
+    pub async fn lookup_run(
+        &self,
+        pages: Arc<super::page_store::PageStore>,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<super::index::OwnedEntry>, ObjectLogError> {
+        pages.require_operation()?;
+        if !Arc::ptr_eq(&self.identity, &pages.binding_identity()) {
+            return Err(invalid("captured head belongs to another store binding"));
+        }
+        super::index::Index::new(pages)
+            .lookup_run(self.head.index_root, offset, max_entries)
+            .await
     }
     pub async fn lookup(
         &self,
@@ -1313,7 +1416,7 @@ impl Owner {
                 )
                 .await?
             {
-                MetadataSwap::Stored => return Ok(head),
+                MetadataSwap::Stored(_) => return Ok(head),
                 MetadataSwap::Conflict(current) => observed = current,
             }
         }

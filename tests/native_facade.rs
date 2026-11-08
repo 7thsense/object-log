@@ -451,6 +451,137 @@ async fn external_s3_common_append_reopen_contract_both_signing_modes() {
     }
 }
 
+/// Appends through a long-lived writer that never rereads the head: every
+/// conditional write must use the version token returned by the previous one.
+async fn advancing_writer_contract(log: &NativeLog, other: &NativeLog) {
+    let namespace = log.provision_new(b"advance\0queue").await.unwrap();
+    let writer = log.acquire(&namespace).await.unwrap();
+    for n in 0..45u64 {
+        let identity = format!("advance-{n}");
+        let payload = format!("payload-{n}");
+        let publication = log
+            .prepare(
+                &writer,
+                &[NativeAppend {
+                    identity: &identity,
+                    payload: payload.as_bytes(),
+                    records: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        let head = stored(log.submit(&publication).await.unwrap());
+        assert_eq!(
+            log.advance_writer(&writer, &publication).await.unwrap(),
+            head
+        );
+        assert_eq!(head.bounds(), (0, n + 1));
+    }
+    let cut = log.capture(&namespace).await.unwrap();
+    for n in 0..45u64 {
+        let record = log.read(&cut, n).await.unwrap().unwrap();
+        assert_eq!(record.bytes(), format!("payload-{n}").as_bytes());
+    }
+    // The same records through run planning, hydrated concurrently.
+    let mut offset = 0;
+    let mut seen = 0u64;
+    while offset < 45 {
+        let plans = log.plan_range(&cut, offset, 1000).await.unwrap();
+        assert!(!plans.is_empty());
+        for plan in plans {
+            let payload = plan.payload_bytes();
+            let record = log.read_planned(plan, payload).await.unwrap();
+            assert_eq!(record.base_offset(), seen);
+            assert_eq!(record.bytes(), format!("payload-{seen}").as_bytes());
+            seen += 1;
+            offset = seen;
+        }
+    }
+    assert_eq!(seen, 45);
+    assert!(log.plan_range(&cut, 45, 4).await.unwrap().is_empty());
+    // A newer writer family changes the head; the advanced writer's token is stale.
+    let other_namespace = other.open(b"advance\0queue").await.unwrap().unwrap();
+    let _newer = other.acquire(&other_namespace).await.unwrap();
+    let publication = log
+        .prepare(
+            &writer,
+            &[NativeAppend {
+                identity: "late",
+                payload: b"late",
+                records: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        log.submit(&publication).await.unwrap(),
+        NativePublishOutcome::Conflict
+    );
+    assert!(log.advance_writer(&writer, &publication).await.is_err());
+}
+
+#[tokio::test]
+async fn external_local_advancing_writer_chains_versions_without_rereads() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = NativeLog::local(
+        LocalBlobStore::new(directory.path()),
+        "local-advance".into(),
+        limits(),
+    )
+    .unwrap();
+    let other = NativeLog::local(
+        LocalBlobStore::new(directory.path()),
+        "local-advance".into(),
+        limits(),
+    )
+    .unwrap();
+    advancing_writer_contract(&log, &other).await;
+    log.shutdown().await.unwrap();
+    other.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test]
+#[ignore = "requires an explicitly configured live S3 provider"]
+async fn external_s3_advancing_writer_chains_etags_both_signing_modes() {
+    let required =
+        |name| std::env::var(name).expect("live S3 qualification requires complete configuration");
+    let endpoint = required("OBJECT_LOG_S3_ENDPOINT");
+    let region = required("OBJECT_LOG_S3_REGION");
+    let bucket = required("OBJECT_LOG_S3_BUCKET");
+    let key = required("OBJECT_LOG_S3_KEY_ID");
+    let secret = required("OBJECT_LOG_S3_SECRET");
+    let client = |disabled| {
+        object_log::S3BlobStore::new_owned_with_options(
+            &endpoint,
+            &region,
+            &bucket,
+            &key,
+            &secret,
+            object_log::S3ClientOptions {
+                disable_payload_signing: disabled,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    for disabled in [false, true] {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let prefix = format!("native-facade-advance/{nonce}/{disabled}");
+        let log = NativeLog::s3(client(disabled), prefix.clone(), limits()).unwrap();
+        let other = NativeLog::s3(client(disabled), prefix.clone(), limits()).unwrap();
+        advancing_writer_contract(&log, &other).await;
+        log.shutdown().await.unwrap();
+        other.shutdown().await.unwrap();
+        let cleanup = client(false);
+        for object in cleanup.list(&prefix).await.unwrap() {
+            cleanup.delete(&object).await.unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn external_regressed_cas_authority_is_an_error_not_a_validated_conflict() {
     let directory = tempfile::tempdir().unwrap();

@@ -48,7 +48,7 @@ async fn local_metadata_version_limit_is_explicit_and_checked_before_io() {
             )
             .await
             .unwrap(),
-        MetadataSwap::Stored
+        MetadataSwap::Stored(_)
     ));
     assert_eq!(
         store
@@ -295,7 +295,7 @@ async fn local_metadata_exact_budget_conflict_and_token_scope_have_zero_rejected
             )
             .await
             .unwrap(),
-        MetadataSwap::Stored
+        MetadataSwap::Stored(_)
     ));
     let old = first
         .read_metadata("head", metadata_limits(4), metadata_owners(Arc::new(())))

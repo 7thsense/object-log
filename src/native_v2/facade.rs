@@ -603,7 +603,7 @@ impl NativeLog {
         let owner = self.owner.clone();
         self.run(move |physical| async move {
             let scoped = owner.pages.in_operation(physical)?;
-            let writer = writer.inner.lock().await;
+            let mut writer = writer.inner.lock().await;
             let pages = scoped.for_binding(&writer.binding)?;
             if let Some((expected, _)) = &semantic
                 && !writer.writer.snapshot().same_cut(&expected.captured)
@@ -630,7 +630,7 @@ impl NativeLog {
                 let mut work = semantic.limits.work.budget();
                 writer
                     .writer
-                    .clone()
+                    .take_for_prepare()
                     .prepare_semantic_group(
                         pages.clone(),
                         &references,
@@ -646,7 +646,7 @@ impl NativeLog {
             } else {
                 writer
                     .writer
-                    .clone()
+                    .take_for_prepare()
                     .prepare_group(pages.clone(), &references, limits)
                     .await?
             };
@@ -662,6 +662,28 @@ impl NativeLog {
             })
         })
         .await
+    }
+    /// Adopt the head that `publication` stored as the writer's captured head,
+    /// making no storage request, so the next `prepare` needs no refresh.
+    ///
+    /// Fails unless `publication` was stored by this writer family and directly
+    /// extends the writer's current captured head in its acquired epoch. After an
+    /// error the writer is unchanged; use `resolve` and `refresh_writer`.
+    pub async fn advance_writer(
+        &self,
+        writer: &NativeWriter,
+        publication: &NativePublication,
+    ) -> Result<NativeHead, ObjectLogError> {
+        self.check(&writer.origin)?;
+        self.check(&publication.origin)?;
+        let mut writer = writer.inner.lock().await;
+        let WriterBinding {
+            writer: fenced,
+            binding,
+            head_key,
+            ..
+        } = &mut *writer;
+        publication.attempt.adopt(fenced, binding, head_key).await
     }
     /// Submit the retained original transition once; errors require original resolution.
     pub async fn submit(
@@ -737,6 +759,49 @@ impl NativeLog {
                 origin: owner.identity.clone(),
                 _charge: charge,
             }))
+        })
+        .await
+    }
+    /// Authenticate consecutive entries of a fixed cut with one root-to-leaf walk.
+    ///
+    /// Returns plans for the entries from the one covering `offset` through the
+    /// end of that leaf, at most `max_entries`; call again from the next entry's
+    /// offset to continue. Empty at or past the cut's end. Each plan is hydrated
+    /// with `read_planned` exactly as one from `plan_read`, so payloads can be
+    /// fetched concurrently. `max_entries` must be nonzero.
+    pub async fn plan_range(
+        &self,
+        cut: &NativeReadCut,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<NativeReadPlan>, ObjectLogError> {
+        self.check(&cut.origin)?;
+        if max_entries == 0 {
+            return Err(ObjectLogError::InvalidConfig(
+                "native plan range needs at least one entry".into(),
+            ));
+        }
+        let read = cut.retained();
+        let owner = self.owner.clone();
+        self.run(move |physical| async move {
+            let pages = owner
+                .pages
+                .in_operation(physical)?
+                .for_binding(&read.binding)?;
+            let entries = read
+                .captured
+                .lookup_run(pages.clone(), offset, max_entries)
+                .await?;
+            let mut plans = Vec::with_capacity(entries.len());
+            for entry in entries {
+                plans.push(NativeReadPlan {
+                    entry,
+                    binding: read.binding.clone(),
+                    origin: owner.identity.clone(),
+                    _charge: pages.charge_output(std::mem::size_of::<NativeReadPlan>())?,
+                });
+            }
+            Ok(plans)
         })
         .await
     }
@@ -820,6 +885,9 @@ impl NativeLog {
 fn invalid(message: &str) -> ObjectLogError {
     ObjectLogError::InvalidBatch(message.into())
 }
+
+#[cfg(test)]
+mod advance_tests;
 
 #[cfg(test)]
 mod tests {

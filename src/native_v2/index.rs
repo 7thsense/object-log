@@ -4,15 +4,61 @@ use super::codec::{
     BRANCH_SLOTS, DESCRIPTOR_BYTES, Descriptor, HEADER, Kind, LEAF_SLOTS, LeafEntry, MAX_HEIGHT,
     PAGE_BYTES,
 };
-use super::page_store::{Charge, OwnedPage, PageStore, PageView};
+use super::page_store::{Charge, OwnedPage, PageStore, PageView, PendingPage, Upload, UploadBatch};
 use crate::ObjectLogError;
 use std::sync::Arc;
 
 pub(super) struct Index {
     pages: Arc<PageStore>,
 }
+/// The owned pages from an index root to its rightmost leaf: a writer's position,
+/// not a cache. It is used only when its root equals the root being extended,
+/// otherwise it is dropped and rebuilt by reading. Each page holds its own byte
+/// reservation, and there are at most `MAX_HEIGHT + 1` of them.
+pub(super) struct Spine {
+    root: Descriptor,
+    // Root to leaf, each with the descriptor of its current encoding.
+    levels: Vec<(Descriptor, OwnedPage)>,
+}
+impl Spine {
+    pub fn root(&self) -> Descriptor {
+        self.root
+    }
+    fn extends(&self, root: Descriptor) -> bool {
+        if self.root != root
+            || self.levels.is_empty()
+            || self.levels.len() > MAX_HEIGHT as usize + 1
+            || self.levels[0].0 != root
+        {
+            return false;
+        }
+        self.levels
+            .iter()
+            .enumerate()
+            .all(
+                |(depth, (descriptor, page))| match (page.view(), self.levels.get(depth + 1)) {
+                    (PageView::Branch { children, .. }, Some((below, _))) => {
+                        children.last() == Some(below) && descriptor.height == below.height + 1
+                    }
+                    (PageView::Leaf(entries), None) => {
+                        descriptor.height == 0
+                            && entries.last().and_then(|e| e.end().ok()) == Some(root.end)
+                    }
+                    _ => false,
+                },
+            )
+    }
+}
+/// A new root, the spine that reaches it, and the pages that must be stored
+/// before anything references that root.
+pub(super) struct Appended {
+    pub root: Descriptor,
+    pub spine: Spine,
+    pub uploads: Vec<PendingPage>,
+}
 pub(super) struct OwnedEntry {
-    page: OwnedPage,
+    // Entries of one run share their leaf, which keeps its single reservation.
+    page: Arc<OwnedPage>,
     slot: usize,
 }
 impl OwnedEntry {
@@ -109,27 +155,45 @@ impl Index {
         root: Option<Descriptor>,
         offset: u64,
     ) -> Result<Option<OwnedEntry>, ObjectLogError> {
+        Ok(self.lookup_run(root, offset, 1).await?.pop())
+    }
+
+    /// One root-to-leaf walk, then up to `max_entries` consecutive entries from the
+    /// one covering `offset` to the end of its leaf. Empty at or past the root's end.
+    pub async fn lookup_run(
+        &self,
+        root: Option<Descriptor>,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<OwnedEntry>, ObjectLogError> {
         let Some(mut cursor) = root else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         cursor.validate()?;
         if cursor.kind == Kind::Overflow || offset < cursor.start {
             return Err(invalid("offset root or retained range"));
         }
         if offset >= cursor.end {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         for _ in 0..=MAX_HEIGHT {
             let page = self.pages.read(cursor).await?;
             match page.view() {
                 PageView::Leaf(entries) => {
-                    let slot = entries
+                    let first = entries
                         .iter()
                         .position(|entry| {
                             entry.base <= offset && entry.end().is_ok_and(|end| offset < end)
                         })
                         .ok_or_else(|| invalid("leaf does not cover requested offset"))?;
-                    return Ok(Some(OwnedEntry { page, slot }));
+                    let last = entries.len().min(first.saturating_add(max_entries));
+                    let page = Arc::new(page);
+                    return Ok((first..last)
+                        .map(|slot| OwnedEntry {
+                            page: page.clone(),
+                            slot,
+                        })
+                        .collect());
                 }
                 PageView::Branch { children, .. } => {
                     cursor = *children
@@ -144,11 +208,27 @@ impl Index {
     }
 
     /// Input is borrowed; reserve complete identity capacity before chunk copies.
+    #[cfg(test)]
     pub async fn store_object_id(&self, value: &str) -> Result<Descriptor, ObjectLogError> {
-        validate_object_id(value)?;
-        self.store_literal_id(value).await
+        let mut batch = UploadBatch::new();
+        let descriptor = self.stage_object_id(value, &mut batch).await?;
+        batch.finish(&self.pages).await?;
+        Ok(descriptor)
     }
-    pub async fn store_literal_id(&self, value: &str) -> Result<Descriptor, ObjectLogError> {
+    pub async fn stage_object_id(
+        &self,
+        value: &str,
+        batch: &mut UploadBatch,
+    ) -> Result<Descriptor, ObjectLogError> {
+        validate_object_id(value)?;
+        self.stage_literal_id(value, batch).await
+    }
+    /// Encode the identity's chunk pages, queueing each for the batch's upload.
+    pub async fn stage_literal_id(
+        &self,
+        value: &str,
+        batch: &mut UploadBatch,
+    ) -> Result<Descriptor, ObjectLogError> {
         if value.is_empty() || value.contains('\0') {
             return Err(invalid("literal identity"));
         }
@@ -166,7 +246,9 @@ impl Index {
         {
             start -= bytes.len();
             let page = self.pages.overflow(start as u64, bytes, next)?;
-            next = Some(self.pages.write(page).await?);
+            let (descriptor, pending) = self.pages.seal(&page)?;
+            batch.push(&self.pages, Upload::Page(pending)).await?;
+            next = Some(descriptor);
         }
         next.ok_or_else(|| invalid("empty physical object identity"))
     }
@@ -220,95 +302,159 @@ impl Index {
         })
     }
 
-    /// Caller supplies an internally authored uploaded-entry certificate. This
-    /// module alone cannot publish a head or authorize semantic replay skipping.
+    /// Convenience over `append_spine` for tests and fixtures: reads the spine.
+    #[cfg(test)]
     pub async fn append(
         &self,
         root: Option<Descriptor>,
         entry: LeafEntry,
     ) -> Result<Descriptor, ObjectLogError> {
+        let appended = self.append_spine(root, None, entry).await?;
+        for page in appended.uploads {
+            self.pages.upload(page).await?;
+        }
+        Ok(appended.root)
+    }
+
+    /// Caller supplies an internally authored uploaded-entry certificate. This
+    /// module alone cannot publish a head or authorize semantic replay skipping.
+    ///
+    /// Extend `root` by one entry. With a spine that reaches `root` nothing is
+    /// read; without one the right spine is read, `h + 1` pages. Encodes only:
+    /// the caller must upload every returned page before referencing the root.
+    pub async fn append_spine(
+        &self,
+        root: Option<Descriptor>,
+        spine: Option<Spine>,
+        entry: LeafEntry,
+    ) -> Result<Appended, ObjectLogError> {
         entry.end()?;
         let Some(root) = root else {
             if entry.base != 0 {
                 return Err(invalid("first append is not offset zero"));
             }
-            return self.pages.write(self.pages.leaf(&[entry])?).await;
+            let leaf = self.pages.leaf(&[entry])?;
+            let (descriptor, pending) = self.pages.seal(&leaf)?;
+            return Ok(Appended {
+                root: descriptor,
+                spine: Spine {
+                    root: descriptor,
+                    levels: vec![(descriptor, leaf)],
+                },
+                uploads: vec![pending],
+            });
         };
         root.validate()?;
         if root.kind == Kind::Overflow || root.start != 0 || root.end != entry.base {
             return Err(invalid("append root or original assigned range"));
         }
         // Bounded frame capacity is reserved before allocating the path.
-        let _path_charge = self
-            .pages
-            .charge_output(MAX_HEIGHT as usize * std::mem::size_of::<OwnedPage>())?;
-        let mut path = Vec::with_capacity(MAX_HEIGHT as usize);
-        let mut cursor = root;
-        let mut leaf;
-        loop {
-            let page = self.pages.read(cursor).await?;
-            match page.view() {
-                PageView::Leaf(_) => {
-                    leaf = page;
-                    break;
-                }
-                PageView::Branch { children, .. } => {
-                    if path.len() == MAX_HEIGHT as usize {
-                        return Err(invalid("append path height limit"));
-                    }
-                    cursor = *children
-                        .last()
-                        .ok_or_else(|| invalid("empty append branch"))?;
-                    path.push(page);
-                }
-                PageView::Overflow { .. } => return Err(invalid("overflow in append path")),
-            }
-        }
+        let _path_charge = self.pages.charge_output(
+            (MAX_HEIGHT as usize + 1) * std::mem::size_of::<(Descriptor, OwnedPage)>(),
+        )?;
+        let mut path = match spine {
+            Some(spine) if spine.extends(root) => spine.levels,
+            _ => self.read_spine(root).await?,
+        };
+        let (leaf_descriptor, mut leaf) = path.pop().ok_or_else(|| invalid("empty append path"))?;
         let PageView::Leaf(entries) = leaf.view() else {
             unreachable!("validated leaf")
         };
-        if root.height == MAX_HEIGHT && entries.len() == LEAF_SLOTS && path.iter().all(|page| matches!(page.view(), PageView::Branch { children, .. } if children.len()==BRANCH_SLOTS)) {
+        if root.height == MAX_HEIGHT && entries.len() == LEAF_SLOTS && path.iter().all(|(_, page)| matches!(page.view(), PageView::Branch { children, .. } if children.len()==BRANCH_SLOTS)) {
             return Err(invalid("append would exceed height before page upload"));
         }
+        // Built from the new leaf upward; reversed into a root-to-leaf spine.
+        let mut rising = Vec::with_capacity(path.len() + 2);
+        let mut uploads = Vec::with_capacity(path.len() + 2);
         let (mut left, mut right) = if entries.len() < LEAF_SLOTS {
             leaf.push_leaf(entry)?;
-            (self.pages.write(leaf).await?, None)
+            let (descriptor, pending) = self.pages.seal(&leaf)?;
+            uploads.push(pending);
+            rising.push((descriptor, leaf));
+            (descriptor, None)
         } else {
             // A full immutable left leaf remains valid under the captured root.
             drop(leaf);
-            (
-                cursor,
-                Some(self.pages.write(self.pages.leaf(&[entry])?).await?),
-            )
+            let fresh = self.pages.leaf(&[entry])?;
+            let (descriptor, pending) = self.pages.seal(&fresh)?;
+            uploads.push(pending);
+            rising.push((descriptor, fresh));
+            (leaf_descriptor, Some(descriptor))
         };
-        while let Some(mut parent) = path.pop() {
+        while let Some((_, mut parent)) = path.pop() {
             let PageView::Branch { height, children } = parent.view() else {
                 unreachable!("validated branch")
             };
             let full = children.len() == BRANCH_SLOTS;
             parent.replace_last_child(left)?;
             let sibling = match right.take() {
-                Some(child) if full => Some(
-                    self.pages
-                        .write(self.pages.branch(height, &[child])?)
-                        .await?,
-                ),
+                Some(child) if full => {
+                    let sibling = self.pages.branch(height, &[child])?;
+                    let (descriptor, pending) = self.pages.seal(&sibling)?;
+                    uploads.push(pending);
+                    rising.push((descriptor, sibling));
+                    Some(descriptor)
+                }
                 Some(child) => {
                     parent.push_child(child)?;
                     None
                 }
                 None => None,
             };
-            left = self.pages.write(parent).await?;
+            let (descriptor, pending) = self.pages.seal(&parent)?;
+            uploads.push(pending);
+            left = descriptor;
+            // A full parent is final and leaves the spine for its new sibling.
+            if sibling.is_none() {
+                rising.push((descriptor, parent));
+            }
             right = sibling;
         }
-        match right {
+        let new_root = match right {
             Some(right) => {
-                self.pages
-                    .write(self.pages.branch(root.height + 1, &[left, right])?)
-                    .await
+                let grown = self.pages.branch(root.height + 1, &[left, right])?;
+                let (descriptor, pending) = self.pages.seal(&grown)?;
+                uploads.push(pending);
+                rising.push((descriptor, grown));
+                descriptor
             }
-            None => Ok(left),
+            None => left,
+        };
+        rising.reverse();
+        Ok(Appended {
+            root: new_root,
+            spine: Spine {
+                root: new_root,
+                levels: rising,
+            },
+            uploads,
+        })
+    }
+    async fn read_spine(
+        &self,
+        root: Descriptor,
+    ) -> Result<Vec<(Descriptor, OwnedPage)>, ObjectLogError> {
+        let mut path = Vec::with_capacity(MAX_HEIGHT as usize + 1);
+        let mut cursor = root;
+        loop {
+            let page = self.pages.read(cursor).await?;
+            match page.view() {
+                PageView::Leaf(_) => {
+                    path.push((cursor, page));
+                    return Ok(path);
+                }
+                PageView::Branch { children, .. } => {
+                    if path.len() == MAX_HEIGHT as usize {
+                        return Err(invalid("append path height limit"));
+                    }
+                    let next = *children
+                        .last()
+                        .ok_or_else(|| invalid("empty append branch"))?;
+                    path.push((cursor, page));
+                    cursor = next;
+                }
+                PageView::Overflow { .. } => return Err(invalid("overflow in append path")),
+            }
         }
     }
 }
@@ -734,5 +880,87 @@ mod extension_tests {
             .unwrap();
         resources.close_and_drain().await.unwrap();
         assert_eq!(resources.bytes.available(), 1 << 20);
+    }
+
+    #[tokio::test]
+    async fn retained_spine_reads_nothing_and_matches_the_rebuilt_path_through_root_growth() {
+        use crate::native_v2::semantic_map::TestCountingStore as CountingStore;
+        let directory = tempfile::tempdir().unwrap();
+        let counting = CountingStore::new(Arc::new(LocalBlobStore::new(directory.path())));
+        let resources = Resources::new(ExecutionConfig {
+            workers: 2,
+            blocking_workers: 2,
+            operations: 1,
+            bytes: 8 << 20,
+        })
+        .unwrap();
+        let pages = PageStore::new(
+            counting.clone(),
+            "pages".into(),
+            Scope {
+                namespace: [1; 32],
+                incarnation: [2; 32],
+            },
+            resources.bytes.clone(),
+            MetadataLimits {
+                payload_bytes: PAGE_BYTES,
+                version_bytes: 56,
+            },
+        )
+        .unwrap();
+        resources
+            .run(move |physical| async move {
+                let pages = pages.in_operation(physical)?;
+                let index = Index::new(pages.clone());
+                let id = index.store_object_id("physical/object").await?;
+                let entry = |base| LeafEntry {
+                    object_id: id,
+                    logical_id: id,
+                    base,
+                    record_count: 1,
+                    byte_start: 0,
+                    byte_len: 1,
+                    payload_hash: [3; 32],
+                    frame_kind: crate::native_v2::codec::FrameKind::Legacy,
+                };
+                // Past a full height-one tree, so a full branch splits and the root grows twice.
+                let total = (LEAF_SLOTS * BRANCH_SLOTS + LEAF_SLOTS + 2) as u64;
+                let (mut root, mut spine) = (None, None);
+                let mut checked = 0;
+                let mut heights = std::collections::BTreeSet::new();
+                for n in 0..total {
+                    counting.take();
+                    let appended = index.append_spine(root, spine.take(), entry(n)).await?;
+                    // Encoding with a retained spine performs no storage call at all.
+                    assert_eq!(counting.take(), Default::default(), "append {n}");
+                    if n % 7 == 0 || n % LEAF_SLOTS as u64 <= 1 {
+                        let rebuilt = index.append_spine(root, None, entry(n)).await?;
+                        assert_eq!(rebuilt.root, appended.root, "append {n}");
+                        // Reading the spine is exactly `h + 1` pages.
+                        let expected = root.map_or(0, |root| usize::from(root.height) + 1);
+                        assert_eq!(counting.take().reads.len(), expected);
+                        checked += 1;
+                    }
+                    for page in appended.uploads {
+                        pages.upload(page).await?;
+                    }
+                    heights.insert(appended.root.height);
+                    root = Some(appended.root);
+                    spine = Some(appended.spine);
+                }
+                assert!(checked > 100);
+                assert_eq!(heights.into_iter().collect::<Vec<_>>(), [0, 1, 2]);
+                // A spine for some other root is discarded and rebuilt by reading.
+                let other = index.append(None, entry(0)).await?;
+                let stale = index.append_spine(Some(other), None, entry(1)).await?.spine;
+                counting.take();
+                let rebuilt = index.append_spine(root, Some(stale), entry(total)).await?;
+                assert_eq!(counting.take().reads.len(), 3);
+                let reference = index.append_spine(root, None, entry(total)).await?;
+                assert_eq!(rebuilt.root, reference.root);
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }

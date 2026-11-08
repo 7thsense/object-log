@@ -165,7 +165,7 @@ fn independent_store_runtime_teardown(owned: bool, destroy: bool) {
     *gate.0.lock().unwrap() = true;
     gate.1.notify_all();
     let result = worker.join().unwrap();
-    let stored = matches!(result, Ok(crate::MetadataSwap::Stored));
+    let stored = matches!(result, Ok(crate::MetadataSwap::Stored(_)));
     drop(runtime_a);
     drop(a);
     stop.store(true, Ordering::Release);
