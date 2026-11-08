@@ -96,7 +96,7 @@ test.describe('Get Started', () => {
   test('install and sample code', async ({ page }, testInfo) => {
     await page.goto('./get-started/')
     await expect(article(page).getByRole('heading', { level: 1 }).first()).toBeVisible()
-    await expect(article(page).getByText(/object-log = "0.3"/)).toBeVisible()
+    await expect(article(page).getByText(/object-log = "0.4"/)).toBeVisible()
     await expect(article(page).getByText(/LogEngine::new/)).toBeVisible()
     await desktopScreenshot(page, testInfo, 'get-started')
   })
