@@ -77,10 +77,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whole slice before changing any partition.
 - Native immutable pages and data frames are created with a conditional write
   first and read only if the store rejects it, still validated byte for byte.
+- **Breaking:** the `s3` feature no longer enables the AWS SDK's `sigv4a`
+  signing, so S3 Multi-Region Access Points are not supported. object-log never
+  used SigV4a. This drops `crypto-bigint` and `p256` from the dependency tree
+  (RUSTSEC-2026-0387).
 - One native append uploads its immutable objects with up to eight concurrent
   writes and returns only when all are stored; the head is written afterwards.
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
+- `cargo-deny` ignores RUSTSEC-2026-0441 (`pin-utils` unmaintained, used only
+  by the AWS SDK); vulnerability and yanked checks are unchanged.
 
 ### Fixed
 

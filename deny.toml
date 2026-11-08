@@ -3,6 +3,13 @@
 [advisories]
 version = 2
 # Fail on any security advisory or unmaintained/yanked crate.
+# RUSTSEC-2026-0441 is an informational unmaintained advisory for pin-utils,
+# which the AWS SDK still uses transitively. object-log does not use it
+# directly. Version 0.1.1 is the final upstream release; there is no maintained
+# compatible replacement until the SDK moves to core::pin or pin-project-lite.
+# Retain this narrowly identified maintenance exception while keeping actual
+# vulnerability and yanked-release checks enabled. Review on each SDK update.
+ignore = ["RUSTSEC-2026-0441"]
 
 [licenses]
 version = 2
