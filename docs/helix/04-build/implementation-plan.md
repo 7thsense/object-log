@@ -70,7 +70,7 @@ object-log 0.2.x re-foundation (ADR-002) is **implemented**. Remaining work hard
 | CONTRACT-001/002 v2 match public API | Yes for produce/fetch/stream/reap/BlobStore/Sequencer |
 | Layer purity (no Kafka types in public API) | Yes |
 | S3 evidence (MinIO class) | Yes (TD-002) |
-| MSRV + CI | Yes (1.88, `.github/workflows/ci.yml`) |
+| MSRV + CI | Yes (1.99, `.github/workflows/ci.yml`) |
 | Semver 1.0 decision | **Open** — operator call; crate remains 0.2.x until cut |
 
 ## Explicitly Not Planned (rejected)

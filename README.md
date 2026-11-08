@@ -134,7 +134,7 @@ Deployed by `.github/workflows/pages.yml` on push to `main`.
 
 ## Status
 
-`0.3.x` — pre-1.0; the API may evolve. Requires Rust 1.88+ (edition 2024).
+`0.4.x` — pre-1.0; the API may evolve. Requires Rust 1.99+ (edition 2024).
 
 ## License
 
