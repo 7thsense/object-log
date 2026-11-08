@@ -30,4 +30,4 @@ Authoritative detail: [docs.rs/object-log](https://docs.rs/object-log).
 
 ## MSRV
 
-Rust **1.88** (edition 2024), as declared in `Cargo.toml`.
+Rust **1.99** (edition 2024), as declared in `Cargo.toml`.

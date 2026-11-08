@@ -8,11 +8,11 @@ produce/fetch loop?
 
 ## Install
 
-Requires **Rust 1.88+** (edition 2024).
+Requires **Rust 1.99+** (edition 2024).
 
 ```toml
 [dependencies]
-object-log = "0.3"
+object-log = "0.4"
 ```
 
 Optional features:

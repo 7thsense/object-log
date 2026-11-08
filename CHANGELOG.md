@@ -6,8 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-08
+
 ### Added
 
+- Optional `native` feature: a bounded native append-log facade (`NativeLog`,
+  `NativeNamespace`, `NativeWriter`, `NativeAppend`, `NativeHead` and related
+  types) over Local or S3 storage, independent of the legacy sequencer port.
+  Appends publish authenticated state and log groups atomically, hold caller
+  admission until physical I/O completes, and resolve ambiguous publications
+  through `submit` / `resolve`. `NativeLog::local`, `NativeLog::s3` and
+  `NativeLog::preflight_s3` construct it.
+- `NativeLog::plan_read` seals a read plan, and `NativeReadPlan::requirements`
+  returns a `NativeReadRequirements` (identity, validation and frame bytes,
+  hydration reads and bytes), so a caller can reserve exact admission before
+  `read_planned`. `read_bounded` and `ObjectLogError::ReadLimitExceeded`
+  reject an authenticated payload larger than the caller's limit before
+  hydrating it.
+- `BoundedMetadataStore`, `MetadataSnapshot`, `MetadataSwap`, `MetadataLimits`
+  and `MetadataOwners`: bounded, version-bound metadata reads and conditional
+  writes for the Local and S3 stores.
+- Bounded replay: `FetchPlan`, the `BoundedSequencer` page-lookup port, and
+  strict S3 range reads that fail unless the response is `206` with the exact
+  requested length.
+- Native conditional log-head sequencing: `Sequencer::commit_conditionally`,
+  `Sequencer::supports_conditional_commit`, `ConditionalCommitOutcome`,
+  `ObjectLogError::HeadRejected`, and `LogEngine::produce_conditional_at_epoch`.
+  `ManifestSequencer` implements them. Sequencers that do not implement them
+  reject any head condition.
+- `Sequencer::acquire_authoritative_epoch` and
+  `Sequencer::authoritative_partition_state` (with
+  `AuthoritativePartitionState`) read durable epoch and offset bounds directly.
+  Both fail on sequencers that do not implement them.
+- `AppendOwner` and `LogEngine::produce_owned_at_epoch`: an append owner stays
+  alive until the append's physical uploads finish.
+- `S3ClientOptions` and `S3BlobStore::new_owned_with_options` configure an
+  S3 client that the store owns, with an explicit transport and root
+  certificates.
 - `NativeLog::advance_writer` adopts the head a stored publication wrote as the
   writer's captured head without any storage request, so a single-owner writer
   appends without `refresh_writer`. It refuses a publication that was not
@@ -35,12 +70,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   PUT reply with no ETag is now an error (outcome unknown), never a reread.
   Implementers of `BoundedMetadataStore` and code matching on `Stored` must
   update.
+- **Breaking:** the minimum supported Rust version is now 1.99.0 (was 1.88).
+- `Sequencer::commit` no longer promises that an `Err` leaves nothing indexed:
+  the manifest sequencer publishes each partition independently, so an error
+  can follow a durable earlier partition. `InMemorySequencer` validates the
+  whole slice before changing any partition.
 - Native immutable pages and data frames are created with a conditional write
   first and read only if the store rejects it, still validated byte for byte.
 - One native append uploads its immutable objects with up to eight concurrent
   writes and returns only when all are stored; the head is written afterwards.
 - CI: release-mode `perf_throughput` ratio gate; live MinIO `s3-minio` job.
 - MSRV CI builds with `--all-features`.
+
+### Fixed
+
+- `ManifestSequencer` drives its blob I/O on a one-worker multi-thread runtime
+  rather than a current-thread runtime, so pooled connection tasks keep running
+  between synchronous calls instead of stalling.
+- S3 conditional writes no longer retry inside the SDK, and a precondition
+  failure is detected from the HTTP status or error code rather than from
+  message text. A lost reply to a conditional write is reported as unknown,
+  not as a definite conflict.
+- The manifest sequencer preserves native authority evidence across the loss
+  of its catalog.
 
 ## [0.3.6] — 2026-09-24
 
